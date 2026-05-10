@@ -77,8 +77,8 @@ struct ContentView: View {
     @State private var spacing: CGFloat = 20.0
     @State private var bottomMargin: CGFloat = 150.0
     
-    // 💡 记忆储存：外观主题、长图导出宽度和3个独立的文件路径
-    @AppStorage("colorSchemeStyle") private var colorSchemeStyle: Int = 0 // 0: Auto, 1: Light, 2: Dark
+    // 💡 记忆储存：外观主题仅保留 1:浅色, 2:深色 (默认浅色)
+    @AppStorage("colorSchemeStyle") private var colorSchemeStyle: Int = 1
     @AppStorage("exportWidth") private var exportWidth: String = "2560"
     @AppStorage("lastGlobalWatermarkDir") private var lastGlobalWatermarkDir: String = ""
     @AppStorage("lastExportDir") private var lastExportDir: String = ""
@@ -103,12 +103,9 @@ struct ContentView: View {
     @State private var exportAlertTitle = ""
     @State private var exportAlertMessage = ""
 
-    var currentColorScheme: ColorScheme? {
-        switch colorSchemeStyle {
-        case 1: return .light
-        case 2: return .dark
-        default: return nil
-        }
+    // 强制返回指定的 ColorScheme
+    var currentColorScheme: ColorScheme {
+        return colorSchemeStyle == 2 ? .dark : .light
     }
 
     var body: some View {
@@ -120,15 +117,14 @@ struct ContentView: View {
                     HStack {
                         Text("AoiStitcher").font(.title2).bold().frame(maxWidth: .infinity, alignment: .leading)
                         
-                        // 外观切换组件
+                        // 💡 彻底移除自动模式，仅保留深浅切换，杜绝卡死
                         Picker("", selection: $colorSchemeStyle) {
-                            Image(systemName: "circle.lefthalf.filled").tag(0) // 跟随系统
                             Image(systemName: "sun.max.fill").tag(1)           // 浅色
                             Image(systemName: "moon.fill").tag(2)              // 深色
                         }
                         .pickerStyle(.segmented)
-                        .frame(width: 90)
-                        .help("切换外观模式")
+                        .frame(width: 70)
+                        .help("切换深浅色模式")
                     }
                     
                     HStack {
@@ -260,12 +256,12 @@ struct ContentView: View {
             
             // ================== 右侧全局工作区 ==================
             ZStack {
-                Color(NSColor.underPageBackgroundColor).ignoresSafeArea()
+                // 💡 优化动态背景色：直接绑定主题变量，绝对不卡死
+                (colorSchemeStyle == 2 ? Color(white: 0.12) : Color(white: 0.94)).ignoresSafeArea()
+                
                 ScrollView([.vertical, .horizontal]) {
                     VStack(spacing: 0) {
-                        if images.isEmpty {
-                            ContentUnavailableView("暂无照片", systemImage: "photo.on.rectangle.angled", description: Text("支持 Option+滚轮 或 双指捏合 指哪打哪\n按住空格键可平移画布\n拖拽照片排序，双击进入【裁剪】")).frame(width: 800, height: 600)
-                        } else {
+                        if !images.isEmpty {
                             VStack(spacing: 0) {
                                 // 💡 性能核心优化：通过 item 自身 ID 进行 SwiftUI 循环渲染，杜绝重建
                                 ForEach(images) { item in
@@ -289,6 +285,11 @@ struct ContentView: View {
                             .frame(width: 800).padding(.vertical, 60).fixedSize(horizontal: true, vertical: true).animation(.spring(response: 0.35, dampingFraction: 0.8), value: images)
                         }
                     }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center).background(ScrollViewConfigurator(scrollViewProxy: $hostingScrollView, currentScale: $canvasScale))
+                }
+                
+                // 💡 居中空状态提示
+                if images.isEmpty {
+                    ContentUnavailableView("暂无照片", systemImage: "photo.on.rectangle.angled", description: Text("支持 Option+滚轮 或 双指捏合 指哪打哪\n按住空格键可平移画布\n拖拽照片排序，双击进入【裁剪】"))
                 }
             }
             .dropDestination(for: URL.self) { items, _ in
@@ -551,7 +552,7 @@ struct ScrollViewConfigurator: NSViewRepresentable {
 }
 
 // ==========================================
-// 💡 AppKit 透明事件侦听器 (完美捕获弹窗内的滚轮与触控板捏合)
+// 💡 AppKit 透明事件侦听器
 // ==========================================
 struct ZoomPanCatcher: NSViewRepresentable {
     @Binding var zoom: CGFloat
@@ -592,7 +593,6 @@ struct ZoomPanCatcher: NSViewRepresentable {
 // ==========================================
 // 4. 二次裁剪与盖印工作台
 // ==========================================
-// 💡 修改了枚举名称，精简显示文字
 enum EditMode: String, CaseIterable { case crop = "📐 裁剪"; case watermark = "💧 水印" }
 enum DragHandle { case topLeft, top, topRight, right, bottomRight, bottom, bottomLeft, left, center }
 
@@ -625,7 +625,8 @@ struct CropEditorView: View {
     @State private var localWatermarks: [OverlayWatermark] = []
     @State private var selectedWatermarkID: UUID?
     
-    // 记忆储存：图片内水印的路径
+    // 💡 读取主界面传递的深浅色变量，保证颜色统一
+    @AppStorage("colorSchemeStyle") private var colorSchemeStyle: Int = 1
     @AppStorage("lastLocalWatermarkDir") private var lastLocalWatermarkDir: String = ""
 
     var body: some View {
@@ -686,7 +687,8 @@ struct CropEditorView: View {
                 ZStack {
                     ZoomPanCatcher(zoom: $canvasZoom).ignoresSafeArea()
                     
-                    Color(NSColor.underPageBackgroundColor).ignoresSafeArea()
+                    // 💡 同步统一裁剪工作台背景色
+                    (colorSchemeStyle == 2 ? Color(white: 0.12) : Color(white: 0.94)).ignoresSafeArea()
                         .gesture(currentMode == .crop && !isSpacePressed ? rotationGesture(center: CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)) : nil)
                         .onTapGesture { if currentMode == .watermark { selectedWatermarkID = nil } }
                     
