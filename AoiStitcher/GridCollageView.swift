@@ -27,6 +27,7 @@ struct GridCollageView: View {
     @State private var isPreparingCrop = false
     @State private var swapSourceID: String?
     @State private var pendingSlotRemoval: (targetCount: Int, photos: [GridCollagePhotoRemoval])?
+    @State private var selectedToolbarSize = CGSize(width: 250, height: 34)
 
     private var canInteract: Bool {
         isActive && !isExporting && !store.isLoading && !isPreparingCrop && cropSession == nil
@@ -291,11 +292,26 @@ struct GridCollageView: View {
                        ).slotRects[slot.id] {
                         selectedImageToolbar(slot)
                             .fixedSize()
-                            .position(toolbarPosition(for: rect.offsetBy(dx: fitted.minX, dy: fitted.minY),
-                                                      in: proxy.size))
+                            .background {
+                                GeometryReader { geometry in
+                                    Color.clear.preference(
+                                        key: SelectedImageToolbarSizePreferenceKey.self,
+                                        value: geometry.size
+                                    )
+                                }
+                            }
+                            .position(SelectedImageToolbarPlacement.position(
+                                for: rect.offsetBy(dx: fitted.minX, dy: fitted.minY),
+                                in: proxy.size,
+                                toolbarSize: selectedToolbarSize
+                            ))
                     }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.height)
+                .onPreferenceChange(SelectedImageToolbarSizePreferenceKey.self) { size in
+                    guard size.width > 0, size.height > 0 else { return }
+                    selectedToolbarSize = size
+                }
             }
         }
         .dropDestination(for: URL.self) { urls, _ in
@@ -380,35 +396,9 @@ struct GridCollageView: View {
             .frame(width: 118)
             .accessibilityLabel("照片填充方式")
         }
-        .buttonStyle(.plain)
-        .controlSize(.small)
-        .font(.callout.weight(.medium))
-        .foregroundStyle(Color.primary)
-        .padding(.horizontal, 10)
-        .frame(height: 34)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(NSColor.separatorColor).opacity(0.5), lineWidth: 0.5)
-        }
-        .shadow(color: .black.opacity(0.14), radius: 5, y: 2)
+        .modifier(SelectedImageToolbarChrome())
         .accessibilityElement(children: .contain)
         .accessibilityLabel("所选照片快捷操作")
-    }
-
-    private func toolbarPosition(for rect: CGRect, in size: CGSize) -> CGPoint {
-        let horizontalInset = min(174, size.width / 2)
-        let x = min(max(rect.midX, horizontalInset), max(horizontalInset, size.width - horizontalInset))
-        let y: CGFloat
-        if rect.minY >= 22 {
-            // Prefer the space above the selected cell to keep the photo visible.
-            y = max(18, rect.minY - 23)
-        } else if rect.maxY + 44 <= size.height {
-            y = rect.maxY + 23
-        } else {
-            y = rect.minY + 23
-        }
-        return CGPoint(x: x, y: min(max(18, y), max(18, size.height - 18)))
     }
 
     private func beginSwap(_ slot: CollageSlot) {

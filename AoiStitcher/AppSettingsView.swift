@@ -58,8 +58,68 @@ struct AppSettingsView: View {
     @AppStorage(AoiBorderContact.userDefaultsKey) private var contactEmail = ""
     @Environment(\.openWindow) private var openWindow
     @State private var restored = false
+    @ObservedObject private var longStitchPreferences = LongStitchPreferences.shared
 
     var body: some View {
+        TabView {
+            ScrollView { generalSettings.padding(24) }
+                .tabItem { Label("通用", systemImage: "gearshape") }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    Text("长图拼接设置").font(.title2.weight(.semibold))
+                    Text("修改后立即用于当前长图，并保留到下次使用。")
+                        .font(.callout).foregroundStyle(.secondary)
+                    LongStitchLayoutControls(preferences: longStitchPreferences)
+                    Divider()
+                    LongStitchWatermarkControls(preferences: longStitchPreferences)
+                    Divider()
+                    longStitchShortcuts
+                    Divider()
+                    EditorSection("导出") {
+                        LongStitchExportSettingsFields(preferences: longStitchPreferences)
+                    }
+                }.padding(24)
+            }
+            .tabItem { Label("长图拼接", systemImage: "rectangle.split.1x2") }
+            VStack(alignment: .leading, spacing: 12) {
+                Text("标准拼图设置").font(.title2.weight(.semibold))
+                Text("标准拼图的独立偏好将在后续版本中提供。当前可在工作区调整画布样式。")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+            }
+            .padding(24)
+            .tabItem { Label("标准拼图", systemImage: "square.grid.2x2") }
+        }
+        .padding(12)
+        .frame(width: 600, height: 680)
+        .background(Color(NSColor.windowBackgroundColor))
+        .preferredColorScheme(theme == 2 ? .dark : .light)
+    }
+
+    private var longStitchShortcuts: some View {
+        EditorSection("画布快捷键") {
+            HStack {
+                Text("拖拽查看")
+                Spacer()
+                Picker("拖拽查看按键", selection: $longStitchPreferences.settings.panKey) {
+                    ForEach(LongStitchPanKey.allCases) { key in Text(key.title).tag(key) }
+                }.labelsHidden().frame(width: 180)
+            }
+            HStack {
+                Text("滚轮缩放")
+                Spacer()
+                Picker("滚轮缩放修饰键", selection: $longStitchPreferences.settings.zoomModifier) {
+                    ForEach(LongStitchZoomModifier.allCases) { key in Text(key.title).tag(key) }
+                }.labelsHidden().frame(width: 180)
+            }
+            Text("按住所选按键并拖动以平移画布；按住缩放修饰键并滚动以放大或缩小。触控板双指捏合也可缩放。")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var generalSettings: some View {
         VStack(alignment: .leading, spacing: 22) {
             Text("软件设置").font(.title2.weight(.semibold))
             EditorSection("外观") {
@@ -88,15 +148,17 @@ struct AppSettingsView: View {
             }
             Divider()
             HStack {
-                Button { AppPreferences.restoreDefaults(); restored = true } label: {
+                Button {
+                    AppPreferences.restoreDefaults()
+                    longStitchPreferences.restoreDefaults()
+                    restored = true
+                } label: {
                     Label("恢复默认设置", systemImage: "arrow.counterclockwise")
                 }
                 Spacer()
                 if restored { Text("已恢复默认设置").font(.callout).foregroundStyle(.secondary) }
             }
             Text("恢复软件偏好，保留当前画布和照片。").font(.callout).foregroundStyle(.secondary)
-        }.padding(24).frame(width: 440)
-            .background(Color(NSColor.windowBackgroundColor))
-            .preferredColorScheme(theme == 2 ? .dark : .light)
+        }
     }
 }

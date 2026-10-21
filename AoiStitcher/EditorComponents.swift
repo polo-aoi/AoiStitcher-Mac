@@ -6,6 +6,56 @@ enum EditorStyle {
     static let padding: CGFloat = 16
 }
 
+struct SelectedImageToolbarChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .buttonStyle(.plain)
+            .controlSize(.small)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(Color.primary)
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(NSColor.separatorColor).opacity(0.5), lineWidth: 0.5)
+            }
+            .shadow(color: .black.opacity(0.14), radius: 5, y: 2)
+    }
+}
+
+enum SelectedImageToolbarPlacement {
+    static func position(for imageRect: CGRect, in viewportSize: CGSize,
+                         toolbarSize: CGSize, gap: CGFloat = 8) -> CGPoint {
+        let halfWidth = toolbarSize.width / 2
+        let minX = halfWidth + gap
+        let maxX = viewportSize.width - halfWidth - gap
+        let x = minX <= maxX
+            ? min(max(imageRect.midX, minX), maxX)
+            : viewportSize.width / 2
+
+        let halfHeight = toolbarSize.height / 2
+        let minY = halfHeight + gap
+        let maxY = viewportSize.height - halfHeight - gap
+        let above = imageRect.minY - halfHeight - gap
+        let below = imageRect.maxY + halfHeight + gap
+        let preferredY = above >= minY ? above : (below <= maxY ? below : imageRect.minY + halfHeight + gap)
+        let y = minY <= maxY
+            ? min(max(preferredY, minY), maxY)
+            : viewportSize.height / 2
+
+        return CGPoint(x: x, y: y)
+    }
+}
+
+struct SelectedImageToolbarSizePreferenceKey: PreferenceKey {
+    static var defaultValue = CGSize.zero
+
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
 struct EditorSidebarHeader<Actions: View>: View {
     @Binding var theme: Int
     @ViewBuilder var actions: () -> Actions
