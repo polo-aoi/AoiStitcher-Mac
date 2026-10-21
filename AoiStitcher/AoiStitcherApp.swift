@@ -1,32 +1,22 @@
-//
-//  AoiStitcherApp.swift
-//  AoiStitcher
-//
-//  Created by 阿多 on 2026/4/1.
-//
-
 import SwiftUI
-import SwiftData
 
 @main
 struct AoiStitcherApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
-
+    @Environment(\.openWindow) private var openWindow
     var body: some Scene {
-        WindowGroup {
+        WindowGroup("aoipic") {
             ContentView()
         }
-        .modelContainer(sharedModelContainer)
+        .defaultSize(width: 1280, height: 900)
+        .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("关于 aoipic") { openWindow(id: "about") }
+            }
+        }
+        Settings { AppSettingsView() }
+        Window("关于 aoipic", id: "about") { AboutView() }
+            .windowResizability(.contentSize)
+        Window("支持作者", id: "support-author") { SupportAuthorView() }
+            .windowResizability(.contentSize)
     }
 }
