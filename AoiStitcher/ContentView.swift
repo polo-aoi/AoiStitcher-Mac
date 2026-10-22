@@ -19,6 +19,8 @@ struct LongStitchView: View {
     @State private var viewportCoordinateView: NSView?
     @State private var canvasCoordinateView: NSView?
     @State private var canvasScale: CGFloat = 1.0
+    @State private var pendingContentAnchor: CGPoint?
+    @State private var settingsViewportUpdateScheduled = false
 
     @State private var isPanKeyPressed = false
     @State private var panStartPoint: NSPoint?
@@ -60,13 +62,8 @@ struct LongStitchView: View {
                     }.buttonStyle(.borderedProminent).help("添加照片")
                 }
                 Divider()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        LongStitchLayoutControls(preferences: preferences)
-                        Divider()
-                        LongStitchWatermarkControls(preferences: preferences)
-                    }.padding(16)
-                }
+                LongStitchSidebar(preferences: preferences)
+                    .frame(maxHeight: .infinity)
                 Divider()
                 EditorActionBar(isExporting: isExporting, disabled: images.isEmpty,
                                 clear: clearCanvas, export: exportFinalImage,
@@ -190,14 +187,29 @@ struct LongStitchView: View {
             finishCanvasDrag()
             setPanKeyPressed(false)
         }
+        .onReceive(preferences.$settings) { next in
+            captureContentAnchor(before: next)
+        }
         .onChange(of: preferences.settings) { old, new in
-            finishCanvasDrag()
-            setPanKeyPressed(false)
+            let aspects = images.map(\.displayAspect)
+            let oldLayout = LongStitchLayout(aspects: aspects, settings: old)
+            let newLayout = LongStitchLayout(aspects: aspects, settings: new)
+            let layoutChanged = oldLayout.photoRects != newLayout.photoRects || oldLayout.canvasSize != newLayout.canvasSize
+            if layoutChanged, dragCandidateID != nil { finishCanvasDrag() }
+            if old.panKey != new.panKey { setPanKeyPressed(false) }
+            if old.direction != new.direction ||
+                (new.validatedExportShortEdge != nil && old.validatedExportShortEdge != new.validatedExportShortEdge) {
+                finishCanvasDrag()
+                setPanKeyPressed(false)
+                pendingContentAnchor = nil
+                DispatchQueue.main.async { fitToScreen() }
+                return
+            }
+            guard layoutChanged, !settingsViewportUpdateScheduled else { return }
+            settingsViewportUpdateScheduled = true
             DispatchQueue.main.async {
-                refreshCanvasGeometry()
-                if old.direction != new.direction || old.exportShortEdge != new.exportShortEdge {
-                    fitToScreen()
-                }
+                settingsViewportUpdateScheduled = false
+                restoreContentAnchor()
             }
         }
         .sheet(item: $editingItem) { item in
@@ -255,20 +267,19 @@ struct LongStitchView: View {
                 canvasEntryView(entry, size: rect.size)
                     .position(x: rect.midX, y: rect.midY)
             }
-            if let watermark = preferences.watermark {
-                ForEach(LongStitchEdge.allCases) { edge in
-                    if settings[edge].isEnabled, settings[edge].usesWatermark,
-                       let region = layout.marginRects[edge], region.width > 0, region.height > 0 {
-                        let rect = LongStitchLayout.watermarkRect(
-                            imageSize: watermark.size, in: region,
-                            contentShortEdge: min(layout.contentRect.width, layout.contentRect.height),
-                            margin: settings[edge]
-                        )
-                        Image(nsImage: watermark).resizable().scaledToFit()
-                            .frame(width: rect.width, height: rect.height)
-                            .position(x: rect.midX, y: rect.midY)
-                            .allowsHitTesting(false)
-                    }
+            ForEach(LongStitchEdge.allCases) { edge in
+                if settings[edge].isEnabled, settings[edge].usesWatermark,
+                   let watermark = preferences.watermark(for: edge),
+                   let region = layout.marginRects[edge], region.width > 0, region.height > 0 {
+                    let rect = LongStitchLayout.watermarkRect(
+                        imageSize: watermark.size, in: region,
+                        contentShortEdge: min(layout.contentRect.width, layout.contentRect.height),
+                        margin: settings[edge]
+                    )
+                    Image(nsImage: watermark).resizable().scaledToFit()
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
+                        .allowsHitTesting(false)
                 }
             }
         }
@@ -423,6 +434,43 @@ struct LongStitchView: View {
         }
     }
 
+    /// Published settings arrive before assignment, while the native view tree
+    /// still represents the old layout. Capture once for a coalesced update.
+    private func captureContentAnchor(before next: LongStitchSettings) {
+        guard pendingContentAnchor == nil, !images.isEmpty,
+              let canvasCoordinateView, let scrollView = hostingScrollView,
+              canvasCoordinateView.window === scrollView.window else { return }
+        let current = preferences.settings
+        guard current.direction == next.direction,
+              current.validatedExportShortEdge == next.validatedExportShortEdge else { return }
+        let aspects = images.map(\.displayAspect)
+        let oldLayout = LongStitchLayout(aspects: aspects, settings: current)
+        let nextLayout = LongStitchLayout(aspects: aspects, settings: next)
+        guard oldLayout.photoRects != nextLayout.photoRects || oldLayout.canvasSize != nextLayout.canvasSize else { return }
+        let clip = scrollView.contentView
+        let center = NSPoint(x: clip.bounds.midX, y: clip.bounds.midY)
+        let anchor = canvasCoordinateView.convert(center, from: clip)
+        pendingContentAnchor = CGPoint(x: anchor.x - oldLayout.contentRect.minX,
+                                       y: anchor.y - oldLayout.contentRect.minY)
+    }
+
+    private func restoreContentAnchor() {
+        defer { pendingContentAnchor = nil }
+        guard let anchor = pendingContentAnchor,
+              let scrollView = hostingScrollView, let canvasCoordinateView else { return }
+        scrollView.layoutSubtreeIfNeeded()
+        let origin = canvasLayout.contentRect.origin
+        let point = canvasCoordinateView.convert(NSPoint(x: origin.x + anchor.x, y: origin.y + anchor.y),
+                                                to: scrollView.contentView)
+        let clip = scrollView.contentView
+        var bounds = clip.bounds
+        bounds.origin.x += point.x - bounds.midX
+        bounds.origin.y += point.y - bounds.midY
+        clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+        scrollView.reflectScrolledClipView(clip)
+        refreshCanvasGeometry()
+    }
+
     private func exportFinalImage() {
         guard editingItem == nil, !images.isEmpty, !isExporting else { return }
         guard AppPreferences.exportWidth(settings.exportShortEdge) != nil else {
@@ -434,7 +482,17 @@ struct LongStitchView: View {
         let snapshot = settings
         let safeImages = images.map(\.displayImage)
         let layout = canvasLayout
-        let watermark = preferences.watermark
+        var watermarks: [LongStitchEdge: NSImage] = [:]
+        for edge in LongStitchEdge.allCases where snapshot[edge].isEnabled && snapshot[edge].usesWatermark && snapshot[edge].watermarkID != nil {
+            guard let watermark = preferences.watermark(for: edge) else {
+                exportSucceeded = false; exportAlertTitle = "水印无法读取"
+                exportAlertMessage = "请重新选择\(edge.title)水印，或取消该边水印后再导出。"
+                showingExportAlert = true
+                return
+            }
+            watermarks[edge] = watermark
+        }
+        let watermarkSnapshot = watermarks
         let savePanel = NSSavePanel()
         savePanel.allowedContentTypes = [snapshot.exportPNG ? .png : .jpeg]
         savePanel.nameFieldStringValue = snapshot.exportPNG ? "aoipic_Output.png" : "aoipic_Output.jpg"
@@ -447,7 +505,7 @@ struct LongStitchView: View {
                 let result: Result<Void, Error> = Result {
                     try autoreleasepool {
                         let image = try LongStitchRenderer.render(images: safeImages, layout: layout,
-                                                                 settings: snapshot, watermark: watermark)
+                                                                 settings: snapshot, watermarks: watermarkSnapshot)
                         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
                               let data = NSBitmapImageRep(cgImage: cgImage).representation(
                                 using: snapshot.exportPNG ? .png : .jpeg,

@@ -72,10 +72,23 @@ nonisolated struct LongStitchMargin: Codable, Equatable {
     /// Distances are output pixels, independent of preview magnification.
     var size: Double = 150
     var usesWatermark = false
+    var watermarkID: UUID?
     var watermarkScale: Double = 1
     /// Normalized positions within the remaining room, from -1 to 1.
     var offsetX: Double = 0
     var offsetY: Double = 0
+
+    init(isEnabled: Bool = false, size: Double = 150, usesWatermark: Bool = false,
+         watermarkID: UUID? = nil, watermarkScale: Double = 1,
+         offsetX: Double = 0, offsetY: Double = 0) {
+        self.isEnabled = isEnabled
+        self.size = size
+        self.usesWatermark = usesWatermark
+        self.watermarkID = watermarkID
+        self.watermarkScale = watermarkScale
+        self.offsetX = offsetX
+        self.offsetY = offsetY
+    }
 
     func sanitized() -> LongStitchMargin {
         var value = self
@@ -85,20 +98,68 @@ nonisolated struct LongStitchMargin: Codable, Equatable {
         value.offsetY = longStitchClamp(offsetY, to: -1...1, fallback: 0)
         return value
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case isEnabled, size, usesWatermark, watermarkID, watermarkScale, offsetX, offsetY
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? false
+        size = try container.decodeIfPresent(Double.self, forKey: .size) ?? 150
+        usesWatermark = try container.decodeIfPresent(Bool.self, forKey: .usesWatermark) ?? false
+        watermarkID = try container.decodeIfPresent(UUID.self, forKey: .watermarkID)
+        watermarkScale = try container.decodeIfPresent(Double.self, forKey: .watermarkScale) ?? 1
+        offsetX = try container.decodeIfPresent(Double.self, forKey: .offsetX) ?? 0
+        offsetY = try container.decodeIfPresent(Double.self, forKey: .offsetY) ?? 0
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(isEnabled, forKey: .isEnabled)
+        try container.encode(size, forKey: .size)
+        try container.encode(usesWatermark, forKey: .usesWatermark)
+        try container.encodeIfPresent(watermarkID, forKey: .watermarkID)
+        try container.encode(watermarkScale, forKey: .watermarkScale)
+        try container.encode(offsetX, forKey: .offsetX)
+        try container.encode(offsetY, forKey: .offsetY)
+    }
 }
 
 nonisolated struct LongStitchSettings: Codable, Equatable {
     var direction: LongStitchDirection = .vertical
     var spacing: Double = 20
     var top = LongStitchMargin()
-    var bottom = LongStitchMargin(isEnabled: true, usesWatermark: true)
+    var bottom = LongStitchMargin(isEnabled: true)
     var left = LongStitchMargin()
     var right = LongStitchMargin()
+    /// Kept only to decode and migrate the former single-watermark preference.
     var watermarkNote = ""
     var exportShortEdge = "2560"
     var exportPNG = true
     var panKey: LongStitchPanKey = .space
     var zoomModifier: LongStitchZoomModifier = .option
+
+    init(direction: LongStitchDirection = .vertical, spacing: Double = 20,
+         top: LongStitchMargin = LongStitchMargin(),
+         bottom: LongStitchMargin = LongStitchMargin(isEnabled: true),
+         left: LongStitchMargin = LongStitchMargin(),
+         right: LongStitchMargin = LongStitchMargin(), watermarkNote: String = "",
+         exportShortEdge: String = "2560", exportPNG: Bool = true,
+         panKey: LongStitchPanKey = .space,
+         zoomModifier: LongStitchZoomModifier = .option) {
+        self.direction = direction
+        self.spacing = spacing
+        self.top = top
+        self.bottom = bottom
+        self.left = left
+        self.right = right
+        self.watermarkNote = watermarkNote
+        self.exportShortEdge = exportShortEdge
+        self.exportPNG = exportPNG
+        self.panKey = panKey
+        self.zoomModifier = zoomModifier
+    }
 
     subscript(edge: LongStitchEdge) -> LongStitchMargin {
         get {
@@ -132,6 +193,42 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
               (1...16_384).contains(value) else { return nil }
         return value
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case direction, spacing, top, bottom, left, right, watermarkNote
+        case exportShortEdge, exportPNG, panKey, zoomModifier
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        direction = try container.decodeIfPresent(LongStitchDirection.self, forKey: .direction) ?? .vertical
+        spacing = try container.decodeIfPresent(Double.self, forKey: .spacing) ?? 20
+        top = try container.decodeIfPresent(LongStitchMargin.self, forKey: .top) ?? LongStitchMargin()
+        bottom = try container.decodeIfPresent(LongStitchMargin.self, forKey: .bottom)
+            ?? LongStitchMargin(isEnabled: true, usesWatermark: true)
+        left = try container.decodeIfPresent(LongStitchMargin.self, forKey: .left) ?? LongStitchMargin()
+        right = try container.decodeIfPresent(LongStitchMargin.self, forKey: .right) ?? LongStitchMargin()
+        watermarkNote = try container.decodeIfPresent(String.self, forKey: .watermarkNote) ?? ""
+        exportShortEdge = try container.decodeIfPresent(String.self, forKey: .exportShortEdge) ?? "2560"
+        exportPNG = try container.decodeIfPresent(Bool.self, forKey: .exportPNG) ?? true
+        panKey = try container.decodeIfPresent(LongStitchPanKey.self, forKey: .panKey) ?? .space
+        zoomModifier = try container.decodeIfPresent(LongStitchZoomModifier.self, forKey: .zoomModifier) ?? .option
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(direction, forKey: .direction)
+        try container.encode(spacing, forKey: .spacing)
+        try container.encode(top, forKey: .top)
+        try container.encode(bottom, forKey: .bottom)
+        try container.encode(left, forKey: .left)
+        try container.encode(right, forKey: .right)
+        try container.encode(watermarkNote, forKey: .watermarkNote)
+        try container.encode(exportShortEdge, forKey: .exportShortEdge)
+        try container.encode(exportPNG, forKey: .exportPNG)
+        try container.encode(panKey, forKey: .panKey)
+        try container.encode(zoomModifier, forKey: .zoomModifier)
+    }
 }
 
 nonisolated private func longStitchClamp(_ value: Double, to range: ClosedRange<Double>,
@@ -142,77 +239,211 @@ nonisolated private func longStitchClamp(_ value: Double, to range: ClosedRange<
 @MainActor
 final class LongStitchPreferences: ObservableObject {
     static let settingsKey = "longStitchSettings.v1"
+    static let migrationKey = "longStitchWatermarkLibraryMigration.v1"
     static let shared = LongStitchPreferences(
         defaults: .standard,
-        watermarkURL: defaultWatermarkURL
+        library: .shared,
+        legacyWatermarkURL: defaultLegacyWatermarkURL
     )
 
     @Published var settings: LongStitchSettings {
-        didSet { persistSettings() }
+        didSet { scheduleSettingsSave() }
     }
-    @Published private(set) var watermark: NSImage?
+    @Published var libraryError: String?
 
     private let defaults: UserDefaults
-    private let watermarkURL: URL?
+    let library: WatermarkLibraryStore
+    private let legacyWatermarkURL: URL?
+    private var libraryObservation: AnyCancellable?
+    private var libraryErrorObservation: AnyCancellable?
+    private var terminationObserver: NSObjectProtocol?
+    private var scheduledSettingsSave: DispatchWorkItem?
 
-    /// A custom store never reads or overwrites the application's shared image.
-    /// Supply a private URL to persist a watermark for a custom defaults suite.
-    init(defaults: UserDefaults = .standard, watermarkURL: URL? = nil) {
+    init(defaults: UserDefaults = .standard,
+         library: WatermarkLibraryStore? = nil,
+         legacyWatermarkURL: URL? = nil) {
         self.defaults = defaults
-        self.watermarkURL = watermarkURL
+        self.library = library ?? WatermarkLibraryStore.shared
+        self.legacyWatermarkURL = legacyWatermarkURL
         if let data = defaults.data(forKey: Self.settingsKey),
            let decoded = try? JSONDecoder().decode(LongStitchSettings.self, from: data) {
             settings = decoded.sanitized()
         } else {
             settings = LongStitchSettings()
         }
-        if let watermarkURL { watermark = NSImage(contentsOf: watermarkURL) }
+        libraryObservation = self.library.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        libraryErrorObservation = self.library.$loadError.compactMap { $0 }.sink { [weak self] error in
+            self?.libraryError = error
+        }
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                do { try self.flushSettings() }
+                catch { self.libraryError = "无法保存长图设置：\(error.localizedDescription)" }
+            }
+        }
+        migrateLegacyWatermarkIfNeeded()
     }
 
-    func importWatermark(from url: URL) throws {
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-        guard let image = NSImage(contentsOf: url),
-              let pixels = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            throw LongStitchRenderError.cannotReadWatermark
+    deinit {
+        scheduledSettingsSave?.cancel()
+        if let terminationObserver { NotificationCenter.default.removeObserver(terminationObserver) }
+    }
+
+    func watermark(for edge: LongStitchEdge) -> NSImage? {
+        let margin = settings[edge]
+        guard margin.usesWatermark else { return nil }
+        return library.image(for: margin.watermarkID)
+    }
+
+    func selectWatermark(_ id: UUID?, for edge: LongStitchEdge) {
+        updateMargin(edge) {
+            $0.watermarkID = id != nil && library.item(id: id) != nil ? id : nil
+            $0.usesWatermark = $0.watermarkID != nil
         }
-        guard let watermarkURL else { throw LongStitchRenderError.watermarkStorageUnavailable }
-        let bitmap = NSBitmapImageRep(cgImage: pixels)
-        guard let data = bitmap.representation(using: .png, properties: [:]) else {
-            throw LongStitchRenderError.cannotEncodeWatermark
+    }
+
+    func deleteWatermark(_ id: UUID) throws {
+        let previous = settings
+        var updated = previous
+        for edge in LongStitchEdge.allCases where updated[edge].watermarkID == id {
+            updated[edge].watermarkID = nil
+            updated[edge].usesWatermark = false
         }
+        settings = updated
         do {
-            try FileManager.default.createDirectory(at: watermarkURL.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
-            try data.write(to: watermarkURL, options: .atomic)
+            try flushSettings()
+            try library.remove(id: id)
         } catch {
-            throw LongStitchRenderError.cannotSaveWatermark(error.localizedDescription)
+            if library.item(id: id) != nil {
+                settings = previous
+                do { try flushSettings() }
+                catch { libraryError = "无法恢复水印选择设置：\(error.localizedDescription)" }
+            }
+            throw error
         }
-        watermark = NSImage(cgImage: pixels,
-                            size: NSSize(width: pixels.width, height: pixels.height))
     }
 
-    func removeWatermark() {
-        watermark = nil
-        if let watermarkURL { try? FileManager.default.removeItem(at: watermarkURL) }
+    func resetWatermarkPlacement(for edge: LongStitchEdge) {
+        updateMargin(edge) {
+            $0.watermarkScale = 1
+            $0.offsetX = 0
+            $0.offsetY = 0
+        }
+    }
+
+    func copyWatermark(from source: LongStitchEdge, to destinations: [LongStitchEdge]) {
+        let sourceMargin = settings[source]
+        for destination in destinations where destination != source {
+            updateMargin(destination) {
+                $0.watermarkID = sourceMargin.watermarkID
+                $0.usesWatermark = sourceMargin.usesWatermark
+            }
+        }
     }
 
     func restoreDefaults() {
         settings = LongStitchSettings()
-        removeWatermark()
-    }
-
-    private func persistSettings() {
-        if let data = try? JSONEncoder().encode(settings.sanitized()) {
-            defaults.set(data, forKey: Self.settingsKey)
+        do {
+            try flushSettings()
+            libraryError = library.loadError
+        } catch {
+            libraryError = "无法保存长图默认设置：\(error.localizedDescription)"
         }
     }
 
-    private static var defaultWatermarkURL: URL {
+    /// Called on app termination and by destructive preference changes that need durable state.
+    func flushSettings(synchronize: Bool = true) throws {
+        scheduledSettingsSave?.cancel()
+        scheduledSettingsSave = nil
+        let data = try JSONEncoder().encode(settings.sanitized())
+        defaults.set(data, forKey: Self.settingsKey)
+        if synchronize, !defaults.synchronize() { throw LongStitchPreferencesError.cannotSaveSettings }
+    }
+
+    func retryLibraryMigration() {
+        library.reload()
+        migrateLegacyWatermarkIfNeeded()
+    }
+
+    private func scheduleSettingsSave() {
+        scheduledSettingsSave?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            do {
+                try self.flushSettings(synchronize: false)
+            } catch {
+                self.libraryError = "无法保存长图设置：\(error.localizedDescription)"
+            }
+        }
+        scheduledSettingsSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    private func updateMargin(_ edge: LongStitchEdge,
+                              _ update: (inout LongStitchMargin) -> Void) {
+        var next = settings
+        update(&next[edge])
+        settings = next
+    }
+
+    private func migrateLegacyWatermarkIfNeeded() {
+        guard !defaults.bool(forKey: Self.migrationKey) else {
+            libraryError = library.loadError
+            return
+        }
+        do {
+            var migrated = settings
+            if let legacyWatermarkURL,
+               FileManager.default.fileExists(atPath: legacyWatermarkURL.path) {
+                let identifier = legacyWatermarkURL.standardizedFileURL.path
+                let item: WatermarkLibraryItem
+                if let existing = library.item(legacySourceIdentifier: identifier) {
+                    item = existing
+                } else {
+                    item = try library.importLegacyImage(
+                        from: legacyWatermarkURL,
+                        name: "旧长图水印",
+                        note: migrated.watermarkNote,
+                        legacySourceIdentifier: identifier
+                    )
+                }
+                for edge in LongStitchEdge.allCases where migrated[edge].usesWatermark && migrated[edge].watermarkID == nil {
+                    migrated[edge].watermarkID = item.id
+                }
+                migrated.watermarkNote = ""
+            } else {
+                // Older versions enabled the bottom watermark even when no image was imported.
+                for edge in LongStitchEdge.allCases where migrated[edge].watermarkID == nil {
+                    migrated[edge].usesWatermark = false
+                }
+            }
+            if migrated != settings { settings = migrated }
+            try flushSettings()
+            defaults.set(true, forKey: Self.migrationKey)
+            guard defaults.synchronize() else { throw LongStitchPreferencesError.cannotSaveSettings }
+            libraryError = library.loadError
+        } catch {
+            defaults.removeObject(forKey: Self.migrationKey)
+            libraryError = "旧水印迁移未完成，可稍后重试：\(error.localizedDescription)"
+        }
+    }
+
+    private static var defaultLegacyWatermarkURL: URL {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         return support.appendingPathComponent("aoipic/LongStitch/watermark.png")
     }
+}
+
+nonisolated enum LongStitchPreferencesError: LocalizedError {
+    case cannotSaveSettings
+
+    var errorDescription: String? { "系统未能保存长图偏好，请检查可用磁盘空间后重试。" }
 }
 
 /// All rectangles use output pixels and a top-left origin. Four outer margins
@@ -315,7 +546,8 @@ nonisolated enum LongStitchRenderer {
     static let maximumPixelCount: Int64 = 64_000_000
 
     static func render(images: [NSImage], layout: LongStitchLayout,
-                       settings: LongStitchSettings, watermark: NSImage?) throws -> NSImage {
+                       settings: LongStitchSettings,
+                       watermarks: [LongStitchEdge: NSImage]) throws -> NSImage {
         let size = layout.canvasSize
         guard !images.isEmpty, images.count == layout.photoRects.count,
               size.width.isFinite, size.height.isFinite, size.width >= 1, size.height >= 1 else {
@@ -345,23 +577,24 @@ nonisolated enum LongStitchRenderer {
             let rect = layout.photoRects[index]
             context.draw(pixels, in: bitmapRect(rect, height: CGFloat(height)))
         }
-        if let watermark,
-           let pixels = watermark.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-            let settings = settings.sanitized()
-            for edge in LongStitchEdge.allCases {
-                let margin = settings[edge]
-                guard margin.isEnabled, margin.usesWatermark,
-                      let region = layout.marginRects[edge], region.width > 0, region.height > 0 else { continue }
-                let rect = LongStitchLayout.watermarkRect(
-                    imageSize: watermark.size, in: region,
-                    contentShortEdge: min(layout.contentRect.width, layout.contentRect.height),
-                    margin: margin
-                )
-                context.saveGState()
-                context.clip(to: bitmapRect(region, height: CGFloat(height)))
-                context.draw(pixels, in: bitmapRect(rect, height: CGFloat(height)))
-                context.restoreGState()
+        let safeSettings = settings.sanitized()
+        for edge in LongStitchEdge.allCases {
+            let margin = safeSettings[edge]
+            guard margin.isEnabled, margin.usesWatermark, margin.watermarkID != nil,
+                  let region = layout.marginRects[edge], region.width > 0, region.height > 0 else { continue }
+            guard let watermark = watermarks[edge],
+                  let pixels = watermark.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                throw LongStitchRenderError.cannotReadWatermark
             }
+            let rect = LongStitchLayout.watermarkRect(
+                imageSize: watermark.size, in: region,
+                contentShortEdge: min(layout.contentRect.width, layout.contentRect.height),
+                margin: margin
+            )
+            context.saveGState()
+            context.clip(to: bitmapRect(region, height: CGFloat(height)))
+            context.draw(pixels, in: bitmapRect(rect, height: CGFloat(height)))
+            context.restoreGState()
         }
         guard let image = context.makeImage() else { throw LongStitchRenderError.renderFailed }
         return NSImage(cgImage: image, size: NSSize(width: width, height: height))
