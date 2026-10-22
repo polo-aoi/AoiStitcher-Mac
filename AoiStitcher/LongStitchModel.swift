@@ -24,6 +24,13 @@ nonisolated enum LongStitchEdge: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+nonisolated enum DragPanMode: String, Codable, CaseIterable, Identifiable {
+    case rightMouse, keyboard
+
+    var id: String { rawValue }
+    var title: String { self == .rightMouse ? "鼠标右键" : "键盘快捷键 + 左键" }
+}
+
 nonisolated enum LongStitchPanKey: String, Codable, CaseIterable, Identifiable {
     case space, option, command, control
 
@@ -67,19 +74,32 @@ nonisolated enum LongStitchZoomModifier: String, Codable, CaseIterable, Identifi
     }
 }
 
+nonisolated enum LongStitchWheelMode: String, Codable, CaseIterable, Identifiable {
+    case zoom, scroll
+
+    var id: String { rawValue }
+    var title: String { self == .zoom ? "滚轮缩放" : "滚轮滚动" }
+}
+
 nonisolated struct LongStitchMargin: Codable, Equatable {
     var isEnabled = false
     /// Distances are output pixels, independent of preview magnification.
     var size: Double = 150
     var usesWatermark = false
     var watermarkID: UUID?
-    var watermarkScale: Double = 1
+    /// Fraction of the largest image that fits completely inside this margin.
+    var watermarkScale: Double = 0.7 {
+        didSet { legacyWatermarkScale = nil }
+    }
+    /// The old scale was relative to 30% of the photo content's short edge.
+    /// Keep it until a real image and layout are available for conversion.
+    private(set) var legacyWatermarkScale: Double?
     /// Normalized positions within the remaining room, from -1 to 1.
     var offsetX: Double = 0
     var offsetY: Double = 0
 
     init(isEnabled: Bool = false, size: Double = 150, usesWatermark: Bool = false,
-         watermarkID: UUID? = nil, watermarkScale: Double = 1,
+         watermarkID: UUID? = nil, watermarkScale: Double = 0.7,
          offsetX: Double = 0, offsetY: Double = 0) {
         self.isEnabled = isEnabled
         self.size = size
@@ -93,7 +113,10 @@ nonisolated struct LongStitchMargin: Codable, Equatable {
     func sanitized() -> LongStitchMargin {
         var value = self
         value.size = longStitchClamp(size, to: 0...16_384, fallback: 150)
-        value.watermarkScale = longStitchClamp(watermarkScale, to: 0.05...5, fallback: 1)
+        value.watermarkScale = longStitchClamp(watermarkScale, to: 0.05...1, fallback: 0.7)
+        value.legacyWatermarkScale = legacyWatermarkScale.map {
+            longStitchClamp($0, to: 0.05...5, fallback: 1)
+        }
         value.offsetX = longStitchClamp(offsetX, to: -1...1, fallback: 0)
         value.offsetY = longStitchClamp(offsetY, to: -1...1, fallback: 0)
         return value
@@ -101,6 +124,7 @@ nonisolated struct LongStitchMargin: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case isEnabled, size, usesWatermark, watermarkID, watermarkScale, offsetX, offsetY
+        case watermarkScaleVersion, legacyWatermarkScale
     }
 
     init(from decoder: Decoder) throws {
@@ -109,7 +133,15 @@ nonisolated struct LongStitchMargin: Codable, Equatable {
         size = try container.decodeIfPresent(Double.self, forKey: .size) ?? 150
         usesWatermark = try container.decodeIfPresent(Bool.self, forKey: .usesWatermark) ?? false
         watermarkID = try container.decodeIfPresent(UUID.self, forKey: .watermarkID)
-        watermarkScale = try container.decodeIfPresent(Double.self, forKey: .watermarkScale) ?? 1
+        let version = try container.decodeIfPresent(Int.self, forKey: .watermarkScaleVersion) ?? 1
+        let storedScale = try container.decodeIfPresent(Double.self, forKey: .watermarkScale)
+        if version >= 2 {
+            watermarkScale = storedScale ?? 0.7
+            legacyWatermarkScale = try container.decodeIfPresent(Double.self, forKey: .legacyWatermarkScale)
+        } else {
+            watermarkScale = 0.7
+            legacyWatermarkScale = watermarkID != nil || usesWatermark ? (storedScale ?? 1) : nil
+        }
         offsetX = try container.decodeIfPresent(Double.self, forKey: .offsetX) ?? 0
         offsetY = try container.decodeIfPresent(Double.self, forKey: .offsetY) ?? 0
     }
@@ -121,6 +153,8 @@ nonisolated struct LongStitchMargin: Codable, Equatable {
         try container.encode(usesWatermark, forKey: .usesWatermark)
         try container.encodeIfPresent(watermarkID, forKey: .watermarkID)
         try container.encode(watermarkScale, forKey: .watermarkScale)
+        try container.encode(2, forKey: .watermarkScaleVersion)
+        try container.encodeIfPresent(legacyWatermarkScale, forKey: .legacyWatermarkScale)
         try container.encode(offsetX, forKey: .offsetX)
         try container.encode(offsetY, forKey: .offsetY)
     }
@@ -137,8 +171,13 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
     var watermarkNote = ""
     var exportShortEdge = "2560"
     var exportPNG = true
+    var panMode: DragPanMode = .rightMouse
+    var rightMousePanEnabled: Bool { panMode == .rightMouse }
+    var keyboardPanEnabled: Bool { panMode == .keyboard }
     var panKey: LongStitchPanKey = .space
     var zoomModifier: LongStitchZoomModifier = .option
+    var wheelMode: LongStitchWheelMode = .zoom
+    var zoomSensitivity: Double = 1
 
     init(direction: LongStitchDirection = .vertical, spacing: Double = 20,
          top: LongStitchMargin = LongStitchMargin(),
@@ -146,8 +185,10 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
          left: LongStitchMargin = LongStitchMargin(),
          right: LongStitchMargin = LongStitchMargin(), watermarkNote: String = "",
          exportShortEdge: String = "2560", exportPNG: Bool = true,
+         panMode: DragPanMode = .rightMouse,
          panKey: LongStitchPanKey = .space,
-         zoomModifier: LongStitchZoomModifier = .option) {
+         zoomModifier: LongStitchZoomModifier = .option,
+         wheelMode: LongStitchWheelMode = .zoom, zoomSensitivity: Double = 1) {
         self.direction = direction
         self.spacing = spacing
         self.top = top
@@ -157,8 +198,11 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
         self.watermarkNote = watermarkNote
         self.exportShortEdge = exportShortEdge
         self.exportPNG = exportPNG
+        self.panMode = panMode
         self.panKey = panKey
         self.zoomModifier = zoomModifier
+        self.wheelMode = wheelMode
+        self.zoomSensitivity = zoomSensitivity
     }
 
     subscript(edge: LongStitchEdge) -> LongStitchMargin {
@@ -183,6 +227,7 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
     func sanitized() -> LongStitchSettings {
         var value = self
         value.spacing = longStitchClamp(spacing, to: 0...16_384, fallback: 20)
+        value.zoomSensitivity = longStitchClamp(zoomSensitivity, to: 0.25...2, fallback: 1)
         for edge in LongStitchEdge.allCases { value[edge] = self[edge].sanitized() }
         // Keep text edits, including an empty field, so the UI can validate them.
         return value
@@ -196,7 +241,8 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case direction, spacing, top, bottom, left, right, watermarkNote
-        case exportShortEdge, exportPNG, panKey, zoomModifier
+        case exportShortEdge, exportPNG, rightMousePanEnabled, keyboardPanEnabled
+        case panMode, panKey, zoomModifier, wheelMode, zoomSensitivity
     }
 
     init(from decoder: Decoder) throws {
@@ -211,8 +257,19 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
         watermarkNote = try container.decodeIfPresent(String.self, forKey: .watermarkNote) ?? ""
         exportShortEdge = try container.decodeIfPresent(String.self, forKey: .exportShortEdge) ?? "2560"
         exportPNG = try container.decodeIfPresent(Bool.self, forKey: .exportPNG) ?? true
+        if let mode = try container.decodeIfPresent(DragPanMode.self, forKey: .panMode) {
+            panMode = mode
+        } else {
+            // Old versions allowed both switches. Prefer the default right mouse
+            // unless the user explicitly enabled only keyboard panning.
+            let rightMouse = try container.decodeIfPresent(Bool.self, forKey: .rightMousePanEnabled) ?? true
+            let keyboard = try container.decodeIfPresent(Bool.self, forKey: .keyboardPanEnabled) ?? true
+            panMode = !rightMouse && keyboard ? .keyboard : .rightMouse
+        }
         panKey = try container.decodeIfPresent(LongStitchPanKey.self, forKey: .panKey) ?? .space
         zoomModifier = try container.decodeIfPresent(LongStitchZoomModifier.self, forKey: .zoomModifier) ?? .option
+        wheelMode = try container.decodeIfPresent(LongStitchWheelMode.self, forKey: .wheelMode) ?? .zoom
+        zoomSensitivity = try container.decodeIfPresent(Double.self, forKey: .zoomSensitivity) ?? 1
     }
 
     func encode(to encoder: Encoder) throws {
@@ -226,8 +283,11 @@ nonisolated struct LongStitchSettings: Codable, Equatable {
         try container.encode(watermarkNote, forKey: .watermarkNote)
         try container.encode(exportShortEdge, forKey: .exportShortEdge)
         try container.encode(exportPNG, forKey: .exportPNG)
+        try container.encode(panMode, forKey: .panMode)
         try container.encode(panKey, forKey: .panKey)
         try container.encode(zoomModifier, forKey: .zoomModifier)
+        try container.encode(wheelMode, forKey: .wheelMode)
+        try container.encode(zoomSensitivity, forKey: .zoomSensitivity)
     }
 }
 
@@ -302,9 +362,31 @@ final class LongStitchPreferences: ObservableObject {
 
     func selectWatermark(_ id: UUID?, for edge: LongStitchEdge) {
         updateMargin(edge) {
+            if $0.watermarkID == nil, id != nil {
+                $0.watermarkScale = 0.7
+            }
             $0.watermarkID = id != nil && library.item(id: id) != nil ? id : nil
             $0.usesWatermark = $0.watermarkID != nil
         }
+    }
+
+    /// Run outside a SwiftUI body once photo and watermark geometry are available.
+    /// Unresolved legacy values remain serializable, including disabled margins.
+    func resolveWatermarkScales(in layout: LongStitchLayout) {
+        let shortEdge = min(layout.contentRect.width, layout.contentRect.height)
+        guard !layout.photoRects.isEmpty, shortEdge.isFinite, shortEdge > 0 else { return }
+        var resolved = settings
+        for edge in LongStitchEdge.allCases {
+            let margin = settings[edge]
+            guard margin.legacyWatermarkScale != nil,
+                  let region = layout.marginRects[edge], region.width > 0, region.height > 0,
+                  let image = library.image(for: margin.watermarkID),
+                  image.size.width > 0, image.size.height > 0 else { continue }
+            resolved[edge].watermarkScale = LongStitchLayout.effectiveWatermarkScale(
+                imageSize: image.size, in: region, contentShortEdge: shortEdge, margin: margin
+            )
+        }
+        if resolved != settings { settings = resolved }
     }
 
     func deleteWatermark(_ id: UUID) throws {
@@ -330,7 +412,7 @@ final class LongStitchPreferences: ObservableObject {
 
     func resetWatermarkPlacement(for edge: LongStitchEdge) {
         updateMargin(edge) {
-            $0.watermarkScale = 1
+            $0.watermarkScale = 0.7
             $0.offsetX = 0
             $0.offsetY = 0
         }
@@ -498,19 +580,41 @@ nonisolated struct LongStitchLayout {
         }
     }
 
-    static func watermarkRect(imageSize: CGSize, in region: CGRect,
-                              contentShortEdge: CGFloat, margin: LongStitchMargin) -> CGRect {
+    static func maximumWatermarkSize(imageSize: CGSize, in region: CGRect) -> CGSize {
         guard region.width.isFinite, region.height.isFinite,
               region.width > 0, region.height > 0,
               imageSize.width.isFinite, imageSize.height.isFinite,
               imageSize.width > 0, imageSize.height > 0 else { return .zero }
+        let aspect = imageSize.width / imageSize.height
+        if region.width / region.height < aspect {
+            return CGSize(width: region.width, height: region.width / aspect)
+        }
+        return CGSize(width: region.height * aspect, height: region.height)
+    }
+
+    static func effectiveWatermarkScale(imageSize: CGSize, in region: CGRect,
+                                        contentShortEdge: CGFloat, margin: LongStitchMargin) -> Double {
         let margin = margin.sanitized()
-        let shortEdge = contentShortEdge.isFinite && contentShortEdge > 0 ? contentShortEdge : 1
-        let desiredWidth = shortEdge * 0.3 * CGFloat(margin.watermarkScale)
-        let desiredHeight = desiredWidth * imageSize.height / imageSize.width
-        let fit = min(1, min(region.width / desiredWidth, region.height / desiredHeight))
-        let width = desiredWidth * fit
-        let height = desiredHeight * fit
+        guard let legacyScale = margin.legacyWatermarkScale,
+              contentShortEdge.isFinite, contentShortEdge > 0 else { return margin.watermarkScale }
+        let maximum = maximumWatermarkSize(imageSize: imageSize, in: region)
+        guard maximum.width > 0 else { return margin.watermarkScale }
+        // The old contain clamp is exactly min(desiredWidth, maximum.width).
+        // Convert that visible size, rather than interpreting the former multiplier as a percentage.
+        let desiredWidth = contentShortEdge * 0.3 * CGFloat(legacyScale)
+        return longStitchClamp(Double(min(desiredWidth, maximum.width) / maximum.width),
+                               to: 0.05...1, fallback: 0.7)
+    }
+
+    static func watermarkRect(imageSize: CGSize, in region: CGRect,
+                              contentShortEdge: CGFloat, margin: LongStitchMargin) -> CGRect {
+        let maximum = maximumWatermarkSize(imageSize: imageSize, in: region)
+        guard maximum.width > 0, maximum.height > 0 else { return .zero }
+        let margin = margin.sanitized()
+        let scale = CGFloat(effectiveWatermarkScale(imageSize: imageSize, in: region,
+                                                   contentShortEdge: contentShortEdge, margin: margin))
+        let width = maximum.width * scale
+        let height = maximum.height * scale
         let x = region.minX + (region.width - width) * CGFloat(margin.offsetX + 1) / 2
         let y = region.minY + (region.height - height) * CGFloat(margin.offsetY + 1) / 2
         return CGRect(x: x, y: y, width: width, height: height)

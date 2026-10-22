@@ -13,6 +13,7 @@ struct LongStitchView: View {
     // 💡 记忆储存：外观主题仅保留 1:浅色, 2:深色 (默认浅色)
     @AppStorage("colorSchemeStyle") private var colorSchemeStyle: Int = 1
     @AppStorage("lastExportDir") private var lastExportDir: String = ""
+    @AppStorage("longStitchPanHintSeen.v1") private var panHintSeen = false
 
     @State private var editingItem: StitchItem?
     @State private var hostingScrollView: NSScrollView?
@@ -23,8 +24,13 @@ struct LongStitchView: View {
     @State private var settingsViewportUpdateScheduled = false
 
     @State private var isPanKeyPressed = false
+    @State private var isPanMouseSequenceActive = false
     @State private var panStartPoint: NSPoint?
     @State private var panStartOrigin: NSPoint?
+    @State private var isRightMousePanning = false
+    @State private var rightPanStartPoint: NSPoint?
+    @State private var rightPanStartOrigin: NSPoint?
+    @State private var isPanHintHighlighted = false
     @State private var eventMonitor: Any?
     @State private var dragCandidateID: UUID?
     @State private var dragStartLocation: NSPoint?
@@ -37,6 +43,10 @@ struct LongStitchView: View {
     @State private var dragPointerLocation: NSPoint?
     @State private var dragAutoScrollTimer: Timer?
     @State private var selectedImageID: UUID?
+    @State private var selectedWatermarkEdge: LongStitchEdge?
+    @State private var watermarkEditorRequestID: UUID?
+    @State private var watermarkFrames: [LongStitchEdge: CGRect] = [:]
+    @State private var watermarkDrag: LongStitchWatermarkDrag?
     @State private var photoFrames: [UUID: CGRect] = [:]
     @State private var toolbarFrameInViewport = CGRect.zero
     @State private var selectedToolbarSize = CGSize(width: 80, height: 34)
@@ -62,7 +72,11 @@ struct LongStitchView: View {
                     }.buttonStyle(.borderedProminent).help("添加照片")
                 }
                 Divider()
-                LongStitchSidebar(preferences: preferences)
+                LongStitchSidebar(preferences: preferences,
+                                  selectedWatermarkEdge: $selectedWatermarkEdge,
+                                  canvasLayout: images.isEmpty ? nil : canvasLayout,
+                                  onLocateWatermark: locateWatermark,
+                                  watermarkEditorRequestID: watermarkEditorRequestID)
                     .frame(maxHeight: .infinity)
                 Divider()
                 EditorActionBar(isExporting: isExporting, disabled: images.isEmpty,
@@ -79,9 +93,19 @@ struct LongStitchView: View {
                 EditorToolbar {
                     Text("\(images.count) 张照片").font(.callout).foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(settings.panKey.title) + 拖动平移 · \(settings.zoomModifier.title) + 滚轮缩放")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .help("可在软件设置 → 长图拼接中更改；触控板也可双指滚动和捏合缩放")
+                    Text(canvasInteractionHint)
+                        .font(.caption.weight(isPanHintHighlighted ? .semibold : .regular))
+                        .foregroundStyle(isPanHintHighlighted ? Color.accentColor : Color.secondary)
+                        .animation(.easeInOut(duration: 0.25), value: isPanHintHighlighted)
+                        .help(canvasInteractionHelp)
+                        .task(id: images.isEmpty) {
+                            guard !images.isEmpty, !panHintSeen else { return }
+                            panHintSeen = true
+                            isPanHintHighlighted = true
+                            try? await Task.sleep(for: .seconds(4))
+                            guard !Task.isCancelled else { return }
+                            isPanHintHighlighted = false
+                        }
                     Button(action: fitToScreen) { Label("适合窗口", systemImage: "viewfinder") }.help("适合窗口")
                     Text(canvasScale < 0.01 ? String(format: "%.1f%%", canvasScale * 100) : "\(Int(canvasScale * 100))%").font(.callout.monospacedDigit()).frame(width: 48)
                 }
@@ -91,22 +115,17 @@ struct LongStitchView: View {
                     let layout = canvasLayout
                     ZStack(alignment: .topLeading) {
                         Color(NSColor.controlBackgroundColor)
-                        ScrollView([.vertical, .horizontal]) {
+                        LongStitchViewport(canvasSize: layout.canvasSize,
+                                           scrollView: $hostingScrollView,
+                                           scale: $canvasScale,
+                                           onViewportChange: refreshCanvasGeometry) {
                             ZStack {
                                 if !images.isEmpty {
                                     stitchCanvas(entries: entries, layout: layout)
+                                        .animation(.easeOut(duration: 0.14), value: dragInsertionIndex)
                                 }
                             }
-                            .padding(24)
-                            .frame(minWidth: viewport.size.width / max(0.001, canvasScale),
-                                   minHeight: viewport.size.height / max(0.001, canvasScale))
-                            .background(ScrollViewConfigurator(
-                                scrollViewProxy: $hostingScrollView,
-                                currentScale: $canvasScale,
-                                onViewportChange: refreshCanvasGeometry
-                            ))
                         }
-                        .scrollIndicators(.hidden)
                         if images.isEmpty {
                             EditorEmptyState()
                                 .frame(width: viewport.size.width, height: viewport.size.height)
@@ -134,6 +153,12 @@ struct LongStitchView: View {
                                 ))
                         }
 
+                        if let edge = selectedWatermarkEdge,
+                           let frame = watermarkFrames[edge],
+                           frame.intersects(CGRect(origin: .zero, size: viewport.size)) {
+                            LongStitchWatermarkSelection(rect: frame)
+                        }
+
                         if let draggedItemID,
                            let item = images.first(where: { $0.id == draggedItemID }),
                            dragPreviewSize.width > 0 {
@@ -149,7 +174,6 @@ struct LongStitchView: View {
                     .clipped()
                     .coordinateSpace(name: "long-stitch-viewport")
                     .background { LongStitchViewportReader(view: $viewportCoordinateView) }
-                    .onPreferenceChange(LongStitchPhotoFramesPreferenceKey.self) { _ in refreshCanvasGeometry() }
                     .onPreferenceChange(LongStitchToolbarFramePreferenceKey.self) { toolbarFrameInViewport = $0 }
                     .onPreferenceChange(SelectedImageToolbarSizePreferenceKey.self) { size in
                         if size.width > 0, size.height > 0 { selectedToolbarSize = size }
@@ -179,13 +203,19 @@ struct LongStitchView: View {
         .preferredColorScheme(currentColorScheme)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
             finishCanvasDrag()
+            finishWatermarkDrag()
+            finishRightMousePan()
             setPanKeyPressed(false)
+            isPanMouseSequenceActive = false
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { notification in
             guard let window = notification.object as? NSWindow,
                   window === hostingScrollView?.window else { return }
             finishCanvasDrag()
+            finishWatermarkDrag()
+            finishRightMousePan()
             setPanKeyPressed(false)
+            isPanMouseSequenceActive = false
         }
         .onReceive(preferences.$settings) { next in
             captureContentAnchor(before: next)
@@ -196,7 +226,15 @@ struct LongStitchView: View {
             let newLayout = LongStitchLayout(aspects: aspects, settings: new)
             let layoutChanged = oldLayout.photoRects != newLayout.photoRects || oldLayout.canvasSize != newLayout.canvasSize
             if layoutChanged, dragCandidateID != nil { finishCanvasDrag() }
+            if layoutChanged { finishWatermarkDrag() }
+            if let edge = selectedWatermarkEdge,
+               (!new[edge].isEnabled || !new[edge].usesWatermark || new[edge].watermarkID == nil || new[edge].size <= 0) {
+                selectedWatermarkEdge = nil
+                finishWatermarkDrag()
+            }
             if old.panKey != new.panKey { setPanKeyPressed(false) }
+            if !new.keyboardPanEnabled { setPanKeyPressed(false) }
+            if !new.rightMousePanEnabled { finishRightMousePan() }
             if old.direction != new.direction ||
                 (new.validatedExportShortEdge != nil && old.validatedExportShortEdge != new.validatedExportShortEdge) {
                 finishCanvasDrag()
@@ -210,6 +248,22 @@ struct LongStitchView: View {
             DispatchQueue.main.async {
                 settingsViewportUpdateScheduled = false
                 restoreContentAnchor()
+            }
+        }
+        .onChange(of: selectedWatermarkEdge) { _, new in
+            if let drag = watermarkDrag, drag.edge != new { finishWatermarkDrag() }
+            if new != nil {
+                selectedImageID = nil
+                toolbarFrameInViewport = .zero
+            }
+        }
+        .onChange(of: editingItem?.id) { _, new in
+            if new != nil {
+                finishCanvasDrag()
+                finishWatermarkDrag()
+                finishRightMousePan()
+                setPanKeyPressed(false)
+                isPanMouseSequenceActive = false
             }
         }
         .sheet(item: $editingItem) { item in
@@ -240,6 +294,19 @@ struct LongStitchView: View {
     }
 
     private var settings: LongStitchSettings { preferences.settings.sanitized() }
+
+    private var canvasInteractionHint: String {
+        var actions = [settings.wheelMode == .zoom ? "滚轮缩放" : "滚动平移 · \(settings.zoomModifier.title)+滚轮缩放"]
+        switch settings.panMode {
+        case .rightMouse: actions.append("右键拖动平移")
+        case .keyboard: actions.append("\(settings.panKey.title)+左键拖动平移")
+        }
+        return actions.joined(separator: " · ")
+    }
+
+    private var canvasInteractionHelp: String {
+        "\(canvasInteractionHint)。可在软件设置 → 长图拼接中更改；触控板双指捏合可缩放。"
+    }
 
     private var canvasLayout: LongStitchLayout {
         LongStitchLayout(aspects: canvasEntries.map { $0.item.displayAspect }, settings: settings)
@@ -312,12 +379,6 @@ struct LongStitchView: View {
             }
             .frame(width: size.width, height: size.height)
             .contentShape(Rectangle())
-            .background {
-                GeometryReader { geometry in
-                    Color.clear.preference(key: LongStitchPhotoFramesPreferenceKey.self,
-                        value: [entry.id: geometry.frame(in: .named("long-stitch-viewport"))])
-                }
-            }
         }
     }
 
@@ -349,6 +410,9 @@ struct LongStitchView: View {
 
     private func clearCanvas() {
         finishCanvasDrag()
+        finishWatermarkDrag()
+        selectedWatermarkEdge = nil
+        watermarkFrames = [:]
         images.removeAll()
         selectedImageID = nil
         photoFrames = [:]
@@ -424,14 +488,99 @@ struct LongStitchView: View {
     }
 
     private func fitToScreen() {
-        guard editingItem == nil, draggedItemID == nil,
+        guard editingItem == nil, draggedItemID == nil, watermarkDrag == nil,
               !images.isEmpty, let scrollView = hostingScrollView else { return }
         let size = canvasLayout.canvasSize
         let target = min(1, max(0.001, min((scrollView.contentSize.width - 48) / size.width,
                                           (scrollView.contentSize.height - 48) / size.height)))
         if let docRect = scrollView.documentView?.bounds {
-            scrollView.setMagnification(target, centeredAt: NSPoint(x: docRect.midX, y: docRect.midY))
+            LongStitchViewportNavigation.setScale(target, in: scrollView,
+                                                  anchor: CGPoint(x: docRect.midX, y: docRect.midY))
         }
+    }
+
+    private func locateWatermark(_ edge: LongStitchEdge) {
+        guard let scrollView = hostingScrollView, let document = scrollView.documentView,
+              let canvasCoordinateView, let geometry = watermarkGeometry(for: edge) else { return }
+        finishCanvasDrag()
+        finishWatermarkDrag()
+        selectedWatermarkEdge = edge
+        selectedImageID = nil
+        // A deliberate focus action fits the logo with enough context to manipulate its handles.
+        let rect = geometry.rect
+        let target = min(4, max(0.001, min((scrollView.contentSize.width - 120) / max(1, rect.width),
+                                          (scrollView.contentSize.height - 120) / max(1, rect.height))))
+        let anchor = canvasCoordinateView.convert(CGPoint(x: rect.midX, y: rect.midY), to: document)
+        LongStitchViewportNavigation.setScale(target, in: scrollView, anchor: anchor)
+        refreshCanvasGeometry()
+    }
+
+    private func watermarkGeometry(for edge: LongStitchEdge) -> (rect: CGRect, region: CGRect, imageSize: CGSize)? {
+        let margin = settings[edge]
+        let layout = canvasLayout
+        guard !images.isEmpty, margin.isEnabled, margin.usesWatermark,
+              let image = preferences.watermark(for: edge),
+              let region = layout.marginRects[edge], region.width > 0, region.height > 0 else { return nil }
+        let rect = LongStitchLayout.watermarkRect(imageSize: image.size, in: region,
+            contentShortEdge: min(layout.contentRect.width, layout.contentRect.height), margin: margin)
+        guard rect.width > 0, rect.height > 0 else { return nil }
+        return (rect, region, image.size)
+    }
+
+    private func beginWatermarkDrag(edge: LongStitchEdge, corner: LongStitchWatermarkCorner?,
+                                    event: NSEvent) {
+        guard let canvasCoordinateView, let geometry = watermarkGeometry(for: edge) else { return }
+        finishCanvasDrag()
+        selectedImageID = nil
+        selectedWatermarkEdge = edge
+        watermarkEditorRequestID = UUID()
+        toolbarFrameInViewport = .zero
+        watermarkDrag = LongStitchWatermarkDrag(edge: edge, corner: corner,
+            originalMargin: settings[edge], startRect: geometry.rect, region: geometry.region,
+            imageSize: geometry.imageSize,
+            startPoint: canvasCoordinateView.convert(event.locationInWindow, from: nil))
+        NSCursor.closedHand.set()
+    }
+
+    private func updateWatermarkDrag(atWindowPoint point: CGPoint) {
+        guard var drag = watermarkDrag, let canvasCoordinateView,
+              preferences.settings[drag.edge].watermarkID == drag.originalMargin.watermarkID else { return }
+        let current = canvasCoordinateView.convert(point, from: nil)
+        if !drag.hasMoved {
+            let distance = hypot(current.x - drag.startPoint.x, current.y - drag.startPoint.y)
+                * (hostingScrollView?.magnification ?? 1)
+            guard distance >= 2 else { return }
+            drag.hasMoved = true
+            watermarkDrag = drag
+        }
+        let rect: CGRect
+        if let corner = drag.corner {
+            rect = LongStitchWatermarkGeometry.resizedRect(from: drag.startRect, corner: corner,
+                startPoint: drag.startPoint, currentPoint: current, in: drag.region)
+        } else {
+            rect = LongStitchWatermarkGeometry.movedRect(from: drag.startRect,
+                startPoint: drag.startPoint, currentPoint: current, in: drag.region)
+        }
+        let values = LongStitchWatermarkGeometry.parameters(for: rect, imageSize: drag.imageSize, in: drag.region)
+        var next = preferences.settings
+        next[drag.edge].watermarkScale = values.scale
+        next[drag.edge].offsetX = drag.region.width - rect.width > 0.000_001
+            ? values.offsetX : drag.originalMargin.offsetX
+        next[drag.edge].offsetY = drag.region.height - rect.height > 0.000_001
+            ? values.offsetY : drag.originalMargin.offsetY
+        if next != preferences.settings { preferences.settings = next }
+        refreshCanvasGeometry()
+    }
+
+    private func finishWatermarkDrag(cancelled: Bool = false) {
+        guard let drag = watermarkDrag else { return }
+        if cancelled, preferences.settings[drag.edge].watermarkID == drag.originalMargin.watermarkID {
+            var next = preferences.settings
+            next[drag.edge] = drag.originalMargin
+            preferences.settings = next
+        }
+        watermarkDrag = nil
+        NSCursor.arrow.set()
     }
 
     /// Published settings arrive before assignment, while the native view tree
@@ -539,10 +688,18 @@ struct LongStitchView: View {
         var frames: [UUID: CGRect] = [:]
         let entries = canvasEntries
         let layout = canvasLayout
+        if !images.isEmpty { preferences.resolveWatermarkScales(in: layout) }
         for (index, entry) in entries.enumerated() where !entry.isPlaceholder {
             frames[entry.id] = canvasCoordinateView.convert(layout.photoRects[index], to: viewportCoordinateView)
         }
         if photoFrames != frames { photoFrames = frames }
+        var nextWatermarkFrames: [LongStitchEdge: CGRect] = [:]
+        for edge in LongStitchEdge.allCases {
+            if let geometry = watermarkGeometry(for: edge) {
+                nextWatermarkFrames[edge] = canvasCoordinateView.convert(geometry.rect, to: viewportCoordinateView)
+            }
+        }
+        if watermarkFrames != nextWatermarkFrames { watermarkFrames = nextWatermarkFrames }
         if draggedItemID != nil, let dragPointerLocation {
             updateCanvasDrag(atWindowPoint: dragPointerLocation)
         }
@@ -551,18 +708,33 @@ struct LongStitchView: View {
     private func setupEventMonitor() {
         guard eventMonitor == nil else { return }
         guard ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] != "1" else { return }
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .keyDown, .keyUp, .flagsChanged, .magnify]) { event in
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .rightMouseDragged, .rightMouseUp, .keyDown, .keyUp, .flagsChanged, .magnify]) { event in
             handleCanvasEvent(event)
         }
     }
 
     private func handleCanvasEvent(_ event: NSEvent) -> NSEvent? {
+        let isKeyboardEvent = [.keyDown, .keyUp, .flagsChanged].contains(event.type)
         guard isActive, editingItem == nil,
               let scrollView = hostingScrollView, let window = scrollView.window,
-              event.window === window else { return event }
-        let pointerInClip = scrollView.contentView.convert(event.locationInWindow, from: nil)
+              event.window === window || (isKeyboardEvent && event.window == nil && window.isKeyWindow)
+        else { return event }
+        // Key events do not contain a reliable mouse location. Hit-testing their
+        // locationInWindow (often zero) prevented Space from arming canvas panning.
+        let pointerLocation = isKeyboardEvent ? window.mouseLocationOutsideOfEventStream : event.locationInWindow
+        let pointerInClip = scrollView.contentView.convert(pointerLocation, from: nil)
         let pointerIsInCanvas = scrollView.contentView.bounds.contains(pointerInClip)
-        let isTextInput = window.firstResponder is NSTextView
+        let isTextInput = window.firstResponder is NSTextView || window.firstResponder is NSTextField
+        if isKeyboardEvent, isTextInput {
+            setPanKeyPressed(false)
+            return event
+        }
+        if event.type == .keyDown, event.keyCode == 53, !isTextInput,
+           watermarkDrag != nil || selectedWatermarkEdge != nil {
+            if watermarkDrag != nil { finishWatermarkDrag(cancelled: true) }
+            else { selectedWatermarkEdge = nil }
+            return nil
+        }
         if event.type == .keyDown, event.keyCode == 53, dragCandidateID != nil {
             finishCanvasDrag()
             return nil
@@ -573,63 +745,128 @@ struct LongStitchView: View {
         }
         if event.type == .flagsChanged, settings.panKey.keyCode == nil {
             let pressed = event.modifierFlags.contains(settings.panKey.modifierFlags)
-            if !pressed || (!isTextInput && pointerIsInCanvas) { setPanKeyPressed(pressed) }
+            if !settings.keyboardPanEnabled { setPanKeyPressed(false); return event }
+            if !pressed || (pointerIsInCanvas && watermarkDrag == nil && dragCandidateID == nil && !isRightMousePanning) {
+                setPanKeyPressed(pressed)
+            }
             return event
         }
-        if event.type == .keyDown, !isTextInput,
+        if event.type == .keyDown, settings.keyboardPanEnabled, !isTextInput,
            event.keyCode == settings.panKey.keyCode, pointerIsInCanvas || isPanKeyPressed {
             // Consume repeats as well: passing repeated Space to AppKit causes the alert sound.
-            setPanKeyPressed(true)
+            if watermarkDrag == nil && dragCandidateID == nil && !isRightMousePanning { setPanKeyPressed(true) }
             return nil
         }
-        if [.leftMouseDown, .scrollWheel, .magnify].contains(event.type), !pointerIsInCanvas {
-            return event
-        }
-
-        if event.type == .magnify ||
-           (event.type == .scrollWheel && event.modifierFlags.contains(settings.zoomModifier.flags)) {
-            guard draggedItemID == nil, panStartPoint == nil else { return nil }
-            guard let documentView = scrollView.documentView else { return event }
-            let factor: CGFloat
-            if event.type == .magnify {
-                factor = exp(event.magnification)
-            } else {
-                let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 10
-                factor = exp(delta * 0.01)
-            }
-            scrollView.setMagnification(max(0.001, min(scrollView.magnification * factor, 4)),
-                                        centeredAt: documentView.convert(event.locationInWindow, from: nil))
-            return nil
-        }
-
-        if event.type == .leftMouseDown, settings.panKey.keyCode == nil {
-            setPanKeyPressed(event.modifierFlags.contains(settings.panKey.modifierFlags))
-        }
-        if isPanKeyPressed, let viewportCoordinateView {
-            let point = viewportCoordinateView.convert(event.locationInWindow, from: nil)
-            let clipView = scrollView.contentView
-            if event.type == .leftMouseDown {
-                window.makeFirstResponder(scrollView)
-                panStartPoint = point
-                panStartOrigin = clipView.bounds.origin
-                NSCursor.closedHand.set()
-                return nil
-            } else if event.type == .leftMouseDragged,
-                      let panStartPoint, let panStartOrigin {
+        // Releasing the key stops panning immediately, but the mouse sequence
+        // still belongs to us until mouse-up because its mouse-down was consumed.
+        if isPanMouseSequenceActive {
+            if event.type == .leftMouseDragged, isPanKeyPressed,
+               let viewportCoordinateView, let panStartPoint, let panStartOrigin {
+                let clipView = scrollView.contentView
                 let start = clipView.convert(panStartPoint, from: viewportCoordinateView)
-                let current = clipView.convert(point, from: viewportCoordinateView)
+                let current = clipView.convert(event.locationInWindow, from: nil)
                 var bounds = clipView.bounds
                 bounds.origin = NSPoint(x: panStartOrigin.x + start.x - current.x,
                                         y: panStartOrigin.y + start.y - current.y)
                 clipView.scroll(to: clipView.constrainBoundsRect(bounds).origin)
                 scrollView.reflectScrolledClipView(clipView)
                 return nil
-            } else if event.type == .leftMouseUp {
-                self.panStartPoint = nil
-                self.panStartOrigin = nil
-                NSCursor.openHand.set()
+            }
+            if event.type == .leftMouseDragged { return nil }
+            if event.type == .leftMouseUp {
+                isPanMouseSequenceActive = false
+                panStartPoint = nil
+                panStartOrigin = nil
+                if isPanKeyPressed { NSCursor.openHand.set() }
                 return nil
             }
+            if event.type == .leftMouseDown {
+                isPanMouseSequenceActive = false
+                panStartPoint = nil
+                panStartOrigin = nil
+            }
+        }
+        if [.leftMouseDown, .rightMouseDown, .scrollWheel, .magnify].contains(event.type), !pointerIsInCanvas {
+            if event.type == .leftMouseDown || event.type == .rightMouseDown { setPanKeyPressed(false) }
+            return event
+        }
+
+        if event.type == .rightMouseDown, settings.rightMousePanEnabled,
+           let viewportCoordinateView {
+            finishCanvasDrag()
+            finishWatermarkDrag()
+            setPanKeyPressed(false)
+            isRightMousePanning = true
+            window.makeFirstResponder(scrollView.documentView)
+            rightPanStartPoint = viewportCoordinateView.convert(event.locationInWindow, from: nil)
+            rightPanStartOrigin = scrollView.contentView.bounds.origin
+            NSCursor.closedHand.set()
+            return nil
+        }
+        if isRightMousePanning, let viewportCoordinateView {
+            if event.type == .rightMouseDragged,
+               let rightPanStartPoint, let rightPanStartOrigin {
+                let clip = scrollView.contentView
+                let start = clip.convert(rightPanStartPoint, from: viewportCoordinateView)
+                let current = clip.convert(viewportCoordinateView.convert(event.locationInWindow, from: nil),
+                                           from: viewportCoordinateView)
+                var bounds = clip.bounds
+                bounds.origin = CGPoint(x: rightPanStartOrigin.x + start.x - current.x,
+                                        y: rightPanStartOrigin.y + start.y - current.y)
+                clip.scroll(to: clip.constrainBoundsRect(bounds).origin)
+                scrollView.reflectScrolledClipView(clip)
+                return nil
+            }
+            if event.type == .rightMouseUp {
+                finishRightMousePan()
+                return nil
+            }
+        }
+
+        let modifierZoom = event.modifierFlags.contains(settings.zoomModifier.flags)
+        // Precise scrolling is the native two-finger pan gesture. A modifier can
+        // still request zoom; ordinary mouse wheel notches zoom by default.
+        let wheelZoom = modifierZoom || (settings.wheelMode == .zoom && !event.hasPreciseScrollingDeltas)
+        if event.type == .magnify || (event.type == .scrollWheel && wheelZoom) {
+            guard dragCandidateID == nil, watermarkDrag == nil, panStartPoint == nil else { return nil }
+            let factor: CGFloat
+            if event.type == .magnify {
+                factor = exp(event.magnification)
+            } else {
+                // Bound unusually large wheel events while keeping the response proportional.
+                let unit: CGFloat = event.hasPreciseScrollingDeltas ? 0.006 : 0.06
+                let delta = max(-0.22, min(0.22, event.scrollingDeltaY * unit * settings.zoomSensitivity))
+                factor = exp(delta)
+            }
+            LongStitchViewportNavigation.zoom(factor, in: scrollView, atWindowPoint: event.locationInWindow)
+            return nil
+        }
+
+        if watermarkDrag != nil {
+            if event.type == .leftMouseDragged {
+                updateWatermarkDrag(atWindowPoint: event.locationInWindow)
+                return nil
+            }
+            if event.type == .leftMouseUp {
+                updateWatermarkDrag(atWindowPoint: event.locationInWindow)
+                finishWatermarkDrag()
+                return nil
+            }
+            if event.type == .scrollWheel { return nil }
+        }
+
+        if event.type == .leftMouseDown, settings.keyboardPanEnabled, settings.panKey.keyCode == nil {
+            setPanKeyPressed(event.modifierFlags.contains(settings.panKey.modifierFlags))
+        }
+        if event.type == .leftMouseDown, isPanKeyPressed, let viewportCoordinateView {
+            let point = viewportCoordinateView.convert(event.locationInWindow, from: nil)
+            let clipView = scrollView.contentView
+            window.makeFirstResponder(scrollView.documentView)
+            isPanMouseSequenceActive = true
+            panStartPoint = point
+            panStartOrigin = clipView.bounds.origin
+            NSCursor.closedHand.set()
+            return nil
         }
 
         if event.type == .leftMouseDown {
@@ -638,9 +875,23 @@ struct LongStitchView: View {
             let viewportPoint = viewportCoordinateView.convert(event.locationInWindow, from: nil)
             if selectedImageID != nil, toolbarFrameInViewport.contains(viewportPoint) { return event }
             finishCanvasDrag()
-            window.makeFirstResponder(scrollView)
+            window.makeFirstResponder(scrollView.documentView)
             let click = canvasCoordinateView.convert(event.locationInWindow, from: nil)
             let layout = canvasLayout
+            if let edge = selectedWatermarkEdge, let geometry = watermarkGeometry(for: edge) {
+                let frame = canvasCoordinateView.convert(geometry.rect, to: viewportCoordinateView)
+                if let corner = LongStitchWatermarkGeometry.handle(at: viewportPoint, in: frame) {
+                    beginWatermarkDrag(edge: edge, corner: corner, event: event)
+                    return nil
+                }
+            }
+            for edge in LongStitchEdge.allCases.reversed() {
+                if let geometry = watermarkGeometry(for: edge), geometry.rect.contains(click) {
+                    beginWatermarkDrag(edge: edge, corner: nil, event: event)
+                    return nil
+                }
+            }
+            selectedWatermarkEdge = nil
             for (index, item) in images.enumerated() {
                 let rect = layout.photoRects[index]
                 if rect.contains(click) {
@@ -687,10 +938,11 @@ struct LongStitchView: View {
               let draggedItemID,
               let item = images.first(where: { $0.id == draggedItemID }),
               let currentIndex = dragInsertionIndex else { return }
-        dragPointerLocation = point
+        if dragPointerLocation != point { dragPointerLocation = point }
         let viewportPoint = viewportCoordinateView.convert(point, from: nil)
-        dragPreviewCenter = CGPoint(x: viewportPoint.x - dragPointerOffset.width,
-                                    y: viewportPoint.y - dragPointerOffset.height)
+        let center = CGPoint(x: viewportPoint.x - dragPointerOffset.width,
+                             y: viewportPoint.y - dragPointerOffset.height)
+        if dragPreviewCenter != center { dragPreviewCenter = center }
 
         // Use fixed insertion-slot centers, independent of placeholder animation.
         let layout = LongStitchLayout(aspects: images.map(\.displayAspect), settings: settings)
@@ -773,23 +1025,38 @@ struct LongStitchView: View {
     }
 
     private func setPanKeyPressed(_ pressed: Bool) {
-        guard pressed != isPanKeyPressed else { return }
-        if pressed {
-            finishCanvasDrag()
-            NSCursor.openHand.push()
-        } else {
-            NSCursor.pop()
+        guard settings.keyboardPanEnabled || !pressed else { return }
+        if !pressed {
             panStartPoint = nil
             panStartOrigin = nil
         }
+        guard pressed != isPanKeyPressed else { return }
+        if pressed {
+            finishCanvasDrag()
+            finishWatermarkDrag()
+            NSCursor.openHand.push()
+        } else {
+            NSCursor.pop()
+        }
         isPanKeyPressed = pressed
+    }
+
+    private func finishRightMousePan() {
+        guard isRightMousePanning else { return }
+        isRightMousePanning = false
+        rightPanStartPoint = nil
+        rightPanStartOrigin = nil
+        NSCursor.arrow.set()
     }
 
     private func removeEventMonitor() {
         if let monitor = eventMonitor { NSEvent.removeMonitor(monitor) }
         eventMonitor = nil
         finishCanvasDrag()
+        finishWatermarkDrag()
+        finishRightMousePan()
         setPanKeyPressed(false)
+        isPanMouseSequenceActive = false
     }
 
     private func loadAndAddImage(from url: URL, completion: (() -> Void)? = nil) {
@@ -814,14 +1081,6 @@ private struct LongStitchCanvasEntry: Identifiable {
     let item: StitchItem
     let isPlaceholder: Bool
     var id: UUID { item.id }
-}
-
-private struct LongStitchPhotoFramesPreferenceKey: PreferenceKey {
-    static var defaultValue: [UUID: CGRect] = [:]
-
-    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
 }
 
 private struct LongStitchToolbarFramePreferenceKey: PreferenceKey {
@@ -851,81 +1110,13 @@ private final class LongStitchCoordinateNSView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
-struct ScrollViewConfigurator: NSViewRepresentable {
-    @Binding var scrollViewProxy: NSScrollView?
-    @Binding var currentScale: CGFloat
-    var onViewportChange: () -> Void
-
-    class Coordinator: NSObject {
-        var magnificationObserver: NSKeyValueObservation?
-        var viewportObservers: [NSObjectProtocol] = []
-        var onViewportChange: (() -> Void)?
-        var refreshScheduled = false
-
-        func scheduleRefresh() {
-            guard !refreshScheduled else { return }
-            refreshScheduled = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.refreshScheduled = false
-                self.onViewportChange?()
-            }
-        }
-
-        func disconnect() {
-            magnificationObserver?.invalidate()
-            magnificationObserver = nil
-            viewportObservers.forEach(NotificationCenter.default.removeObserver)
-            viewportObservers = []
-            onViewportChange = nil
-        }
-
-        deinit {
-            magnificationObserver?.invalidate()
-            viewportObservers.forEach(NotificationCenter.default.removeObserver)
-        }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        let coordinator = context.coordinator
-        coordinator.onViewportChange = onViewportChange
-        DispatchQueue.main.async {
-            if let scrollView = view.enclosingScrollView {
-                scrollView.allowsMagnification = true
-                scrollView.minMagnification = 0.001
-                scrollView.maxMagnification = 4.0
-                scrollView.hasHorizontalScroller = false
-                scrollView.hasVerticalScroller = false
-                scrollView.autohidesScrollers = true
-                scrollView.scrollerStyle = .overlay
-                self.scrollViewProxy = scrollView
-                coordinator.magnificationObserver = scrollView.observe(\.magnification, options: [.new]) { [weak coordinator] sv, _ in
-                    DispatchQueue.main.async {
-                        self.currentScale = sv.magnification
-                        coordinator?.scheduleRefresh()
-                    }
-                }
-                let clipView = scrollView.contentView
-                clipView.postsBoundsChangedNotifications = true
-                clipView.postsFrameChangedNotifications = true
-                for name in [NSView.boundsDidChangeNotification, NSView.frameDidChangeNotification] {
-                    let observer = NotificationCenter.default.addObserver(forName: name, object: clipView, queue: .main) { [weak coordinator] _ in
-                        coordinator?.scheduleRefresh()
-                    }
-                    coordinator.viewportObservers.append(observer)
-                }
-                coordinator.scheduleRefresh()
-            }
-        }
-        return view
-    }
-    func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.onViewportChange = onViewportChange
-    }
-
-    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
-        coordinator.disconnect()
-    }
+private struct LongStitchWatermarkDrag {
+    let edge: LongStitchEdge
+    let corner: LongStitchWatermarkCorner?
+    let originalMargin: LongStitchMargin
+    let startRect: CGRect
+    let region: CGRect
+    let imageSize: CGSize
+    let startPoint: CGPoint
+    var hasMoved = false
 }

@@ -121,7 +121,7 @@ import ImageIO
         checks += testLayersList(image)
         checks += testCanvasOrientation(image)
         checks += try CropRegressionTests.run()
-        checks += PreferencesRegressionTests.run()
+        checks += try PreferencesRegressionTests.run()
         print("PASS: \(checks) canvas and crop checks (layouts, history, layers, keyboard, rotation, crop geometry, native gestures, source quality, PNG/JPEG)")
     }
 

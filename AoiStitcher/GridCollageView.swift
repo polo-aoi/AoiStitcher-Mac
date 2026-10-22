@@ -25,7 +25,9 @@ struct GridCollageView: View {
     @State private var alertMessage: String?
     @State private var cropSession: GridCollageCropSession?
     @State private var isPreparingCrop = false
-    @State private var swapSourceID: String?
+    @AppStorage(AppPreferences.gridPanModeKey) private var panMode: DragPanMode = .rightMouse
+    @AppStorage(AppPreferences.gridPanKeyKey) private var panKey: LongStitchPanKey = .space
+    @State private var dragPreview: GridCollageDragPreview?
     @State private var pendingSlotRemoval: (targetCount: Int, photos: [GridCollagePhotoRemoval])?
     @State private var selectedToolbarSize = CGSize(width: 250, height: 34)
 
@@ -44,14 +46,9 @@ struct GridCollageView: View {
         .preferredColorScheme(theme == 2 ? .dark : .light)
         .onChange(of: isActive) { _, active in
             if !active {
-                swapSourceID = nil
+                dragPreview = nil
                 showingExportSettings = false
             }
-        }
-        .onChange(of: store.state.activeTemplateId) { _, _ in swapSourceID = nil }
-        .onChange(of: store.state.rootNode.slotIDs) { _, _ in swapSourceID = nil }
-        .onChange(of: store.isLoading) { _, loading in
-            if loading { swapSourceID = nil }
         }
         .onChange(of: store.status) { _, _ in
             if !isExporting {
@@ -121,7 +118,6 @@ struct GridCollageView: View {
                             clearTitle: "清空拼图",
                             clear: {
                                 guard canInteract else { return }
-                                swapSourceID = nil
                                 store.clearAll()
                                 resultMessage = nil
                                 exportedURL = nil
@@ -202,34 +198,26 @@ struct GridCollageView: View {
     private var workspace: some View {
         VStack(spacing: 0) {
             EditorToolbar {
-                if swapSourceID != nil {
-                    Label("点击另一格，交换照片", systemImage: "arrow.left.arrow.right")
-                        .font(.callout).foregroundStyle(Color.accentColor)
-                    Button("取消") { swapSourceID = nil }
-                        .keyboardShortcut(.cancelAction)
-                        .disabled(!canInteract)
-                } else {
-                    HStack(spacing: 5) {
-                        Text("\(store.photoCount) 张照片 · \(store.slotCount) 个格子")
-                            .font(.callout).foregroundStyle(.secondary)
-                            .fixedSize()
-                        Button { requestSlotCountChange(store.slotCount - 1) } label: {
-                            Image(systemName: "minus")
-                                .frame(width: 20, height: 20)
-                        }
-                        .buttonStyle(.bordered).controlSize(.mini)
-                        .disabled(!canInteract || store.slotCount <= GridCollageTemplates.supportedCounts.lowerBound)
-                        .help("减少一个拼图格")
-                        .accessibilityLabel("减少一个拼图格")
-                        Button { requestSlotCountChange(store.slotCount + 1) } label: {
-                            Image(systemName: "plus")
-                                .frame(width: 20, height: 20)
-                        }
-                        .buttonStyle(.bordered).controlSize(.mini)
-                        .disabled(!canInteract || store.slotCount >= GridCollageTemplates.supportedCounts.upperBound)
-                        .help("增加一个空白拼图格")
-                        .accessibilityLabel("增加一个拼图格")
+                HStack(spacing: 5) {
+                    Text("\(store.photoCount) 张照片 · \(store.slotCount) 个格子")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize()
+                    Button { requestSlotCountChange(store.slotCount - 1) } label: {
+                        Image(systemName: "minus")
+                            .frame(width: 20, height: 20)
                     }
+                    .buttonStyle(.bordered).controlSize(.mini)
+                    .disabled(!canInteract || store.slotCount <= GridCollageTemplates.supportedCounts.lowerBound)
+                    .help("减少一个拼图格")
+                    .accessibilityLabel("减少一个拼图格")
+                    Button { requestSlotCountChange(store.slotCount + 1) } label: {
+                        Image(systemName: "plus")
+                            .frame(width: 20, height: 20)
+                    }
+                    .buttonStyle(.bordered).controlSize(.mini)
+                    .disabled(!canInteract || store.slotCount >= GridCollageTemplates.supportedCounts.upperBound)
+                    .help("增加一个空白拼图格")
+                    .accessibilityLabel("增加一个拼图格")
                 }
                 if store.isLoading { ProgressView().controlSize(.small) }
                 Spacer()
@@ -275,16 +263,15 @@ struct GridCollageView: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             guard canInteract else { return }
-                            swapSourceID = nil
                             store.selectSlot(nil)
                         }
                     GridCollageCanvas(store: store,
                                       isActive: canInteract,
-                                      swapSourceID: $swapSourceID)
+                                      dragPreview: dragPreview)
                         .frame(width: fitted.width, height: fitted.height)
                         .position(x: fitted.midX, y: fitted.midY)
 
-                    if canInteract,
+                    if canInteract, dragPreview == nil,
                        let slot = store.selectedSlot, slot.hasImage,
                        let rect = GridCollageLayoutEngine.layout(
                         state: store.state,
@@ -306,8 +293,28 @@ struct GridCollageView: View {
                                 toolbarSize: selectedToolbarSize
                             ))
                     }
+                    if let dragPreview {
+                        GridCollagePhoto(slot: dragPreview.slot, viewport: dragPreview.frame.size)
+                            .clipShape(RoundedRectangle(cornerRadius: dragPreview.radius))
+                            .opacity(0.96)
+                            .overlay {
+                                RoundedRectangle(cornerRadius: dragPreview.radius)
+                                    .strokeBorder(Color.accentColor, lineWidth: 2)
+                            }
+                            .shadow(color: .black.opacity(0.24), radius: 12, y: 6)
+                            .position(x: dragPreview.frame.midX, y: dragPreview.frame.midY)
+                            .allowsHitTesting(false)
+                            .transaction { $0.animation = nil }
+                    }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.height)
+                .clipped()
+                .background {
+                    GridCollageInteractionReader(store: store, isActive: canInteract,
+                                                 canvasFrame: fitted, toolbarSize: selectedToolbarSize,
+                                                 panMode: panMode, panKey: panKey,
+                                                 dragPreview: $dragPreview)
+                }
                 .onPreferenceChange(SelectedImageToolbarSizePreferenceKey.self) { size in
                     guard size.width > 0, size.height > 0 else { return }
                     selectedToolbarSize = size
@@ -348,33 +355,14 @@ struct GridCollageView: View {
                 .accessibilityLabel("裁剪 / 水印")
                 .help(isPreparingCrop ? "正在读取完整图片…" : "编辑这张照片的裁剪和水印")
             Button {
-                swapSourceID = nil
                 store.replacePhoto(for: slot.id)
             } label: { Image(systemName: "photo.badge.arrow.down") }
                 .accessibilityLabel("替换照片")
                 .help("替换这格的照片")
-            Button { beginSwap(slot) } label: { Image(systemName: "arrow.left.arrow.right") }
-                .foregroundStyle(swapSourceID == slot.id ? Color.accentColor : Color.primary)
-                .accessibilityLabel(swapSourceID == slot.id ? "取消交换" : "交换位置")
-                .disabled(store.slotCount < 2)
-                .help("点击后选择另一格，或拖动到另一格，交换照片")
-                .onDrag {
-                    guard canInteract, store.slotCount > 1 else { return NSItemProvider() }
-                    swapSourceID = nil
-                    store.selectSlot(slot.id)
-                    let provider = NSItemProvider()
-                    provider.registerDataRepresentation(forTypeIdentifier: GridCollageDropContent.slotType,
-                                                        visibility: .ownProcess) { completion in
-                        completion(Data(slot.id.utf8), nil)
-                        return nil
-                    }
-                    return provider
-                }
             Button { store.resetTransform(for: slot.id) } label: { Image(systemName: "arrow.counterclockwise") }
                 .accessibilityLabel("重置取景")
                 .help("重置图片取景")
             Button(role: .destructive) {
-                swapSourceID = nil
                 store.removePhoto(slot.id)
             } label: { Image(systemName: "trash") }
                 .accessibilityLabel("删除照片")
@@ -401,24 +389,6 @@ struct GridCollageView: View {
         .accessibilityLabel("所选照片快捷操作")
     }
 
-    private func beginSwap(_ slot: CollageSlot) {
-        guard canInteract, slot.hasImage, store.slotCount > 1 else { return }
-        if swapSourceID == slot.id {
-            swapSourceID = nil
-        } else {
-            store.selectSlot(slot.id)
-            swapSourceID = slot.id
-        }
-    }
-
-    private func selectSlot(_ id: String) {
-        if let sourceID = swapSourceID {
-            if sourceID != id { store.swapImages(sourceID, id) }
-            swapSourceID = nil
-        }
-        store.selectSlot(id)
-    }
-
     private func requestSlotCountChange(_ count: Int) {
         switch store.setSlotCount(count) {
         case .changed, .unchanged:
@@ -435,7 +405,6 @@ struct GridCollageView: View {
         switch store.setSlotCount(request.targetCount, confirmingRemovalOf: photoIDs) {
         case .changed, .unchanged:
             pendingSlotRemoval = nil
-            swapSourceID = nil
         case .confirmationRequired(let targetCount, let photos):
             pendingSlotRemoval = (targetCount, photos)
         case .rejected(let message):
@@ -531,7 +500,6 @@ struct GridCollageView: View {
 
     private func beginExport() {
         guard canInteract, store.photoCount > 0 else { return }
-        swapSourceID = nil
         do {
             _ = try GridCollageRenderer.outputSize(for: store.state, width: outputWidth)
         } catch {
@@ -554,7 +522,6 @@ struct GridCollageView: View {
     private func beginCrop(_ slot: CollageSlot) {
         guard canInteract, slot.hasImage else { return }
         let photoID = slot.photoID
-        swapSourceID = nil
         showingExportSettings = false
         isPreparingCrop = true
         Task { @MainActor in
@@ -600,7 +567,7 @@ struct GridCollageView: View {
 private struct GridCollageCanvas: View {
     @ObservedObject var store: GridCollageStore
     var isActive: Bool
-    @Binding var swapSourceID: String?
+    let dragPreview: GridCollageDragPreview?
 
     var body: some View {
         GeometryReader { proxy in
@@ -615,7 +582,6 @@ private struct GridCollageCanvas: View {
                     .contentShape(Rectangle())
                     .onTapGesture {
                         guard isActive else { return }
-                        swapSourceID = nil
                         store.selectSlot(nil)
                     }
                 if let background = state.style.backgroundImage {
@@ -633,7 +599,8 @@ private struct GridCollageCanvas: View {
                             viewport: rect.size,
                             radius: min(state.style.borderRadius * factor, min(rect.width, rect.height) / 2),
                             isActive: isActive,
-                            swapSourceID: $swapSourceID
+                            isDragged: dragPreview?.slot.id == slot.id,
+                            isSwapTarget: dragPreview?.targetID == slot.id
                         )
                         .frame(width: rect.width, height: rect.height)
                         .position(x: rect.midX, y: rect.midY)
@@ -643,7 +610,7 @@ private struct GridCollageCanvas: View {
                     GridCollageDividerHandle(
                         store: store,
                         divider: divider,
-                        isActive: isActive && swapSourceID == nil,
+                        isActive: isActive,
                         onBackgroundTap: clearSelection
                     )
                 }
@@ -652,7 +619,6 @@ private struct GridCollageCanvas: View {
             .background(Color(nsColor: state.style.backgroundColor.nsColor))
             .clipShape(RoundedRectangle(cornerRadius: 3))
             .shadow(color: .black.opacity(0.14), radius: 13, y: 5)
-            .background(GridCollageScrollReader(store: store, isActive: isActive && swapSourceID == nil))
             .coordinateSpace(name: "aoipic-grid-canvas")
         }
         .accessibilityElement(children: .contain)
@@ -661,69 +627,7 @@ private struct GridCollageCanvas: View {
 
     private func clearSelection() {
         guard isActive else { return }
-        swapSourceID = nil
         store.selectSlot(nil)
-    }
-}
-
-/// Observe wheel and trackpad magnification only inside this canvas. Keeping
-/// the monitor on a background NSView lets SwiftUI retain ordinary pointer
-/// gestures and native drag-and-drop above it.
-private struct GridCollageScrollReader: NSViewRepresentable {
-    @ObservedObject var store: GridCollageStore
-    var isActive: Bool
-
-    func makeNSView(context: Context) -> GridCollageScrollView {
-        let view = GridCollageScrollView()
-        view.store = store
-        view.isActive = isActive
-        return view
-    }
-
-    func updateNSView(_ view: GridCollageScrollView, context: Context) {
-        view.store = store
-        view.isActive = isActive
-    }
-}
-
-private final class GridCollageScrollView: NSView {
-    weak var store: GridCollageStore?
-    var isActive = true
-    private var monitor: Any?
-    override var isFlipped: Bool { true }
-
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
-        guard window != nil else { return }
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify]) { [weak self] event in
-            guard let self, self.isActive, self.window == event.window,
-                  let store = self.store, !store.isLoading else { return event }
-            let point = self.convert(event.locationInWindow, from: nil)
-            guard self.bounds.contains(point) else { return event }
-            let layout = GridCollageLayoutEngine.layout(state: store.state, in: self.bounds)
-            guard let slotID = store.state.rootNode.slotIDs.first(where: {
-                layout.slotRects[$0]?.contains(point) == true
-            }), let slot = store.state.slots[slotID], slot.hasImage,
-                  let viewport = layout.slotRects[slotID]?.size else { return event }
-
-            let zoomFactor: CGFloat
-            if event.type == .magnify {
-                zoomFactor = max(0.1, 1 + event.magnification)
-            } else {
-                let sensitivity: CGFloat = event.hasPreciseScrollingDeltas ? 0.008 : 0.04
-                zoomFactor = exp(event.scrollingDeltaY * sensitivity)
-            }
-            store.selectSlot(slotID)
-            store.setScale(slot.transform.scale * zoomFactor, for: slotID, viewport: viewport)
-            return nil
-        }
-    }
-
-    deinit {
-        if let monitor { NSEvent.removeMonitor(monitor) }
     }
 }
 
@@ -733,17 +637,15 @@ private struct GridCollageSlotView: View {
     let viewport: CGSize
     let radius: CGFloat
     let isActive: Bool
-    @Binding var swapSourceID: String?
+    let isDragged: Bool
+    let isSwapTarget: Bool
 
     @State private var isHovered = false
     @State private var isDropTarget = false
-    @State private var panStart: CollageImageTransform?
     @State private var dropGeneration = UUID()
     @State private var acceptsDrops = false
 
     private var isSelected: Bool { store.state.selectedSlotId == slot.id }
-    private var isSwapTarget: Bool { swapSourceID != nil && swapSourceID != slot.id }
-    private var image: CGImage? { slot.previewImage ?? slot.image }
 
     var body: some View {
         ZStack {
@@ -752,17 +654,9 @@ private struct GridCollageSlotView: View {
                     .fill(Color(NSColor.windowBackgroundColor).opacity(0.55))
             }
 
-            if let image {
-                let imageRect = GridCollageLayoutEngine.imageRect(
-                    imageSize: CGSize(width: image.width, height: image.height),
-                    viewport: CGRect(origin: .zero, size: viewport),
-                    transform: slot.transform,
-                    fill: slot.fill
-                )
-                Image(nsImage: NSImage(cgImage: image, size: .zero))
-                    .resizable()
-                    .frame(width: imageRect.width, height: imageRect.height)
-                    .position(x: imageRect.midX, y: imageRect.midY)
+            if slot.hasImage {
+                GridCollagePhoto(slot: slot, viewport: viewport)
+                    .opacity(isDragged ? 0.22 : 1)
             } else if store.photoCount > 0 {
                 VStack(spacing: 7) {
                     Image(systemName: "plus")
@@ -773,14 +667,14 @@ private struct GridCollageSlotView: View {
                 .foregroundStyle(.secondary)
             }
 
-            if isDropTarget || (isSwapTarget && isHovered) {
+            if isDropTarget || isSwapTarget {
                 RoundedRectangle(cornerRadius: radius)
                     .fill(Color.accentColor.opacity(0.18))
                     .overlay(RoundedRectangle(cornerRadius: radius).stroke(Color.accentColor, lineWidth: 2))
                     .allowsHitTesting(false)
             }
 
-            if isSwapTarget && isHovered {
+            if isSwapTarget {
                 Label("交换到这里", systemImage: "arrow.left.arrow.right")
                     .font(.callout.weight(.medium))
                     .padding(.horizontal, 10).padding(.vertical, 6)
@@ -803,25 +697,18 @@ private struct GridCollageSlotView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             guard isActive else { return }
-            if let sourceID = swapSourceID {
-                if sourceID != slot.id { store.swapImages(sourceID, slot.id) }
-                swapSourceID = nil
-                store.selectSlot(slot.id)
-                return
-            }
             store.selectSlot(slot.id)
             if !slot.hasImage && isActive && !store.isLoading {
                 store.importPhotos(into: slot.id)
             }
         }
-        .simultaneousGesture(panGesture)
-        .onDrop(of: [GridCollageDropContent.slotType, UTType.fileURL.identifier],
+        .onDrop(of: [UTType.fileURL.identifier],
                 isTargeted: $isDropTarget, perform: receiveDrop)
         .onHover { hovering in
             isHovered = hovering
             guard isActive else { return }
             if hovering {
-                swapSourceID == nil ? NSCursor.openHand.set() : NSCursor.pointingHand.set()
+                slot.hasImage ? NSCursor.openHand.set() : NSCursor.pointingHand.set()
             } else {
                 NSCursor.arrow.set()
             }
@@ -834,33 +721,12 @@ private struct GridCollageSlotView: View {
         .onChange(of: isActive) { _, active in
             acceptsDrops = active
             dropGeneration = UUID()
-            if !active { panStart = nil }
         }
         .onChange(of: store.state.activeTemplateId) { _, _ in dropGeneration = UUID() }
         .onChange(of: slot.photoID) { _, _ in dropGeneration = UUID() }
-        .onChange(of: swapSourceID) { _, _ in panStart = nil }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(slot.hasImage ? slot.name : "空白图片格")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-
-    private var panGesture: some Gesture {
-        DragGesture(minimumDistance: 3)
-            .onChanged { value in
-                guard isActive, swapSourceID == nil, slot.imageSize != nil,
-                      viewport.width > 0, viewport.height > 0 else { return }
-                if panStart == nil {
-                    panStart = slot.transform
-                    store.selectSlot(slot.id)
-                }
-                guard let start = panStart else { return }
-                let translation = CGPoint(
-                    x: start.translateX + value.translation.width / viewport.width,
-                    y: start.translateY + value.translation.height / viewport.height
-                )
-                store.setPan(translation, for: slot.id, viewport: viewport)
-            }
-            .onEnded { _ in panStart = nil }
     }
 
     private func receiveDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -869,24 +735,6 @@ private struct GridCollageSlotView: View {
         let generation = UUID()
         dropGeneration = generation
         let templateID = store.state.activeTemplateId
-        let photoIDs = store.state.slots.mapValues(\.photoID)
-        swapSourceID = nil
-        if let provider = providers.first(where: {
-            $0.hasItemConformingToTypeIdentifier(GridCollageDropContent.slotType)
-        }) {
-            provider.loadDataRepresentation(forTypeIdentifier: GridCollageDropContent.slotType) { data, _ in
-                guard let data, let sourceID = String(data: data, encoding: .utf8) else { return }
-                DispatchQueue.main.async {
-                    guard isCurrentDrop(generation, templateID: templateID, targetPhotoID: targetPhotoID),
-                          sourceID != slot.id, let sourcePhotoID = photoIDs[sourceID],
-                          store.state.slots[sourceID]?.photoID == sourcePhotoID,
-                          store.state.slots[sourceID]?.hasImage == true else { return }
-                    store.swapImages(sourceID, slot.id)
-                    store.selectSlot(slot.id)
-                }
-            }
-            return true
-        }
         return GridCollageDropContent.loadFileURLs(from: providers) { urls in
             guard isCurrentDrop(generation, templateID: templateID, targetPhotoID: targetPhotoID),
                   !urls.isEmpty else { return }
@@ -901,6 +749,29 @@ private struct GridCollageSlotView: View {
         acceptsDrops && dropGeneration == generation && !store.isLoading &&
             store.state.activeTemplateId == templateID &&
             store.state.slots[slot.id]?.photoID == targetPhotoID
+    }
+}
+
+private struct GridCollagePhoto: View {
+    let slot: CollageSlot
+    let viewport: CGSize
+
+    var body: some View {
+        ZStack {
+            if let image = slot.previewImage ?? slot.image {
+                let rect = GridCollageLayoutEngine.imageRect(
+                    imageSize: CGSize(width: image.width, height: image.height),
+                    viewport: CGRect(origin: .zero, size: viewport),
+                    transform: slot.transform, fill: slot.fill
+                )
+                Image(nsImage: NSImage(cgImage: image, size: .zero))
+                    .resizable()
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+            }
+        }
+        .frame(width: viewport.width, height: viewport.height)
+        .clipped()
     }
 }
 
@@ -1021,8 +892,6 @@ private extension CollageColor {
 }
 
 private enum GridCollageDropContent {
-    static let slotType = "com.aoipic.grid-slot"
-
     /// Collect a multi-file drop before importing, preserving the drag order.
     /// One coordinated import avoids replacing the same target repeatedly.
     static func loadFileURLs(from providers: [NSItemProvider],

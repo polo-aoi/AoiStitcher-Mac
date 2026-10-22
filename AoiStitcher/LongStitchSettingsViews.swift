@@ -34,14 +34,51 @@ struct LongStitchSidebarPage<Content: View>: View {
 
 struct LongStitchEdgeEditor: View {
     @ObservedObject var preferences: LongStitchPreferences
-    @State var edge: LongStitchEdge
+    let edge: LongStitchEdge
+    var canvasLayout: LongStitchLayout?
     var onWillChange: (() -> Void)?
     var onBack: () -> Void
+    var onSelectEdge: (LongStitchEdge) -> Void
+    var onLocateWatermark: ((LongStitchEdge) -> Void)?
     var openLibrary: (LongStitchEdge) -> Void
     @State private var copyTargets: Set<LongStitchEdge> = []
+    @State private var watermarkImageSize: CGSize?
 
     private var margin: LongStitchMargin { preferences.settings[edge].sanitized() }
     private var item: WatermarkLibraryItem? { preferences.library.item(id: margin.watermarkID) }
+    private var region: CGRect? { canvasLayout?.marginRects[edge] }
+    private var effectiveScale: Double {
+        guard let canvasLayout, let region, let watermarkImageSize else { return margin.watermarkScale }
+        return LongStitchLayout.effectiveWatermarkScale(
+            imageSize: watermarkImageSize, in: region,
+            contentShortEdge: min(canvasLayout.contentRect.width, canvasLayout.contentRect.height), margin: margin
+        )
+    }
+    private var maximumWatermarkSize: CGSize? {
+        guard let region, let watermarkImageSize, region.width > 0, region.height > 0 else { return nil }
+        return LongStitchLayout.maximumWatermarkSize(imageSize: watermarkImageSize, in: region)
+    }
+    private var watermarkRect: CGRect? {
+        guard let canvasLayout, let region, let watermarkImageSize else { return nil }
+        return LongStitchLayout.watermarkRect(
+            imageSize: watermarkImageSize, in: region,
+            contentShortEdge: min(canvasLayout.contentRect.width, canvasLayout.contentRect.height), margin: margin
+        )
+    }
+    private var canMoveHorizontally: Bool {
+        guard margin.size > 0 else { return false }
+        guard let region, let watermarkRect else { return true }
+        return region.width - watermarkRect.width > 0.01
+    }
+    private var canMoveVertically: Bool {
+        guard margin.size > 0 else { return false }
+        guard let region, let watermarkRect else { return true }
+        return region.height - watermarkRect.height > 0.01
+    }
+    private var scalePercentageBinding: Binding<Double> {
+        let scale = binding(\.watermarkScale)
+        return Binding(get: { effectiveScale * 100 }, set: { scale.wrappedValue = $0 / 100 })
+    }
 
     private func binding<Value>(_ keyPath: WritableKeyPath<LongStitchMargin, Value>) -> Binding<Value> {
         let target = edge
@@ -67,7 +104,7 @@ struct LongStitchEdgeEditor: View {
             VStack(alignment: .leading, spacing: 16) {
                 Picker("调整方向", selection: Binding(get: { edge }, set: { value in
                     NSApp.keyWindow?.makeFirstResponder(nil)
-                    edge = value
+                    onSelectEdge(value)
                 })) {
                     ForEach(LongStitchEdge.allCases) { edge in Text(edge.title).tag(edge) }
                 }.pickerStyle(.segmented).labelsHidden()
@@ -110,6 +147,14 @@ struct LongStitchEdgeEditor: View {
                             preferences.selectWatermark(nil, for: edge)
                         }.buttonStyle(.borderless).disabled(item == nil)
                     }
+                    Button {
+                        NSApp.keyWindow?.makeFirstResponder(nil)
+                        onLocateWatermark?(edge)
+                    } label: {
+                        Label("在画布中定位", systemImage: "scope")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .disabled(onLocateWatermark == nil || item == nil || margin.size <= 0)
                 }
                 .disabled(!margin.isEnabled)
 
@@ -117,14 +162,23 @@ struct LongStitchEdgeEditor: View {
                     HStack {
                         Text("水印大小")
                         Spacer()
-                        LongStitchNumberField(title: "水印缩放", value: binding(\.watermarkScale),
-                                              range: 0.05...5, decimals: 2)
-                        Text("倍").foregroundStyle(.secondary)
+                        LongStitchNumberField(title: "水印大小百分比", value: scalePercentageBinding,
+                                              range: 5...100, decimals: 1)
+                        Text("%").foregroundStyle(.secondary)
                     }
-                    Slider(value: binding(\.watermarkScale), in: 0.05...5) { editing in
+                    Slider(value: scalePercentageBinding, in: 5...100) { editing in
                         if editing { LongStitchNumericEditing.discardDrafts() }
                     }
-                        .accessibilityLabel("水印缩放")
+                        .accessibilityLabel("水印大小百分比")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("100% 为保持原比例、完整放入当前留白的最大尺寸。")
+                        if let maximumWatermarkSize {
+                            Text("最大尺寸：\(Int(maximumWatermarkSize.width.rounded())) × \(Int(maximumWatermarkSize.height.rounded())) px")
+                                .monospacedDigit()
+                        }
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
                     HStack(alignment: .top, spacing: 14) {
                         positionGrid
@@ -135,8 +189,14 @@ struct LongStitchEdgeEditor: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }.frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    percentageRow("水平偏移", keyPath: \.offsetX)
-                    percentageRow("垂直偏移", keyPath: \.offsetY)
+                    percentageRow("水平偏移", keyPath: \.offsetX, isAvailable: canMoveHorizontally,
+                                  unavailableReason: margin.size <= 0
+                                    ? "请先增加留白大小，再调整水印位置。"
+                                    : "水印已占满留白宽度，缩小水印后可左右移动。")
+                    percentageRow("垂直偏移", keyPath: \.offsetY, isAvailable: canMoveVertically,
+                                  unavailableReason: margin.size <= 0
+                                    ? "请先增加留白大小，再调整水印位置。"
+                                    : "水印已占满留白高度，缩小水印后可上下移动。")
                     Text("−100% 为左侧或顶部，0% 居中，100% 为右侧或底部。")
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -152,6 +212,7 @@ struct LongStitchEdgeEditor: View {
             }.id(edge)
         }
         .onChange(of: edge) { _, _ in copyTargets.removeAll() }
+        .task(id: item?.id) { watermarkImageSize = preferences.library.image(for: item?.id)?.size }
     }
 
     private var positionGrid: some View {
@@ -161,12 +222,14 @@ struct LongStitchEdgeEditor: View {
                     ForEach(0..<3, id: \.self) { column in
                         let x = Double(column - 1)
                         let y = Double(row - 1)
-                        let selected = abs(margin.offsetX - x) < 0.005 && abs(margin.offsetY - y) < 0.005
+                        let selected = (canMoveHorizontally ? abs(margin.offsetX - x) < 0.005 : column == 1)
+                            && (canMoveVertically ? abs(margin.offsetY - y) < 0.005 : row == 1)
                         Button {
                             LongStitchNumericEditing.discardDrafts()
                             onWillChange?()
                             var next = preferences.settings
-                            next[edge].offsetX = x; next[edge].offsetY = y
+                            if canMoveHorizontally { next[edge].offsetX = x }
+                            if canMoveVertically { next[edge].offsetY = y }
                             preferences.settings = next
                         } label: {
                             Circle().fill(selected ? Color.accentColor : Color.secondary.opacity(0.55))
@@ -182,20 +245,30 @@ struct LongStitchEdgeEditor: View {
                 }
             }
         }
+        .disabled(!canMoveHorizontally && !canMoveVertically)
     }
 
-    private func percentageRow(_ title: String, keyPath: WritableKeyPath<LongStitchMargin, Double>) -> some View {
+    private func percentageRow(_ title: String, keyPath: WritableKeyPath<LongStitchMargin, Double>,
+                               isAvailable: Bool, unavailableReason: String) -> some View {
         VStack(spacing: 6) {
             HStack {
                 Text(title)
                 Spacer()
                 LongStitchNumberField(title: title, value: percentageBinding(keyPath), range: -100...100, decimals: 1)
+                    .disabled(!isAvailable)
                 Text("%").foregroundStyle(.secondary)
             }
             Slider(value: percentageBinding(keyPath), in: -100...100) { editing in
                 if editing { LongStitchNumericEditing.discardDrafts() }
             }
                 .accessibilityLabel(title)
+                .disabled(!isAvailable)
+            if !isAvailable {
+                Text(unavailableReason)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 
@@ -453,13 +526,35 @@ struct LongStitchShortcutAndExportPage: View {
         LongStitchSidebarPage(title: "快捷键与导出", onBack: onBack) {
             VStack(alignment: .leading, spacing: 18) {
                 EditorSection("画布快捷键") {
-                    Picker("拖拽查看", selection: $preferences.settings.panKey) {
-                        ForEach(LongStitchPanKey.allCases) { key in Text(key.title).tag(key) }
+                    DragPanSettingsFields(title: "拖动画布", mode: $preferences.settings.panMode,
+                                          key: $preferences.settings.panKey)
+                    Picker("滚轮行为", selection: $preferences.settings.wheelMode) {
+                        ForEach(LongStitchWheelMode.allCases) { mode in Text(mode.title).tag(mode) }
                     }
-                    Picker("滚轮缩放", selection: $preferences.settings.zoomModifier) {
+                    Picker("缩放修饰键", selection: $preferences.settings.zoomModifier) {
                         ForEach(LongStitchZoomModifier.allCases) { key in Text(key.title).tag(key) }
                     }
-                    Text("按住平移键拖动画布；按住缩放修饰键滚动。触控板双指捏合也可缩放。")
+                    VStack(spacing: 6) {
+                        HStack {
+                            Text("缩放灵敏度")
+                            Spacer()
+                            LongStitchNumberField(title: "缩放灵敏度", value: $preferences.settings.zoomSensitivity,
+                                                  range: 0.25...2, decimals: 2)
+                            Text("倍").foregroundStyle(.secondary)
+                        }
+                        Slider(value: $preferences.settings.zoomSensitivity, in: 0.25...2) { editing in
+                            if editing { LongStitchNumericEditing.discardDrafts() }
+                        }
+                        .accessibilityLabel("缩放灵敏度")
+                        HStack {
+                            Text("更精细")
+                            Spacer()
+                            Text("更快速")
+                        }.font(.caption).foregroundStyle(.secondary)
+                    }
+                    Text(preferences.settings.wheelMode == .zoom
+                         ? "鼠标滚轮缩放；触控板双指移动画布，捏合缩放。"
+                         : "滚动可移动画布，按住缩放修饰键滚动可缩放；触控板捏合也可缩放。")
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

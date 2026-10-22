@@ -14,6 +14,10 @@ xcrun swiftc -parse-as-library -swift-version 5 -default-isolation MainActor \
     "$canvas_project_root/AoiStitcher/CropEditorView.swift" \
     "$canvas_project_root/AoiStitcher/EditorComponents.swift" \
     "$canvas_project_root/AoiStitcher/AppPreferences.swift" \
+    "$canvas_project_root/AoiStitcher/LongStitchModel.swift" \
+    "$canvas_project_root/AoiStitcher/WatermarkLibrary.swift" \
+    "$canvas_project_root/AoiStitcher/LongStitchSidebar.swift" \
+    "$canvas_project_root/AoiStitcher/LongStitchSettingsViews.swift" \
     "$canvas_project_root/AoiStitcher/BorderWorkspaceView.swift" \
     "$canvas_project_root/AoiStitcher/AppSettingsView.swift" \
     "$canvas_project_root/Tests/CanvasRegressionTests.swift" \

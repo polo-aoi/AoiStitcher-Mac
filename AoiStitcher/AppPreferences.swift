@@ -4,8 +4,10 @@ enum AppPreferences {
     static let defaultExportWidth = "2560"
     static let defaultExportPNG = true
     static let defaultTheme = 1
+    static let gridPanModeKey = "gridCollage.panMode"
+    static let gridPanKeyKey = "gridCollage.panKey"
     static let exportKeys = ["exportWidth", "exportPNG"]
-    static let preferenceKeys = exportKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir"]
+    static let preferenceKeys = exportKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey]
 
     static func exportWidth(_ text: String) -> Int? {
         guard let width = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)), (1...16384).contains(width) else { return nil }
@@ -20,6 +22,8 @@ enum AppPreferences {
     static func restoreDefaults(in defaults: UserDefaults = .standard) {
         restoreExportDefaults(in: defaults)
         defaults.set(defaultTheme, forKey: "colorSchemeStyle")
+        defaults.removeObject(forKey: gridPanModeKey)
+        defaults.removeObject(forKey: gridPanKeyKey)
         for key in preferenceKeys where key.hasPrefix("last") { defaults.removeObject(forKey: key) }
     }
 }

@@ -1,6 +1,58 @@
 import SwiftUI
 import AppKit
 
+struct DragPanSettingsFields: View {
+    let title: String
+    @Binding var mode: DragPanMode
+    @Binding var key: LongStitchPanKey
+
+    var body: some View {
+        Picker(title, selection: $mode) {
+            ForEach(DragPanMode.allCases) { mode in Text(mode.title).tag(mode) }
+        }
+        .pickerStyle(.radioGroup)
+        if mode == .keyboard {
+            Picker("按住按键", selection: $key) {
+                ForEach(LongStitchPanKey.allCases) { key in Text(key.title).tag(key) }
+            }
+            Text("按住\(key.title)，再用左键拖拽。")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct GridCollageSettingsView: View {
+    @AppStorage(AppPreferences.gridPanModeKey) private var panMode: DragPanMode = .rightMouse
+    @AppStorage(AppPreferences.gridPanKeyKey) private var panKey: LongStitchPanKey = .space
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                Text("标准拼图设置").font(.title2.weight(.semibold))
+                EditorSection("图片快捷键") {
+                    Text("左键单击选中图片，左键拖到另一格可交换图片位置。")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    DragPanSettingsFields(title: "框内移动图片", mode: $panMode, key: $panKey)
+                }
+                Divider()
+                Text("选中图片后，滚轮或触控板捏合可缩放图片。")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button {
+                    panMode = .rightMouse
+                    panKey = .space
+                } label: {
+                    Label("恢复默认快捷键", systemImage: "arrow.counterclockwise")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(24)
+        }
+    }
+}
+
 struct ExportSettingsFields: View {
     @AppStorage("exportWidth") private var width = AppPreferences.defaultExportWidth
     @AppStorage("exportPNG") private var png = AppPreferences.defaultExportPNG
@@ -66,15 +118,8 @@ struct AppSettingsView: View {
                 .tabItem { Label("通用", systemImage: "gearshape") }
             LongStitchSidebar(preferences: longStitchPreferences, includePreferences: true)
                 .tabItem { Label("长图拼接", systemImage: "rectangle.split.1x2") }
-            VStack(alignment: .leading, spacing: 12) {
-                Text("标准拼图设置").font(.title2.weight(.semibold))
-                Text("标准拼图的独立偏好将在后续版本中提供。当前可在工作区调整画布样式。")
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer()
-            }
-            .padding(24)
-            .tabItem { Label("标准拼图", systemImage: "square.grid.2x2") }
+            GridCollageSettingsView()
+                .tabItem { Label("标准拼图", systemImage: "square.grid.2x2") }
         }
         .padding(12)
         .frame(width: 600, height: 680)

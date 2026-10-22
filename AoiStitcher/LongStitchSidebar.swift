@@ -6,7 +6,26 @@ struct LongStitchSidebar: View {
     @ObservedObject var preferences: LongStitchPreferences
     var includePreferences = false
     var onWillChange: (() -> Void)? = nil
+    @Binding var selectedWatermarkEdge: LongStitchEdge?
+    var canvasLayout: LongStitchLayout? = nil
+    var onLocateWatermark: ((LongStitchEdge) -> Void)? = nil
+    var watermarkEditorRequestID: UUID? = nil
     @State private var path: [Route] = []
+
+    init(preferences: LongStitchPreferences, includePreferences: Bool = false,
+         onWillChange: (() -> Void)? = nil,
+         selectedWatermarkEdge: Binding<LongStitchEdge?> = .constant(nil),
+         canvasLayout: LongStitchLayout? = nil,
+         onLocateWatermark: ((LongStitchEdge) -> Void)? = nil,
+         watermarkEditorRequestID: UUID? = nil) {
+        self.preferences = preferences
+        self.includePreferences = includePreferences
+        self.onWillChange = onWillChange
+        self._selectedWatermarkEdge = selectedWatermarkEdge
+        self.canvasLayout = canvasLayout
+        self.onLocateWatermark = onLocateWatermark
+        self.watermarkEditorRequestID = watermarkEditorRequestID
+    }
 
     private enum Route: Hashable {
         case edgeEditor(LongStitchEdge)
@@ -21,7 +40,7 @@ struct LongStitchSidebar: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     LongStitchLayoutControls(preferences: preferences, onWillChange: onWillChange) {
-                        navigate(.edgeEditor($0))
+                        showEdgeEditor($0)
                     } openLibrary: { navigate(.library(nil)) }
                     if includePreferences {
                         Divider()
@@ -56,8 +75,11 @@ struct LongStitchSidebar: View {
                 switch route {
                 case .edgeEditor(let edge):
                     LongStitchEdgeEditor(preferences: preferences, edge: edge,
+                                         canvasLayout: canvasLayout,
                                          onWillChange: onWillChange,
                                          onBack: goBack,
+                                         onSelectEdge: showEdgeEditor,
+                                         onLocateWatermark: onLocateWatermark,
                                          openLibrary: { target in
                                              endEditing()
                                              path = [.edgeEditor(target), .library(target)]
@@ -100,11 +122,22 @@ struct LongStitchSidebar: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(NSColor.windowBackgroundColor))
         .transaction { $0.animation = nil }
+        .onChange(of: selectedWatermarkEdge) { _, edge in
+            if let edge { showEdgeEditor(edge) }
+        }
+        .onChange(of: watermarkEditorRequestID) { _, _ in
+            if let edge = selectedWatermarkEdge { showEdgeEditor(edge) }
+        }
     }
 
     private func endEditing() { NSApp.keyWindow?.makeFirstResponder(nil) }
     private func navigate(_ route: Route) { endEditing(); path.append(route) }
     private func goBack() { endEditing(); if !path.isEmpty { path.removeLast() } }
+    private func showEdgeEditor(_ edge: LongStitchEdge) {
+        endEditing()
+        selectedWatermarkEdge = edge
+        path = [.edgeEditor(edge)]
+    }
 }
 
 struct LongStitchLayoutControls: View {
@@ -397,10 +430,10 @@ struct LongStitchStableScrollViewConfigurator: NSViewRepresentable {
     func updateNSView(_ view: NSView, context: Context) {
         DispatchQueue.main.async {
             guard let scrollView = view.enclosingScrollView else { return }
-            if scrollView.scrollerStyle != .legacy { scrollView.scrollerStyle = .legacy }
+            if scrollView.scrollerStyle != .overlay { scrollView.scrollerStyle = .overlay }
             if !scrollView.hasVerticalScroller { scrollView.hasVerticalScroller = true }
             if scrollView.hasHorizontalScroller { scrollView.hasHorizontalScroller = false }
-            if scrollView.autohidesScrollers { scrollView.autohidesScrollers = false }
+            if !scrollView.autohidesScrollers { scrollView.autohidesScrollers = true }
         }
     }
 }
