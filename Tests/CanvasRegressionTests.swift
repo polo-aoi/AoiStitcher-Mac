@@ -1,6 +1,12 @@
 import AppKit
 import ImageIO
 
+/// Supply eligibility for direct handler calls without ordering a window onscreen
+/// or changing the application's actual key window.
+@MainActor private final class CanvasInteractionTestWindow: NSWindow {
+    override var isKeyWindow: Bool { true }
+}
+
 @main struct CanvasRegressionTests {
     @MainActor static func main() throws {
         var checks = 0
@@ -122,7 +128,8 @@ import ImageIO
         checks += testCanvasOrientation(image)
         checks += try CropRegressionTests.run()
         checks += try PreferencesRegressionTests.run()
-        print("PASS: \(checks) canvas and crop checks (layouts, history, layers, keyboard, rotation, crop geometry, native gestures, source quality, PNG/JPEG)")
+        checks += try ProjectLibraryRegressionTests.run()
+        print("PASS: \(checks) canvas, crop, and project checks (layouts, history, layers, keyboard, rotation, crop geometry, native gestures, source quality, PNG/JPEG)")
     }
 
     @MainActor private static func testWorkspace(_ image: CGImage) -> Int {
@@ -133,7 +140,7 @@ import ImageIO
                                 center: CGPoint(x: 400, y: 300), size: CGSize(width: 300, height: 200))
         store.mutate { $0.layers = [layer] }
         let view = CanvasWorkspaceView(frame: CGRect(x: 0, y: 0, width: 1000, height: 800))
-        let window = NSWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        let window = CanvasInteractionTestWindow(contentRect: view.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = view; view.store = store
         view.snapshot = CanvasRenderSnapshot(store.document, preview: true)
         let scale: CGFloat = 1.125
@@ -182,12 +189,16 @@ import ImageIO
         drag(from: lockedCenter, to: CGPoint(x: lockedCenter.x + 20, y: lockedCenter.y + 20))
         require(store.selectedLayer!.center == lockedCenter, "Locked material ignores mouse dragging")
         view.rightMouseDown(with: event(.rightMouseDown, at: lockedCenter))
+        require(inspected == nil, "Right mouse-down waits to distinguish a click from viewport panning")
+        view.rightMouseUp(with: event(.rightMouseUp, at: lockedCenter))
         require(inspected == layer.id, "Right-click opens the hit material's parameters, including locked materials")
         inspected = nil
         view.rightMouseDown(with: event(.rightMouseDown, at: CGPoint(x: 10, y: 10)))
+        view.rightMouseUp(with: event(.rightMouseUp, at: CGPoint(x: 10, y: 10)))
         require(inspected == nil, "Right-clicking empty canvas does not open parameters")
+        view.disconnect()
         window.close()
-        return 9
+        return 10
     }
 
     @MainActor private static func testLayerOrdering(_ image: CGImage) -> Int {

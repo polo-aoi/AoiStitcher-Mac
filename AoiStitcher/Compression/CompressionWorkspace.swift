@@ -8,23 +8,28 @@ final class CompressionWorkspace: ObservableObject {
     static let customSettingsKey = "aoipic.compression.customSettings"
     static let outputFolderKey = "aoipic.compression.outputFolder"
 
-    @Published private(set) var photos: [PhotoItem] = []
+    @Published private(set) var photos: [PhotoItem] = [] {
+        didSet {
+            if oldValue.map(\.id) != photos.map(\.id) { publishProjectStatus() }
+        }
+    }
     @Published var selectedIDs: Set<UUID> = []
     @Published var settings: ExportSettings {
         didSet {
             persist(settings, key: Self.settingsKey)
             if !settings.isPlatformPreset { customSettings = settings; persist(settings, key: Self.customSettingsKey) }
-            if oldValue != settings && !isExporting {
+            if Self.renderSignature(oldValue) != Self.renderSignature(settings) && !isExporting {
                 for index in photos.indices where photos[index].width > 0 {
                     photos[index].status = .waiting
                     photos[index].outputBytes = nil; photos[index].failure = nil; photos[index].exportedURL = nil
                 }
                 statusMessage = nil
             }
+            publishProjectStatus()
         }
     }
-    @Published private(set) var isImporting = false
-    @Published private(set) var isExporting = false
+    @Published private(set) var isImporting = false { didSet { publishProjectStatus() } }
+    @Published private(set) var isExporting = false { didSet { publishProjectStatus() } }
     @Published private(set) var isCancelling = false
     @Published private(set) var exportCompleted = 0
     @Published private(set) var exportTotal = 0
@@ -43,6 +48,37 @@ final class CompressionWorkspace: ObservableObject {
     private let processor = CompressionProcessor()
     private var customSettings: ExportSettings
     private var cancellation: CompressionCancellation?
+    private weak var projectLibrary: ProjectLibraryStore?
+    private weak var projectBridge: ProjectEditorBridge?
+    private var exportedSignatures: [UUID: String] = [:]
+
+    func connectProject(library: ProjectLibraryStore, bridge: ProjectEditorBridge) {
+        projectLibrary = library; projectBridge = bridge
+        publishProjectStatus()
+    }
+
+    private static func renderSignature(_ settings: ExportSettings) -> String {
+        var rendered = settings
+        rendered.applyPlatformRecipe()
+        // Revealing the output folder does not change the exported image.
+        rendered.revealAfterExport = false
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        return (try? encoder.encode(rendered).base64EncodedString()) ?? ""
+    }
+
+    private func signature(for photo: PhotoItem, renderedSettings: String) -> String {
+        photo.id.uuidString + "|" + photo.url.standardizedFileURL.path + "|" + renderedSettings
+    }
+
+    private func publishProjectStatus() {
+        guard let projectBridge else { return }
+        let renderedSettings = Self.renderSignature(settings)
+        let signature = photos.map { self.signature(for: $0, renderedSettings: renderedSettings) }.joined(separator: "\n")
+        projectBridge.update(operation: .compression, count: photos.count, signature: signature, isBusy: isBusy)
+        if !photos.isEmpty, photos.allSatisfy({ exportedSignatures[$0.id] == self.signature(for: $0, renderedSettings: renderedSettings) }) {
+            projectBridge.didExport(operation: .compression, signature: signature)
+        }
+    }
 
     init(defaults: UserDefaults = .standard, legacyDefaults: UserDefaults? = UserDefaults(suiteName: "studio.aoi.fit")) {
         self.defaults = defaults
@@ -106,13 +142,41 @@ final class CompressionWorkspace: ObservableObject {
     }
 
     @discardableResult
-    func importURLs(_ urls: [URL]) -> Bool {
+    func importURLs(_ urls: [URL], mode: ProjectImportMode = .append, preservingInputOrder: Bool = false) -> Bool {
         guard !isBusy, !urls.isEmpty else { return false }
         isImporting = true; statusMessage = nil
-        let existing = Set(photos.map { $0.url.resolvingSymlinksInPath().standardizedFileURL.path })
+        let existing = mode == .replace ? Set<String>()
+            : Set(photos.map { $0.url.resolvingSymlinksInPath().standardizedFileURL.path })
+        let expectedPaths = Set(urls.map { $0.resolvingSymlinksInPath().standardizedFileURL.path })
+        var inputOrder: [String: Int] = [:]
+        if preservingInputOrder {
+            for (index, url) in urls.enumerated() {
+                let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+                if inputOrder[path] == nil { inputOrder[path] = index }
+            }
+        }
+        let requestedOrder = inputOrder
         processor.importPhotos(urls, existing: existing) { [weak self] added in
             guard let self else { return }
-            self.photos.append(contentsOf: added); self.isImporting = false
+            let ordered = preservingInputOrder ? added.enumerated().sorted { lhs, rhs in
+                let leftPath = lhs.element.url.resolvingSymlinksInPath().standardizedFileURL.path
+                let rightPath = rhs.element.url.resolvingSymlinksInPath().standardizedFileURL.path
+                let leftIndex = requestedOrder[leftPath] ?? Int.max
+                let rightIndex = requestedOrder[rightPath] ?? Int.max
+                return leftIndex == rightIndex ? lhs.offset < rhs.offset : leftIndex < rightIndex
+            }.map(\.element) : added
+            if mode == .replace {
+                let receivedPaths = Set(ordered.map { $0.url.resolvingSymlinksInPath().standardizedFileURL.path })
+                guard !ordered.isEmpty, ordered.allSatisfy({ $0.status != .failed }), receivedPaths == expectedPaths else {
+                    self.isImporting = false
+                    self.errorMessage = "新照片未能全部读取，已保留当前列表。请检查文件后重试。"
+                    return
+                }
+                self.exportedSignatures.removeAll()
+                self.selectedIDs.removeAll()
+                self.photos = ordered
+            } else { self.photos.append(contentsOf: ordered) }
+            self.isImporting = false
             if added.isEmpty { self.statusMessage = "没有新照片可添加" }
             else if added.contains(where: { $0.status == .failed }) {
                 self.statusMessage = "部分文件读取失败，点击对应行的“失败”查看详情。"
@@ -123,12 +187,14 @@ final class CompressionWorkspace: ObservableObject {
 
     func remove(_ ids: Set<UUID>) {
         guard !isBusy else { return }
+        for id in ids { exportedSignatures.removeValue(forKey: id) }
         photos.removeAll { ids.contains($0.id) }; selectedIDs.subtract(ids)
         statusMessage = nil
     }
 
     func clearPhotos() {
         guard !isBusy else { return }
+        exportedSignatures.removeAll()
         photos.removeAll(); selectedIDs.removeAll(); statusMessage = nil
         exportCompleted = 0; exportTotal = 0
     }
@@ -158,6 +224,15 @@ final class CompressionWorkspace: ObservableObject {
     private func beginBatch(_ items: [PhotoItem], directory: URL) {
         var snapshot = settings
         snapshot.applyPlatformRecipe()
+        let renderedSettings = Self.renderSignature(snapshot)
+        let signatures = Dictionary(uniqueKeysWithValues: items.map { ($0.id, signature(for: $0, renderedSettings: renderedSettings)) })
+        let contexts = Dictionary(uniqueKeysWithValues: items.compactMap { item -> (UUID, ProjectExportContext)? in
+            guard let context = projectLibrary?.captureExport(operation: .compression, sourceURLs: [item.url]) else { return nil }
+            return (item.id, context)
+        })
+        let exportLibrary = projectLibrary
+        let exportBridge = projectBridge
+        exportBridge?.beginExport()
         let flag = CompressionCancellation()
         cancellation = flag; isExporting = true; isCancelling = false; statusMessage = nil
         exportCompleted = 0; exportTotal = items.count
@@ -166,9 +241,14 @@ final class CompressionWorkspace: ObservableObject {
         processor.export(items, settings: snapshot, directory: directory, cancellation: flag,
                          progress: { [weak self] progress in
             guard let self else { return }
+            if progress.status == .done, let outputURL = progress.url {
+                self.exportedSignatures[progress.id] = signatures[progress.id]
+                if let context = contexts[progress.id] { exportLibrary?.recordExport(context, outputURL: outputURL) }
+            }
             self.update(progress)
             if progress.status == .done || progress.status == .failed { self.exportCompleted += 1 }
         }, completion: { [weak self] result in
+            exportBridge?.endExport()
             guard let self else { return }
             self.isExporting = false; self.isCancelling = false; self.cancellation = nil
             self.lastExportedURL = result.lastURL

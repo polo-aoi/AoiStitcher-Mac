@@ -2,32 +2,6 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-struct ContentView: View {
-    @State private var mode = 0
-    @StateObject private var canvasStore = CanvasStore()
-    @StateObject private var compressionStore = CompressionWorkspace()
-    @StateObject private var gridCollageStore = GridCollageStore()
-    var body: some View {
-        TabView(selection: $mode) {
-            BorderWorkspaceView(isActive: mode == 0)
-                .tabItem { Label("边框水印", systemImage: "rectangle.dashed") }.tag(0)
-            FreeCanvasView(store: canvasStore, isActive: mode == 1, showsQuickLayout: true,
-                           onRequestFreeCanvas: { mode = 2 })
-                .tabItem { Label("双图拼接", systemImage: "rectangle.split.2x1") }.tag(1)
-            FreeCanvasView(store: canvasStore, isActive: mode == 2, showsQuickLayout: false)
-                .tabItem { Label("自由画布", systemImage: "rectangle.on.rectangle") }.tag(2)
-            LongStitchView(isActive: mode == 3)
-                .tabItem { Label("长图拼接", systemImage: "rectangle.split.1x2") }.tag(3)
-            CompressionView(workspace: compressionStore, isActive: mode == 4)
-                .tabItem { Label("图片压缩", systemImage: "arrow.down.right.and.arrow.up.left") }.tag(4)
-            GridCollageView(store: gridCollageStore, isActive: mode == 5)
-                .tabItem { Label("标准拼图", systemImage: "square.grid.2x2") }.tag(5)
-        }
-        .padding(8)
-        .frame(minWidth: 1020, minHeight: 740)
-    }
-}
-
 private struct CanvasCropSession: Identifiable {
     var id: UUID
     var item: StitchItem
@@ -36,12 +10,18 @@ private struct CanvasCropSession: Identifiable {
 struct FreeCanvasView: View {
     @ObservedObject var store: CanvasStore
     var isActive: Bool
-    var showsQuickLayout: Bool = false
-    var onRequestFreeCanvas: (() -> Void)?
+    @EnvironmentObject private var projectLibrary: ProjectLibraryStore
+    @EnvironmentObject private var projectBridge: ProjectEditorBridge
     @AppStorage("colorSchemeStyle") private var theme = 1
     @AppStorage("exportWidth") private var exportWidth = AppPreferences.defaultExportWidth
     @AppStorage("exportPNG") private var exportPNG = AppPreferences.defaultExportPNG
     @AppStorage("lastExportDir") private var lastExportDir = ""
+    @AppStorage(AppPreferences.canvasWheelBehaviorKey) private var wheelBehavior: CanvasScrollBehavior = .zoom
+    @AppStorage(AppPreferences.canvasGestureBehaviorKey) private var gestureBehavior: CanvasScrollBehavior = .pan
+    @AppStorage(AppPreferences.canvasZoomSensitivityKey) private var zoomSensitivity = 1.0
+    @AppStorage(AppPreferences.canvasReverseZoomKey) private var reverseZoom = false
+    @AppStorage(AppPreferences.canvasPanModeKey) private var panMode: DragPanMode = .rightMouse
+    @AppStorage(AppPreferences.canvasPanKeyKey) private var panKey: LongStitchPanKey = .space
     @State private var layoutMargin: CGFloat = 40
     @State private var layoutGap: CGFloat = 24
     @State private var layoutSplit: CGFloat = 0.5
@@ -70,7 +50,8 @@ struct FreeCanvasView: View {
                 workspaceToolbar
                 Divider()
                 ZStack {
-                    CanvasWorkspace(store: store, isActive: isActive, onCrop: startCrop, onInspect: openInspector)
+                    CanvasWorkspace(store: store, isActive: isActive, settings: interactionSettings,
+                                    onCrop: startCrop, onInspect: openInspector)
                     if store.document.layers.isEmpty {
                         EditorEmptyState()
                     }
@@ -81,10 +62,25 @@ struct FreeCanvasView: View {
                             Spacer()
                         }.padding(16).allowsHitTesting(false)
                     }
-                }
+                }.clipped()
+                Text(interactionSettings.hint)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
             }
         }
         .preferredColorScheme(theme == 2 ? .dark : .light)
+        .onReceive(projectBridge.$request) { request in
+            guard request?.operation == .freeCanvas else { return }
+            DispatchQueue.main.async { receiveProjectImages() }
+        }
+        .onAppear { projectBridge.observeCanvas(store) }
+        .onChange(of: store.isLoading) { _, loading in
+            if !loading { receiveProjectImages() }
+        }
+        .onChange(of: store.isExporting) { _, exporting in
+            if !exporting { receiveProjectImages() }
+        }
         .onChange(of: store.selectedID) { _, id in
             if id != inspectedID { inspectedID = nil }
         }
@@ -92,10 +88,6 @@ struct FreeCanvasView: View {
             if let inspectedID, !ids.contains(inspectedID) { self.inspectedID = nil }
         }
         .onChange(of: isActive) { _, active in if !active { inspectedID = nil } }
-        .onChange(of: store.photoCount) { _, count in
-            guard isActive, showsQuickLayout, count >= 3 else { return }
-            onRequestFreeCanvas?()
-        }
         .sheet(item: $cropSession) { session in
             CropEditorView(item: session.item) { updated in
                 store.updateCrop(updated, layerID: session.id); cropSession = nil
@@ -121,6 +113,12 @@ struct FreeCanvasView: View {
         }
     }
 
+    private var interactionSettings: CanvasInteractionSettings {
+        CanvasInteractionSettings(wheelBehavior: wheelBehavior, gestureBehavior: gestureBehavior,
+                                  zoomSensitivity: zoomSensitivity, reverseZoom: reverseZoom,
+                                  panMode: panMode, panKey: panKey)
+    }
+
     private var sidebar: some View {
         VStack(spacing: 0) {
             EditorSidebarHeader(theme: $theme) {
@@ -143,10 +141,8 @@ struct FreeCanvasView: View {
                     canvasControls
                     Divider()
                     paperLibraryControls
-                    if showsQuickLayout {
-                        Divider()
-                        layoutControls
-                    }
+                    Divider()
+                    layoutControls
                     Divider()
                     layersControls
                 }.padding(16)
@@ -228,7 +224,7 @@ struct FreeCanvasView: View {
                     HStack { Text("两图区域比例").font(.caption); Spacer(); Text("\(Int(layoutSplit * 100)) : \(100 - Int(layoutSplit * 100))").font(.caption.monospacedDigit()) }
                     Slider(value: $layoutSplit, in: 0.15...0.85)
                 } else if store.photoCount > 2 {
-                    Text("三张及以上图片已进入自由画布，请直接拖动、缩放和旋转。")
+                    Text("快捷排版适用于一至两张照片；多张照片可直接拖动、缩放和旋转。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -420,13 +416,16 @@ struct FreeCanvasView: View {
     }
 
     private func performExport(snapshot suppliedSnapshot: CanvasRenderSnapshot? = nil) {
+        guard !store.isLoading, !store.isExporting else { return }
         let snapshot = suppliedSnapshot ?? CanvasRenderSnapshot(store.document)
+        let signature = ProjectCompositionSignature.canvas(snapshot)
         guard let width = AppPreferences.exportWidth(exportWidth) else {
             store.message = "导出宽度需为 1 到 16384 的整数。"
             return
         }
         do { _ = try CanvasRenderer.outputSize(for: snapshot, width: width) }
         catch { store.message = error.localizedDescription; return }
+        let projectContext = projectLibrary.captureExport(operation: .freeCanvas, sourceURLs: snapshot.sourceURLs)
         let panel = NSSavePanel()
         let png = exportPNG
         panel.allowedContentTypes = [png ? .png : .jpeg]
@@ -435,16 +434,29 @@ struct FreeCanvasView: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         lastExportDir = url.deletingLastPathComponent().path
         store.isExporting = true
+        projectBridge.beginExport()
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Result { try CanvasRenderer.export(snapshot, width: width, png: png, to: url) }
             DispatchQueue.main.async {
                 store.isExporting = false
+                projectBridge.endExport()
                 switch result {
-                case .success: exportedFile = url.lastPathComponent
+                case .success:
+                    projectBridge.didExport(operation: .freeCanvas, signature: signature)
+                    if let projectContext { projectLibrary.recordExport(projectContext, outputURL: url) }
+                    exportedFile = url.lastPathComponent
                 case .failure(let error): store.message = "导出失败：\(error.localizedDescription)"
                 }
             }
         }
+    }
+
+    private func receiveProjectImages() {
+        guard !store.isLoading, !store.isExporting,
+              let request = projectBridge.request, request.operation == .freeCanvas else { return }
+        projectBridge.observeCanvas(store)
+        store.importURLs(request.urls, projectMode: request.mode)
+        projectBridge.consume(id: request.id)
     }
 
     private func clearCanvas() {

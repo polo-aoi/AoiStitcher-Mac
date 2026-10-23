@@ -52,6 +52,7 @@ nonisolated private struct GridCollageCachedEdit {
     @Published private(set) var state: CollageState
     @Published var status: String?
     @Published private(set) var isLoading = false
+    @Published var isExporting = false
     @Published var pendingStatus: String?
     private var importGeneration = UUID()
     private let previewMaximum = 1600
@@ -349,10 +350,10 @@ nonisolated private struct GridCollageCachedEdit {
         }
     }
 
-    func importURLs(_ urls: [URL], into slotID: String? = nil) {
+    func importURLs(_ urls: [URL], into slotID: String? = nil, projectMode: ProjectImportMode? = nil) {
         guard !isLoading, !urls.isEmpty else { return }
-        let existing = photoCount
-        let replacing = slotID.flatMap { state.slots[$0] }?.hasImage == true ? 1 : 0
+        let existing = projectMode == .replace ? 0 : photoCount
+        let replacing = projectMode == .replace ? 0 : (slotID.flatMap { state.slots[$0] }?.hasImage == true ? 1 : 0)
         guard existing - replacing + urls.count <= GridCollageTemplates.maximumPhotoCount else {
             status = "一次拼图最多 \(GridCollageTemplates.maximumPhotoCount) 张。此次未导入，原有照片保持不变。"; return
         }
@@ -364,10 +365,20 @@ nonisolated private struct GridCollageCachedEdit {
                 urls.map { url in (url, Self.loadPreview(url, maximum: maximum)) }
             }.value
             guard let self, self.importGeneration == generation else { return }
-            self.isLoading = false; self.pendingStatus = nil
             let successes = loaded.compactMap { url, image in image.map { (url, $0) } }
-            self.addLoadedPreviews(successes, into: slotID)
             let failures = loaded.filter { $0.1 == nil }.map { $0.0.lastPathComponent }
+            if projectMode != nil, !failures.isEmpty {
+                self.isLoading = false; self.pendingStatus = nil
+                self.status = "此次未导入，原有拼图保持不变。无法读取：\(failures.joined(separator: "、"))"
+                return
+            }
+            if projectMode == .replace {
+                self.cropSession = nil
+                for id in self.state.rootNode.slotIDs { self.state.slots[id] = CollageSlot(id: id) }
+                self.state.selectedSlotId = nil
+            }
+            self.addLoadedPreviews(successes, into: slotID)
+            self.isLoading = false; self.pendingStatus = nil
             if !failures.isEmpty {
                 self.status = "已导入 \(successes.count) 张；读取失败：\(failures.joined(separator: "、"))"
             } else { self.status = "已导入 \(successes.count) 张照片" }

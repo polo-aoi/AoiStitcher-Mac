@@ -2,6 +2,8 @@ import SwiftUI
 import AppKit
 
 struct CompressionView: View {
+    @EnvironmentObject private var projectLibrary: ProjectLibraryStore
+    @EnvironmentObject private var projectBridge: ProjectEditorBridge
     @ObservedObject var workspace: CompressionWorkspace
     var isActive: Bool
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
@@ -46,7 +48,13 @@ struct CompressionView: View {
             }
         }
         .preferredColorScheme(theme == 2 ? .dark : .light)
-        .onAppear { pixelText = String(workspace.settings.pixels) }
+        .onAppear {
+            pixelText = String(workspace.settings.pixels)
+            workspace.connectProject(library: projectLibrary, bridge: projectBridge)
+            receiveProjectPhotos()
+        }
+        .onChange(of: projectBridge.request?.id) { _, _ in receiveProjectPhotos() }
+        .onChange(of: workspace.isBusy) { _, busy in if !busy { receiveProjectPhotos() } }
         .onChange(of: workspace.settings.pixels) { _, pixels in pixelText = String(pixels) }
         .onChange(of: pixelsFocused) { _, focused in if !focused { commitPixels() } }
         .alert("文件处理失败", isPresented: Binding(get: { workspace.errorMessage != nil },
@@ -254,6 +262,13 @@ struct CompressionView: View {
         }
         if let value = Int(pixelText) { workspace.setPixels(value) }
         pixelText = String(workspace.settings.pixels)
+    }
+
+    private func receiveProjectPhotos() {
+        guard let request = projectBridge.request, request.operation == .compression, !workspace.isBusy else { return }
+        if workspace.importURLs(request.urls, mode: request.mode, preservingInputOrder: true) {
+            projectBridge.consume(id: request.id)
+        }
     }
 }
 

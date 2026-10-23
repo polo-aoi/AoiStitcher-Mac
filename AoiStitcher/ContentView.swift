@@ -7,7 +7,11 @@ import AppKit
 // ==========================================
 struct LongStitchView: View {
     var isActive: Bool = true
+    @EnvironmentObject private var projectLibrary: ProjectLibraryStore
+    @EnvironmentObject private var projectBridge: ProjectEditorBridge
     @State private var images: [StitchItem] = []
+    @State private var projectImportInProgress = false
+    @State private var localImportCount = 0
     @ObservedObject private var preferences = LongStitchPreferences.shared
 
     // 💡 记忆储存：外观主题仅保留 1:浅色, 2:深色 (默认浅色)
@@ -201,6 +205,25 @@ struct LongStitchView: View {
             }
         }
         .preferredColorScheme(currentColorScheme)
+        .onReceive(projectBridge.$request) { request in
+            guard request?.operation == .longStitch else { return }
+            DispatchQueue.main.async { receiveProjectImages() }
+        }
+        .onAppear { publishProjectStatus() }
+        .onDisappear { publishProjectStatus() }
+        .onChange(of: projectSignature) { _, _ in publishProjectStatus() }
+        .onChange(of: projectImportInProgress) { _, importing in
+            publishProjectStatus()
+            if !importing { receiveProjectImages() }
+        }
+        .onChange(of: localImportCount) { _, count in
+            publishProjectStatus()
+            if count == 0 { receiveProjectImages() }
+        }
+        .onChange(of: isExporting) { _, exporting in
+            publishProjectStatus()
+            if !exporting { receiveProjectImages() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
             finishCanvasDrag()
             finishWatermarkDrag()
@@ -219,6 +242,7 @@ struct LongStitchView: View {
         }
         .onReceive(preferences.$settings) { next in
             captureContentAnchor(before: next)
+            publishProjectStatus(settings: next.sanitized())
         }
         .onChange(of: preferences.settings) { old, new in
             let aspects = images.map(\.displayAspect)
@@ -459,10 +483,14 @@ struct LongStitchView: View {
         panel.allowedContentTypes = [.image]
         panel.directoryURL = item.url.deletingLastPathComponent()
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        localImportCount += 1
+        publishProjectStatus()
         let accessing = url.startAccessingSecurityScopedResource()
         DispatchQueue.global(qos: .userInitiated).async {
             let image = NSImage(contentsOf: url)
             DispatchQueue.main.async {
+                localImportCount = max(0, localImportCount - 1)
+                defer { publishProjectStatus() }
                 if accessing { url.stopAccessingSecurityScopedResource() }
                 guard let image, let index = images.firstIndex(where: { $0.id == item.id }) else { return }
                 let replacement = StitchItem(url: url, image: image)
@@ -621,7 +649,8 @@ struct LongStitchView: View {
     }
 
     private func exportFinalImage() {
-        guard editingItem == nil, !images.isEmpty, !isExporting else { return }
+        guard editingItem == nil, !images.isEmpty, !isExporting,
+              !projectImportInProgress, localImportCount == 0 else { return }
         guard AppPreferences.exportWidth(settings.exportShortEdge) != nil else {
             exportSucceeded = false; exportAlertTitle = "导出设置有误"
             exportAlertMessage = "短边像素需为 1 到 16384 的整数，不包含四边留白。"
@@ -629,7 +658,9 @@ struct LongStitchView: View {
         }
         finishCanvasDrag()
         let snapshot = settings
+        let signature = projectSignature
         let safeImages = images.map(\.displayImage)
+        let projectContext = projectLibrary.captureExport(operation: .longStitch, sourceURLs: images.map(\.url))
         let layout = canvasLayout
         var watermarks: [LongStitchEdge: NSImage] = [:]
         for edge in LongStitchEdge.allCases where snapshot[edge].isEnabled && snapshot[edge].usesWatermark && snapshot[edge].watermarkID != nil {
@@ -649,6 +680,8 @@ struct LongStitchView: View {
         savePanel.begin { response in
             guard response == .OK, let url = savePanel.url else { return }
             isExporting = true
+            publishProjectStatus()
+            projectBridge.beginExport()
             lastExportDir = url.deletingLastPathComponent().path
             DispatchQueue.global(qos: .userInitiated).async {
                 let result: Result<Void, Error> = Result {
@@ -667,8 +700,12 @@ struct LongStitchView: View {
                 }
                 DispatchQueue.main.async {
                     isExporting = false
+                    publishProjectStatus()
+                    projectBridge.endExport()
                     switch result {
                     case .success:
+                        projectBridge.didExport(operation: .longStitch, signature: signature)
+                        if let projectContext { projectLibrary.recordExport(projectContext, outputURL: url) }
                         exportSucceeded = true; exportAlertTitle = "导出成功"
                         exportAlertMessage = "图片已保存：\(url.lastPathComponent)"
                     case .failure(let error):
@@ -1059,19 +1096,65 @@ struct LongStitchView: View {
         isPanMouseSequenceActive = false
     }
 
+    private var projectSignature: String {
+        ProjectCompositionSignature.longStitch(images, settings: settings)
+    }
+
+    private func publishProjectStatus(settings suppliedSettings: LongStitchSettings? = nil) {
+        projectBridge.update(operation: .longStitch, count: images.count,
+            signature: ProjectCompositionSignature.longStitch(images, settings: suppliedSettings ?? settings),
+            isBusy: projectImportInProgress || localImportCount > 0 || isExporting)
+    }
+
     private func loadAndAddImage(from url: URL, completion: (() -> Void)? = nil) {
+        localImportCount += 1
+        publishProjectStatus()
         let accessing = url.startAccessingSecurityScopedResource()
         DispatchQueue.global(qos: .userInitiated).async {
-            if let nsImage = NSImage(contentsOf: url) {
-                DispatchQueue.main.async {
-                    withAnimation { self.images.append(StitchItem(url: url, image: nsImage)) }
-                    if accessing { url.stopAccessingSecurityScopedResource() }
-                    completion?()
+            let nsImage = NSImage(contentsOf: url)
+            if accessing { url.stopAccessingSecurityScopedResource() }
+            DispatchQueue.main.async {
+                if let nsImage {
+                    withAnimation { images.append(StitchItem(url: url, image: nsImage)) }
                 }
+                localImportCount = max(0, localImportCount - 1)
+                publishProjectStatus()
+                completion?()
             }
-            else {
-                if accessing { url.stopAccessingSecurityScopedResource() }
-                DispatchQueue.main.async { completion?() }
+        }
+    }
+
+    private func receiveProjectImages() {
+        guard !projectImportInProgress, localImportCount == 0, !isExporting,
+              let request = projectBridge.request, request.operation == .longStitch else { return }
+        projectImportInProgress = true
+        publishProjectStatus()
+        projectBridge.consume(id: request.id)
+        let urls = request.urls
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Decode every source before changing the old composition.
+            let loaded = urls.compactMap { url -> (URL, NSImage)? in
+                let accessing = url.startAccessingSecurityScopedResource()
+                defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+                guard let source = CanvasImageLoader.load(url) else { return nil }
+                return (url, NSImage(cgImage: source.image,
+                    size: CGSize(width: source.image.width, height: source.image.height)))
+            }
+            DispatchQueue.main.async {
+                if loaded.count == urls.count {
+                    if request.mode == .replace { clearCanvas() }
+                    withAnimation {
+                        images.append(contentsOf: loaded.map { StitchItem(url: $0.0, image: $0.1) })
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { fitToScreen() }
+                } else {
+                    exportSucceeded = false
+                    exportAlertTitle = "导入提醒"
+                    exportAlertMessage = "有 \(urls.count - loaded.count) 张照片无法读取，此次未导入，原有长图保持不变。"
+                    showingExportAlert = true
+                }
+                projectImportInProgress = false
+                publishProjectStatus()
             }
         }
     }

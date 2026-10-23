@@ -22,8 +22,10 @@ nonisolated struct CanvasRenderSnapshot {
     var size: CGSize
     var background: CanvasColor
     var layers: [CanvasRenderLayer]
+    var sourceURLs: [URL]
     @MainActor init(_ document: CanvasDocument, preview: Bool = false) {
         size = document.size; background = document.background
+        sourceURLs = document.layers.compactMap { $0.kind == .photo ? $0.photo?.url : nil }
         // Normalize here as a compatibility guard for documents created by
         // older builds or callers that construct a snapshot directly.
         layers = CanvasLayerOrdering.normalized(document.layers)

@@ -4,17 +4,20 @@ import AppKit
 struct CanvasWorkspace: NSViewRepresentable {
     @ObservedObject var store: CanvasStore
     var isActive: Bool
+    var settings: CanvasInteractionSettings
     var onCrop: (CanvasLayer) -> Void
     var onInspect: (CanvasLayer) -> Void
 
     func makeNSView(context: Context) -> CanvasWorkspaceView {
         let view = CanvasWorkspaceView()
         view.store = store; view.onCrop = onCrop; view.onInspect = onInspect
+        view.isActive = isActive; view.settings = settings
         return view
     }
 
     func updateNSView(_ view: CanvasWorkspaceView, context: Context) {
         view.isActive = isActive
+        view.settings = settings
         view.onCrop = onCrop
         view.onInspect = onInspect
         view.snapshot = CanvasRenderSnapshot(store.document, preview: true)
@@ -24,6 +27,10 @@ struct CanvasWorkspace: NSViewRepresentable {
         }
         view.needsDisplay = true
     }
+
+    static func dismantleNSView(_ view: CanvasWorkspaceView, coordinator: ()) {
+        view.disconnect()
+    }
 }
 
 final class CanvasWorkspaceView: NSView {
@@ -31,7 +38,12 @@ final class CanvasWorkspaceView: NSView {
     var snapshot: CanvasRenderSnapshot?
     var onCrop: ((CanvasLayer) -> Void)?
     var onInspect: ((CanvasLayer) -> Void)?
-    var isActive = true
+    var isActive = true {
+        didSet { if !isActive && oldValue { finishInteraction(clearKeyboard: true) } }
+    }
+    var settings = CanvasInteractionSettings() {
+        didSet { if settings != oldValue { finishInteraction(clearKeyboard: true) } }
+    }
     var lastFitRequest = -1
     private var zoom: CGFloat = 1
     private var pan = CGPoint.zero
@@ -42,6 +54,11 @@ final class CanvasWorkspaceView: NSView {
     private var didDrag = false
     private var guideX = false
     private var guideY = false
+    private var rightClickStart: CGPoint?
+    private var rightClickLayerID: UUID?
+    private var rightClickDidDrag = false
+    private var keyboardMonitor: Any?
+    private var observers: [NSObjectProtocol] = []
     private enum Interaction { case move, resize(Int), rotate, pan }
     private var interaction: Interaction?
     private let cornerSigns = [CGPoint(x: -1, y: -1), CGPoint(x: 1, y: -1),
@@ -59,6 +76,89 @@ final class CanvasWorkspaceView: NSView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        disconnect()
+        guard let window else { return }
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+            .keyDown, .keyUp, .flagsChanged, .leftMouseDown, .rightMouseDown
+        ]) { [weak self] event in
+            guard let self else { return event }
+            return self.handleKeyboardEvent(event)
+        }
+        for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
+                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                self?.finishInteraction(clearKeyboard: true)
+            })
+        }
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        finishInteraction(clearKeyboard: true)
+    }
+
+    func disconnect() {
+        if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor); self.keyboardMonitor = nil }
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
+        finishInteraction(clearKeyboard: true)
+    }
+
+    private var acceptsInteraction: Bool {
+        isActive && !isHiddenOrHasHiddenAncestor && window?.isKeyWindow == true && window?.attachedSheet == nil
+    }
+
+    private func handleKeyboardEvent(_ event: NSEvent) -> NSEvent? {
+        guard acceptsInteraction, let window, event.window === window || event.window == nil else { return event }
+        let textInput = window.firstResponder is NSTextView || window.firstResponder is NSTextField
+        if textInput {
+            spacePressed = false
+            stopKeyboardPan()
+            return event
+        }
+        if event.type == .keyUp, event.keyCode == 49, spacePressed {
+            spacePressed = false
+            stopKeyboardPan()
+            NSCursor.arrow.set()
+            return nil
+        }
+        if event.type == .flagsChanged, settings.panMode == .keyboard, settings.panKey != .space,
+           !event.modifierFlags.contains(settings.panKey.modifierFlags) {
+            stopKeyboardPan()
+        }
+        if event.type == .leftMouseDown || event.type == .rightMouseDown {
+            if !bounds.contains(eventPoint(event)) {
+                spacePressed = false
+                stopKeyboardPan()
+            }
+            return event
+        }
+        // Keyboard events lack pointer coordinates. Observe only Space over
+        // this active viewport, so panning also works before its first click.
+        let pointer = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        if event.type == .keyDown, event.keyCode == 49,
+           settings.panMode == .keyboard, settings.panKey == .space,
+           spacePressed || bounds.contains(pointer) {
+            spacePressed = true
+            NSCursor.openHand.set()
+            return nil
+        }
+        return event
+    }
+
+    private func keyboardPanRequested(_ event: NSEvent) -> Bool {
+        settings.panMode == .keyboard && (settings.panKey == .space
+            ? spacePressed : event.modifierFlags.contains(settings.panKey.modifierFlags))
+    }
+
+    private func stopKeyboardPan() {
+        if case .pan = interaction, rightClickStart == nil {
+            finishInteraction(clearKeyboard: false)
+        }
+    }
+
     private var fitScale: CGFloat {
         guard let size = snapshot?.size else { return 1 }
         return max(0.01, min((bounds.width - 100) / size.width, (bounds.height - 100) / size.height))
@@ -75,6 +175,7 @@ final class CanvasWorkspaceView: NSView {
     private func eventPoint(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
 
     func resetViewport() {
+        finishInteraction(clearKeyboard: true)
         zoom = 1; pan = .zero
         store?.displayedZoom = 1
         needsDisplay = true
@@ -84,6 +185,7 @@ final class CanvasWorkspaceView: NSView {
         NSColor.controlBackgroundColor.setFill(); bounds.fill()
         guard let snapshot, let context = NSGraphicsContext.current?.cgContext else { return }
         context.saveGState()
+        context.clip(to: bounds)
         context.translateBy(x: origin.x, y: origin.y); context.scaleBy(x: scale, y: scale)
         context.setShadow(offset: CGSize(width: 0, height: 2 / scale), blur: 12 / scale,
                           color: CGColor(gray: 0, alpha: 0.12))
@@ -138,12 +240,13 @@ final class CanvasWorkspaceView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard isActive else { return }
-        if event.modifierFlags.contains(.control) { rightMouseDown(with: event); return }
+        guard acceptsInteraction, bounds.contains(eventPoint(event)) else { return }
+        let keyboardPan = keyboardPanRequested(event)
+        if event.modifierFlags.contains(.control), !keyboardPan { rightMouseDown(with: event); return }
         window?.makeFirstResponder(self)
         let point = eventPoint(event)
         dragStart = canvasPoint(point); panStart = pan; didDrag = false
-        if spacePressed {
+        if keyboardPan {
             dragStart = point; interaction = .pan; NSCursor.closedHand.set(); return
         }
         if let selected = store.selectedLayer, let selectedHandle = handle(at: dragStart, layer: selected) {
@@ -167,15 +270,41 @@ final class CanvasWorkspaceView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        guard isActive, let hit = layer(at: canvasPoint(eventPoint(event))) else { return }
+        guard acceptsInteraction, bounds.contains(eventPoint(event)) else { return }
         window?.makeFirstResponder(self)
-        interaction = nil
-        store.selectedID = hit.id
-        onInspect?(hit)
+        finishInteraction(clearKeyboard: false)
+        let point = eventPoint(event)
+        rightClickStart = point
+        rightClickLayerID = layer(at: canvasPoint(point))?.id
+        panStart = pan
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        guard acceptsInteraction, let start = rightClickStart else { return }
+        let point = eventPoint(event)
+        if hypot(point.x - start.x, point.y - start.y) >= 5 { rightClickDidDrag = true }
+        guard rightClickDidDrag, settings.panMode == .rightMouse else { return }
+        pan = CGPoint(x: panStart.x + point.x - start.x, y: panStart.y + point.y - start.y)
+        NSCursor.closedHand.set()
         needsDisplay = true
     }
 
+    override func rightMouseUp(with event: NSEvent) {
+        guard let start = rightClickStart else { return }
+        let point = eventPoint(event)
+        let isClick = !rightClickDidDrag && hypot(point.x - start.x, point.y - start.y) < 5
+        let clickedID = rightClickLayerID
+        finishInteraction(clearKeyboard: false)
+        if acceptsInteraction, isClick, bounds.contains(point),
+           let hit = store.document.layers.first(where: { $0.id == clickedID }) {
+            store.selectedID = hit.id
+            onInspect?(hit)
+        }
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        if rightClickStart != nil { rightMouseDragged(with: event); return }
+        guard acceptsInteraction else { finishInteraction(clearKeyboard: true); return }
         guard let interaction else { return }
         if case .pan = interaction {
             let point = eventPoint(event)
@@ -226,15 +355,25 @@ final class CanvasWorkspaceView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if rightClickStart != nil { rightMouseUp(with: event); return }
+        finishInteraction(clearKeyboard: false)
+    }
+
+    private func finishInteraction(clearKeyboard: Bool) {
         if didDrag { store.endContinuousChange() }
         interaction = nil; initialLayer = nil; didDrag = false
+        rightClickStart = nil; rightClickLayerID = nil; rightClickDidDrag = false
+        if clearKeyboard { spacePressed = false }
         guideX = false; guideY = false
         NSCursor.arrow.set(); needsDisplay = true
     }
 
     override func keyDown(with event: NSEvent) {
-        guard isActive else { super.keyDown(with: event); return }
-        if event.keyCode == 49 { spacePressed = true; NSCursor.openHand.set(); return }
+        guard acceptsInteraction else { super.keyDown(with: event); return }
+        if event.keyCode == 53, interaction != nil || rightClickStart != nil {
+            finishInteraction(clearKeyboard: true)
+            return
+        }
         if event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "z": event.modifierFlags.contains(.shift) ? store.redo() : store.undo(); return
@@ -257,13 +396,13 @@ final class CanvasWorkspaceView: NSView {
     }
 
     override func keyUp(with event: NSEvent) {
-        if event.keyCode == 49 { spacePressed = false; NSCursor.arrow.set() }
+        if event.keyCode == 49, spacePressed {
+            spacePressed = false; stopKeyboardPan(); NSCursor.arrow.set()
+        }
         else { super.keyUp(with: event) }
     }
     override func resignFirstResponder() -> Bool {
-        spacePressed = false
-        if didDrag { store.endContinuousChange() }
-        interaction = nil; didDrag = false
+        finishInteraction(clearKeyboard: true)
         return super.resignFirstResponder()
     }
 
@@ -274,10 +413,22 @@ final class CanvasWorkspaceView: NSView {
         pan.x += (after.x - before.x) * scale; pan.y += (after.y - before.y) * scale
         store.displayedZoom = zoom; needsDisplay = true
     }
-    override func magnify(with event: NSEvent) { changeZoom(factor: max(0.1, 1 + event.magnification), around: eventPoint(event)) }
+    override func magnify(with event: NSEvent) {
+        guard acceptsInteraction, bounds.contains(eventPoint(event)), interaction == nil, rightClickStart == nil else { return }
+        changeZoom(factor: max(0.1, 1 + event.magnification), around: eventPoint(event))
+    }
     override func scrollWheel(with event: NSEvent) {
-        if event.modifierFlags.contains(.option) {
-            changeZoom(factor: exp(event.scrollingDeltaY * 0.015), around: eventPoint(event))
+        guard acceptsInteraction, bounds.contains(eventPoint(event)), interaction == nil, rightClickStart == nil else { return }
+        // Precise deltas also occur on touch mice. Gesture phases distinguish
+        // continuous gestures; their behavior can be overridden in Settings.
+        let isContinuousGesture = event.hasPreciseScrollingDeltas && (event.phase != [] || event.momentumPhase != [])
+        let behavior = isContinuousGesture ? settings.gestureBehavior : settings.wheelBehavior
+        if behavior == .zoom {
+            let sensitivity = settings.zoomSensitivity.isFinite ? min(3, max(0.25, settings.zoomSensitivity)) : 1
+            let unit: CGFloat = event.hasPreciseScrollingDeltas ? 0.008 : 0.08
+            let direction: CGFloat = settings.reverseZoom ? -1 : 1
+            let exponent = event.scrollingDeltaY * unit * CGFloat(sensitivity) * direction
+            changeZoom(factor: exp(min(2, max(-2, exponent))), around: eventPoint(event))
         } else {
             let factor: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
             pan.x += event.scrollingDeltaX * factor; pan.y += event.scrollingDeltaY * factor

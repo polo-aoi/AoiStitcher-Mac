@@ -53,6 +53,56 @@ private struct GridCollageSettingsView: View {
     }
 }
 
+private struct FreeCanvasSettingsView: View {
+    @AppStorage(AppPreferences.canvasWheelBehaviorKey) private var wheelBehavior: CanvasScrollBehavior = .zoom
+    @AppStorage(AppPreferences.canvasGestureBehaviorKey) private var gestureBehavior: CanvasScrollBehavior = .pan
+    @AppStorage(AppPreferences.canvasZoomSensitivityKey) private var zoomSensitivity = 1.0
+    @AppStorage(AppPreferences.canvasReverseZoomKey) private var reverseZoom = false
+    @AppStorage(AppPreferences.canvasPanModeKey) private var panMode: DragPanMode = .rightMouse
+    @AppStorage(AppPreferences.canvasPanKeyKey) private var panKey: LongStitchPanKey = .space
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                Text("自由画布设置").font(.title2.weight(.semibold))
+                EditorSection("浏览画布") {
+                    Picker("鼠标滚轮", selection: $wheelBehavior) {
+                        ForEach(CanvasScrollBehavior.allCases) { Text($0.title).tag($0) }
+                    }
+                    Picker("触控板连续滚动", selection: $gestureBehavior) {
+                        ForEach(CanvasScrollBehavior.allCases) { Text($0.title).tag($0) }
+                    }
+                    Text("触控板双指滚动默认平移，捏合始终缩放。部分触控鼠标也发送连续滚动手势，可将连续滚动设为缩放。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Text("滚轮缩放灵敏度")
+                        Slider(value: $zoomSensitivity, in: 0.25...3, step: 0.05)
+                        Text(String(format: "%.2f×", zoomSensitivity))
+                            .font(.callout.monospacedDigit()).frame(width: 50)
+                    }
+                    Toggle("反转滚轮缩放方向", isOn: $reverseZoom)
+                    Text("缩放以鼠标所在位置为中心，只改变查看比例。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Divider()
+                EditorSection("拖动画布") {
+                    DragPanSettingsFields(title: "平移方式", mode: $panMode, key: $panKey)
+                    Text("左键拖动照片调整位置；右键单击照片打开素材设置。")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider()
+                Button { AppPreferences.restoreCanvasInteractionDefaults() } label: {
+                    Label("恢复默认操作", systemImage: "arrow.counterclockwise")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(24)
+        }
+    }
+}
+
 struct ExportSettingsFields: View {
     @AppStorage("exportWidth") private var width = AppPreferences.defaultExportWidth
     @AppStorage("exportPNG") private var png = AppPreferences.defaultExportPNG
@@ -108,6 +158,7 @@ struct ExportSettingsView: View {
 struct AppSettingsView: View {
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
     @AppStorage(AoiBorderContact.userDefaultsKey) private var contactEmail = ""
+    @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
     @Environment(\.openWindow) private var openWindow
     @State private var restored = false
     @ObservedObject private var longStitchPreferences = LongStitchPreferences.shared
@@ -120,6 +171,8 @@ struct AppSettingsView: View {
                 .tabItem { Label("长图拼接", systemImage: "rectangle.split.1x2") }
             GridCollageSettingsView()
                 .tabItem { Label("标准拼图", systemImage: "square.grid.2x2") }
+            FreeCanvasSettingsView()
+                .tabItem { Label("自由画布", systemImage: "rectangle.on.rectangle") }
         }
         .padding(12)
         .frame(width: 600, height: 680)
@@ -136,6 +189,8 @@ struct AppSettingsView: View {
                     Label("深色", systemImage: "moon").tag(2)
                 }.pickerStyle(.segmented).labelsHidden()
             }
+            Divider()
+            workspaceOrderSettings
             Divider()
             EditorSection("导出") { ExportSettingsFields() }
             Divider()
@@ -169,5 +224,64 @@ struct AppSettingsView: View {
             }
             Text("恢复软件偏好，保留当前画布和照片。").font(.callout).foregroundStyle(.secondary)
         }
+    }
+
+    private var workspaceOrder: [AppWorkspace] {
+        AppPreferences.workspaceOrder(from: storedWorkspaceOrder)
+    }
+
+    private var workspaceOrderSettings: some View {
+        EditorSection("顶部功能排序") {
+            Text("拖动条目，或用上下箭头调整顺序，修改后立即生效。")
+                .font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            List {
+                ForEach(workspaceOrder) { workspace in
+                    HStack(spacing: 12) {
+                        Image(systemName: "line.3.horizontal")
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                        Label(workspace.title, systemImage: workspace.systemImage)
+                        Spacer()
+                        Button { moveWorkspace(workspace, by: -1) } label: {
+                            Image(systemName: "chevron.up")
+                        }
+                        .disabled(workspace == workspaceOrder.first)
+                        .help("上移")
+                        .accessibilityLabel("将\(workspace.title)上移")
+                        Button { moveWorkspace(workspace, by: 1) } label: {
+                            Image(systemName: "chevron.down")
+                        }
+                        .disabled(workspace == workspaceOrder.last)
+                        .help("下移")
+                        .accessibilityLabel("将\(workspace.title)下移")
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .onMove(perform: moveWorkspaces)
+            }
+            .listStyle(.inset)
+            .environment(\.defaultMinListRowHeight, 38)
+            .frame(height: CGFloat(workspaceOrder.count) * 38 + 16)
+            .scrollDisabled(true)
+            .accessibilityLabel("顶部功能顺序")
+            Button { storedWorkspaceOrder = "" } label: {
+                Label("恢复默认顺序", systemImage: "arrow.counterclockwise")
+            }
+            .disabled(workspaceOrder == AppWorkspace.allCases)
+        }
+    }
+
+    private func moveWorkspaces(from offsets: IndexSet, to destination: Int) {
+        var order = workspaceOrder
+        order.move(fromOffsets: offsets, toOffset: destination)
+        storedWorkspaceOrder = AppPreferences.encodeWorkspaceOrder(order)
+    }
+
+    private func moveWorkspace(_ workspace: AppWorkspace, by offset: Int) {
+        var order = workspaceOrder
+        guard let index = order.firstIndex(of: workspace), order.indices.contains(index + offset) else { return }
+        order.swapAt(index, index + offset)
+        storedWorkspaceOrder = AppPreferences.encodeWorkspaceOrder(order)
     }
 }

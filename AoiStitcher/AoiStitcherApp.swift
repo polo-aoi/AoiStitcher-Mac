@@ -4,7 +4,7 @@ import SwiftUI
 struct AoiStitcherApp: App {
     @Environment(\.openWindow) private var openWindow
     var body: some Scene {
-        WindowGroup("aoipic") {
+        Window("aoipic", id: "main") {
             ContentView()
         }
         .defaultSize(width: 1280, height: 900)

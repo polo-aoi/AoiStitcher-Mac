@@ -370,7 +370,8 @@ nonisolated enum CanvasImageLoader {
         if panel.runModal() == .OK { importURLs(panel.urls, as: kind) }
     }
 
-    func importURLs(_ urls: [URL], as kind: CanvasLayerKind = .photo, at point: CGPoint? = nil) {
+    func importURLs(_ urls: [URL], as kind: CanvasLayerKind = .photo, at point: CGPoint? = nil,
+                    projectMode: ProjectImportMode? = nil) {
         guard !urls.isEmpty, !isLoading else { return }
         isLoading = true
         let accessed = urls.filter { $0.startAccessingSecurityScopedResource() }
@@ -378,9 +379,19 @@ nonisolated enum CanvasImageLoader {
             let loaded = urls.compactMap { CanvasImageLoader.load($0) }
             accessed.forEach { $0.stopAccessingSecurityScopedResource() }
             DispatchQueue.main.async {
-                self.isLoading = false
-                self.addLoadedImages(loaded, as: kind, at: point)
                 let failures = urls.count - loaded.count
+                if projectMode != nil, failures > 0 {
+                    self.message = "有 \(failures) 张照片无法读取，此次未导入，原有画布保持不变。"
+                    self.isLoading = false
+                    return
+                }
+                if projectMode == .replace {
+                    self.beginContinuousChange()
+                    self.mutate { $0.layers.removeAll() }
+                    self.selectedID = nil
+                }
+                self.addLoadedImages(loaded, as: kind, at: point)
+                self.isLoading = false
                 if failures > 0 { self.message = "有 \(failures) 个文件未能读取。请使用 PNG、JPEG、HEIC 或 TIFF 图片，单张图片不超过 1.6 亿像素。" }
             }
         }

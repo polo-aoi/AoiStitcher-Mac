@@ -6,6 +6,7 @@ trap 'rmdir "$grid_test_dir" 2>/dev/null || true' EXIT
 xcrun swiftc -parse-as-library -swift-version 5 -default-isolation MainActor \
     -target "$(uname -m)-apple-macos14.6" \
     "$grid_project_root/AoiStitcher/StitchModels.swift" \
+    "$grid_project_root/AoiStitcher/ProjectImportMode.swift" \
     "$grid_project_root/AoiStitcher/GridCollageModel.swift" \
     "$grid_project_root/AoiStitcher/GridCollageTemplates.swift" \
     "$grid_project_root/AoiStitcher/GridCollageStore.swift" \

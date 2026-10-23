@@ -14,10 +14,12 @@ private struct GridCollageCropSession: Identifiable {
 struct GridCollageView: View {
     @ObservedObject var store: GridCollageStore
     var isActive: Bool
+    @EnvironmentObject private var projectLibrary: ProjectLibraryStore
+    @EnvironmentObject private var projectBridge: ProjectEditorBridge
 
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
     @State private var showingExportSettings = false
-    @State private var isExporting = false
+    private var isExporting: Bool { store.isExporting }
     @State private var outputWidth = 3000
     @State private var outputFormat: GridCollageExportFormat = .jpeg
     @State private var resultMessage: String?
@@ -44,6 +46,17 @@ struct GridCollageView: View {
             workspace
         }
         .preferredColorScheme(theme == 2 ? .dark : .light)
+        .onReceive(projectBridge.$request) { request in
+            guard request?.operation == .gridCollage else { return }
+            DispatchQueue.main.async { receiveProjectImages() }
+        }
+        .onAppear { projectBridge.observeGrid(store) }
+        .onChange(of: store.isLoading) { _, loading in
+            if !loading { receiveProjectImages() }
+        }
+        .onChange(of: isExporting) { _, exporting in
+            if !exporting { receiveProjectImages() }
+        }
         .onChange(of: isActive) { _, active in
             if !active {
                 dragPreview = nil
@@ -500,8 +513,13 @@ struct GridCollageView: View {
 
     private func beginExport() {
         guard canInteract, store.photoCount > 0 else { return }
+        let snapshot = store.state
+        let width = outputWidth
+        let format = outputFormat
+        let projectContext = projectLibrary.captureExport(operation: .gridCollage,
+                                                          sourceURLs: snapshot.orderedSlots.compactMap(\.imageURL))
         do {
-            _ = try GridCollageRenderer.outputSize(for: store.state, width: outputWidth)
+            _ = try GridCollageRenderer.outputSize(for: snapshot, width: width)
         } catch {
             alertMessage = error.localizedDescription
             return
@@ -509,13 +527,13 @@ struct GridCollageView: View {
         let panel = NSSavePanel()
         panel.title = "导出标准拼图"
         panel.prompt = "导出"
-        panel.allowedContentTypes = [outputFormat.type]
+        panel.allowedContentTypes = [format.type]
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        panel.nameFieldStringValue = "aoipic-拼图.\(outputFormat.fileExtension)"
+        panel.nameFieldStringValue = "aoipic-拼图.\(format.fileExtension)"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            export(to: url)
+            export(snapshot: snapshot, width: width, format: format, projectContext: projectContext, to: url)
         }
     }
 
@@ -536,12 +554,13 @@ struct GridCollageView: View {
         }
     }
 
-    private func export(to url: URL) {
+    private func export(snapshot: CollageState, width: Int, format: GridCollageExportFormat,
+                        projectContext: ProjectExportContext?, to url: URL) {
         guard !isExporting else { return }
-        let snapshot = store.state
-        let width = outputWidth
-        let format = outputFormat
-        isExporting = true
+        projectBridge.observeGrid(store)
+        store.isExporting = true
+        let signature = ProjectCompositionSignature.grid(snapshot)
+        projectBridge.beginExport()
         resultMessage = "正在导出拼图…"
         exportedURL = nil
 
@@ -550,9 +569,12 @@ struct GridCollageView: View {
                 try GridCollageRenderer.export(state: snapshot, width: width, format: format, to: url)
             }
             DispatchQueue.main.async {
-                isExporting = false
+                store.isExporting = false
+                projectBridge.endExport()
                 switch result {
                 case .success:
+                    projectBridge.didExport(operation: .gridCollage, signature: signature)
+                    if let projectContext { projectLibrary.recordExport(projectContext, outputURL: url) }
                     exportedURL = url
                     resultMessage = "已导出：\(url.lastPathComponent)"
                 case .failure(let error):
@@ -561,6 +583,14 @@ struct GridCollageView: View {
                 }
             }
         }
+    }
+
+    private func receiveProjectImages() {
+        guard !store.isLoading, !isExporting,
+              let request = projectBridge.request, request.operation == .gridCollage else { return }
+        projectBridge.observeGrid(store)
+        store.importURLs(request.urls, projectMode: request.mode)
+        projectBridge.consume(id: request.id)
     }
 }
 

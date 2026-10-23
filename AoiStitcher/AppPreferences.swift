@@ -1,13 +1,84 @@
 import Foundation
 
+nonisolated enum CanvasScrollBehavior: String, CaseIterable, Identifiable {
+    case zoom, pan
+
+    var id: String { rawValue }
+    var title: String { self == .zoom ? "缩放查看" : "平移查看" }
+}
+
+nonisolated struct CanvasInteractionSettings: Equatable {
+    var wheelBehavior: CanvasScrollBehavior = .zoom
+    var gestureBehavior: CanvasScrollBehavior = .pan
+    var zoomSensitivity: Double = 1
+    var reverseZoom = false
+    var panMode: DragPanMode = .rightMouse
+    var panKey: LongStitchPanKey = .space
+
+    var hint: String {
+        let wheel = wheelBehavior == .zoom ? "滚轮缩放" : "滚轮平移"
+        let drag = panMode == .rightMouse ? "右键拖动画布" : "\(panKey.title) + 左键拖动画布"
+        return "\(wheel) · \(drag)"
+    }
+}
+
+nonisolated enum AppWorkspace: String, CaseIterable, Identifiable {
+    case border, freeCanvas, longStitch, compression, gridCollage
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .border: return "边框水印"
+        case .freeCanvas: return "自由画布"
+        case .longStitch: return "长图拼接"
+        case .compression: return "图片压缩"
+        case .gridCollage: return "标准拼图"
+        }
+    }
+    var systemImage: String {
+        switch self {
+        case .border: return "rectangle.dashed"
+        case .freeCanvas: return "rectangle.on.rectangle"
+        case .longStitch: return "rectangle.split.1x2"
+        case .compression: return "arrow.down.right.and.arrow.up.left"
+        case .gridCollage: return "square.grid.2x2"
+        }
+    }
+}
+
 enum AppPreferences {
     static let defaultExportWidth = "2560"
     static let defaultExportPNG = true
     static let defaultTheme = 1
     static let gridPanModeKey = "gridCollage.panMode"
     static let gridPanKeyKey = "gridCollage.panKey"
+    static let workspaceOrderKey = "workspaceOrder.v1"
+    static let libraryLabelsKey = "projectLibrary.showsRatingsAndColors"
+    static let canvasWheelBehaviorKey = "freeCanvas.wheelBehavior"
+    static let canvasGestureBehaviorKey = "freeCanvas.gestureBehavior"
+    static let canvasZoomSensitivityKey = "freeCanvas.zoomSensitivity"
+    static let canvasReverseZoomKey = "freeCanvas.reverseZoom"
+    static let canvasPanModeKey = "freeCanvas.panMode"
+    static let canvasPanKeyKey = "freeCanvas.panKey"
+    static let canvasInteractionKeys = [canvasWheelBehaviorKey, canvasGestureBehaviorKey,
+        canvasZoomSensitivityKey, canvasReverseZoomKey, canvasPanModeKey, canvasPanKeyKey]
     static let exportKeys = ["exportWidth", "exportPNG"]
-    static let preferenceKeys = exportKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey]
+    static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey, libraryLabelsKey]
+
+    static func workspaceOrder(from storedOrder: String) -> [AppWorkspace] {
+        let identifiers = (try? JSONDecoder().decode([String].self, from: Data(storedOrder.utf8))) ?? []
+        var order: [AppWorkspace] = []
+        // Keep every workspace exactly once, including newly added functions.
+        for workspace in identifiers.compactMap(AppWorkspace.init(rawValue:)) + AppWorkspace.allCases {
+            if !order.contains(workspace) { order.append(workspace) }
+        }
+        return order
+    }
+
+    static func encodeWorkspaceOrder(_ order: [AppWorkspace]) -> String {
+        guard let data = try? JSONEncoder().encode(order.map(\.rawValue)) else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
 
     static func exportWidth(_ text: String) -> Int? {
         guard let width = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)), (1...16384).contains(width) else { return nil }
@@ -21,9 +92,16 @@ enum AppPreferences {
 
     static func restoreDefaults(in defaults: UserDefaults = .standard) {
         restoreExportDefaults(in: defaults)
+        restoreCanvasInteractionDefaults(in: defaults)
         defaults.set(defaultTheme, forKey: "colorSchemeStyle")
         defaults.removeObject(forKey: gridPanModeKey)
         defaults.removeObject(forKey: gridPanKeyKey)
+        defaults.removeObject(forKey: workspaceOrderKey)
+        defaults.removeObject(forKey: libraryLabelsKey)
         for key in preferenceKeys where key.hasPrefix("last") { defaults.removeObject(forKey: key) }
+    }
+
+    static func restoreCanvasInteractionDefaults(in defaults: UserDefaults = .standard) {
+        for key in canvasInteractionKeys { defaults.removeObject(forKey: key) }
     }
 }
