@@ -98,7 +98,7 @@ struct FreeCanvasView: View {
                 store.importURLs([url], as: .paper)
             }
         }
-        .alert("aoipic", isPresented: Binding(get: { store.message != nil }, set: { if !$0 { store.message = nil } })) {
+        .alert("AoiStitcher", isPresented: Binding(get: { store.message != nil }, set: { if !$0 { store.message = nil } })) {
             Button("确定") { store.message = nil }
         } message: { Text(store.message ?? "") }
         .alert("导出成功", isPresented: Binding(get: { exportedFile != nil }, set: { if !$0 { exportedFile = nil } })) {
@@ -429,7 +429,7 @@ struct FreeCanvasView: View {
         let panel = NSSavePanel()
         let png = exportPNG
         panel.allowedContentTypes = [png ? .png : .jpeg]
-        panel.nameFieldStringValue = png ? "aoipic_Canvas.png" : "aoipic_Canvas.jpg"
+        panel.nameFieldStringValue = png ? "AoiStitcher_Canvas.png" : "AoiStitcher_Canvas.jpg"
         if !lastExportDir.isEmpty { panel.directoryURL = URL(fileURLWithPath: lastExportDir) }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         lastExportDir = url.deletingLastPathComponent().path

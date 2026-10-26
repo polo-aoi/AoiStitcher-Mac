@@ -3,6 +3,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 nonisolated struct CanvasRenderLayer {
+    var id: UUID
     var image: CGImage?
     var texture: CGImage?
     var center: CGPoint
@@ -10,11 +11,18 @@ nonisolated struct CanvasRenderLayer {
     var rotation: CGFloat
     var opacity: CGFloat
     var color: CanvasColor
+    var bounds: CGRect
 
     @MainActor init(_ layer: CanvasLayer, preview: Bool) {
+        id = layer.id
         image = preview ? (layer.previewImage ?? layer.image) : layer.image
         texture = layer.texture; center = layer.center; size = layer.size
         rotation = layer.rotation; opacity = layer.opacity; color = layer.color
+        let radians = layer.rotation * .pi / 180
+        let width = abs(cos(radians)) * layer.size.width + abs(sin(radians)) * layer.size.height
+        let height = abs(sin(radians)) * layer.size.width + abs(cos(radians)) * layer.size.height
+        bounds = CGRect(x: layer.center.x - width / 2, y: layer.center.y - height / 2,
+                        width: width, height: height)
     }
 }
 
@@ -47,13 +55,15 @@ nonisolated enum CanvasExportError: LocalizedError {
 
 nonisolated enum CanvasRenderer {
     // All callers use top-left coordinates, including the bitmap exporter.
-    static func draw(_ snapshot: CanvasRenderSnapshot, in context: CGContext) {
+    static func draw(_ snapshot: CanvasRenderSnapshot, in context: CGContext,
+                     interpolationQuality: CGInterpolationQuality = .high) {
         context.saveGState()
         context.clip(to: CGRect(origin: .zero, size: snapshot.size))
         context.setFillColor(snapshot.background.cgColor)
         context.fill(CGRect(origin: .zero, size: snapshot.size))
-        context.interpolationQuality = .high
-        for layer in snapshot.layers {
+        context.interpolationQuality = interpolationQuality
+        let visibleRect = context.boundingBoxOfClipPath
+        for layer in snapshot.layers where layer.bounds.intersects(visibleRect) {
             context.saveGState()
             context.translateBy(x: layer.center.x, y: layer.center.y)
             context.rotate(by: layer.rotation * .pi / 180)

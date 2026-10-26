@@ -20,12 +20,11 @@ struct CanvasWorkspace: NSViewRepresentable {
         view.settings = settings
         view.onCrop = onCrop
         view.onInspect = onInspect
-        view.snapshot = CanvasRenderSnapshot(store.document, preview: true)
+        view.synchronizeDocument()
         if view.lastFitRequest != store.fitRequest {
             view.lastFitRequest = store.fitRequest
             view.resetViewport()
         }
-        view.needsDisplay = true
     }
 
     static func dismantleNSView(_ view: CanvasWorkspaceView, coordinator: ()) {
@@ -39,7 +38,16 @@ final class CanvasWorkspaceView: NSView {
     var onCrop: ((CanvasLayer) -> Void)?
     var onInspect: ((CanvasLayer) -> Void)?
     var isActive = true {
-        didSet { if !isActive && oldValue { finishInteraction(clearKeyboard: true) } }
+        didSet {
+            guard oldValue != isActive else { return }
+            if isActive {
+                registerForDraggedTypes([.fileURL, NSPasteboard.PasteboardType("com.aoipic.paper-url")])
+            } else {
+                unregisterDraggedTypes()
+                finishInteraction(clearKeyboard: true)
+            }
+            needsDisplay = true
+        }
     }
     var settings = CanvasInteractionSettings() {
         didSet { if settings != oldValue { finishInteraction(clearKeyboard: true) } }
@@ -50,8 +58,13 @@ final class CanvasWorkspaceView: NSView {
     private var spacePressed = false
     private var dragStart = CGPoint.zero
     private var initialLayer: CanvasLayer?
+    private var previewLayer: CanvasLayer?
+    private var previewLayerIndex: Int?
+    private var interactionRevision: UInt64?
+    private var snapshotRevision: UInt64?
+    private var lastSelectionID: UUID?
+    private var zoomPublication: DispatchWorkItem?
     private var panStart = CGPoint.zero
-    private var didDrag = false
     private var guideX = false
     private var guideY = false
     private var rightClickStart: CGPoint?
@@ -103,7 +116,24 @@ final class CanvasWorkspaceView: NSView {
         if let keyboardMonitor { NSEvent.removeMonitor(keyboardMonitor); self.keyboardMonitor = nil }
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
+        zoomPublication?.cancel(); zoomPublication = nil
         finishInteraction(clearKeyboard: true)
+    }
+
+    func synchronizeDocument() {
+        guard let store else { return }
+        if lastSelectionID != store.selectedID {
+            lastSelectionID = store.selectedID
+            needsDisplay = true
+        }
+        guard snapshotRevision != store.documentRevision || snapshot == nil else { return }
+        if let interactionRevision, interactionRevision != store.documentRevision {
+            finishInteraction(clearKeyboard: true, commit: false)
+            return
+        }
+        snapshot = CanvasRenderSnapshot(store.document, preview: true)
+        snapshotRevision = store.documentRevision
+        needsDisplay = true
     }
 
     private var acceptsInteraction: Bool {
@@ -112,6 +142,12 @@ final class CanvasWorkspaceView: NSView {
 
     private func handleKeyboardEvent(_ event: NSEvent) -> NSEvent? {
         guard acceptsInteraction, let window, event.window === window || event.window == nil else { return event }
+        // Menu shortcuts can bypass keyDown on the view. Finish the local
+        // preview before export, undo or another command reads the document.
+        if event.type == .keyDown, event.modifierFlags.contains(.command),
+           interaction != nil || rightClickStart != nil {
+            finishInteraction(clearKeyboard: true)
+        }
         let textInput = window.firstResponder is NSTextView || window.firstResponder is NSTextField
         if textInput {
             spacePressed = false
@@ -176,6 +212,7 @@ final class CanvasWorkspaceView: NSView {
 
     func resetViewport() {
         finishInteraction(clearKeyboard: true)
+        zoomPublication?.cancel(); zoomPublication = nil
         zoom = 1; pan = .zero
         store?.displayedZoom = 1
         needsDisplay = true
@@ -187,18 +224,15 @@ final class CanvasWorkspaceView: NSView {
         context.saveGState()
         context.clip(to: bounds)
         context.translateBy(x: origin.x, y: origin.y); context.scaleBy(x: scale, y: scale)
-        context.setShadow(offset: CGSize(width: 0, height: 2 / scale), blur: 12 / scale,
-                          color: CGColor(gray: 0, alpha: 0.12))
-        context.setFillColor(snapshot.background.cgColor); context.fill(CGRect(origin: .zero, size: snapshot.size))
-        context.setShadow(offset: .zero, blur: 0, color: nil)
-        CanvasRenderer.draw(snapshot, in: context)
+        CanvasRenderer.draw(snapshot, in: context,
+                            interpolationQuality: interaction != nil || rightClickDidDrag || zoomPublication != nil ? .medium : .high)
         if guideX || guideY {
             context.setStrokeColor(NSColor.systemTeal.cgColor); context.setLineWidth(1 / scale)
             if guideX { context.move(to: CGPoint(x: snapshot.size.width / 2, y: 0)); context.addLine(to: CGPoint(x: snapshot.size.width / 2, y: snapshot.size.height)) }
             if guideY { context.move(to: CGPoint(x: 0, y: snapshot.size.height / 2)); context.addLine(to: CGPoint(x: snapshot.size.width, y: snapshot.size.height / 2)) }
             context.strokePath()
         }
-        if let layer = store.selectedLayer { drawSelection(layer, context: context) }
+        if let layer = previewLayer ?? store.selectedLayer { drawSelection(layer, context: context) }
         context.restoreGState()
     }
 
@@ -241,24 +275,34 @@ final class CanvasWorkspaceView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard acceptsInteraction, bounds.contains(eventPoint(event)) else { return }
+        finishInteraction(clearKeyboard: false)
+        synchronizeDocument()
         let keyboardPan = keyboardPanRequested(event)
         if event.modifierFlags.contains(.control), !keyboardPan { rightMouseDown(with: event); return }
         window?.makeFirstResponder(self)
         let point = eventPoint(event)
-        dragStart = canvasPoint(point); panStart = pan; didDrag = false
+        dragStart = canvasPoint(point); panStart = pan
         if keyboardPan {
             dragStart = point; interaction = .pan; NSCursor.closedHand.set(); return
         }
         if let selected = store.selectedLayer, let selectedHandle = handle(at: dragStart, layer: selected) {
-            initialLayer = selected; interaction = selectedHandle; return
+            beginLayerInteraction(selected, interaction: selectedHandle); return
         }
         let hit = layer(at: dragStart)
-        store.selectedID = hit?.id; initialLayer = hit
-        interaction = hit?.locked == false ? .move : nil
+        store.selectedID = hit?.id
         if event.clickCount == 2, let hit, hit.kind == .photo, !hit.locked {
-            interaction = nil; onCrop?(hit)
+            onCrop?(hit)
+        } else if let hit, !hit.locked {
+            beginLayerInteraction(hit, interaction: .move)
         }
         needsDisplay = true
+    }
+
+    private func beginLayerInteraction(_ layer: CanvasLayer, interaction: Interaction) {
+        initialLayer = layer
+        interactionRevision = store.documentRevision
+        previewLayerIndex = snapshot?.layers.firstIndex { $0.id == layer.id }
+        self.interaction = interaction
     }
 
     private func layer(at point: CGPoint) -> CanvasLayer? {
@@ -311,9 +355,14 @@ final class CanvasWorkspaceView: NSView {
             pan = CGPoint(x: panStart.x + point.x - dragStart.x, y: panStart.y + point.y - dragStart.y)
             needsDisplay = true; return
         }
-        guard let layer = initialLayer else { return }
-        if !didDrag { store.beginContinuousChange(); didDrag = true }
+        guard let layer = initialLayer, interactionRevision == store.documentRevision else {
+            finishInteraction(clearKeyboard: true, commit: false)
+            return
+        }
         let point = canvasPoint(eventPoint(event))
+        var updated = layer
+        invalidatePreview(previewLayer ?? layer)
+        invalidateGuides()
         guideX = false; guideY = false
         switch interaction {
         case .move:
@@ -323,21 +372,47 @@ final class CanvasWorkspaceView: NSView {
                 if abs(center.x - canvas.width / 2) < 6 / scale { center.x = canvas.width / 2; guideX = true }
                 if abs(center.y - canvas.height / 2) < 6 / scale { center.y = canvas.height / 2; guideY = true }
             }
-            store.editLayer(layer.id) { $0.center = center }
+            updated.center = center
         case .rotate:
             let initialAngle = atan2(dragStart.y - layer.center.y, dragStart.x - layer.center.x)
             let angle = atan2(point.y - layer.center.y, point.x - layer.center.x)
             var degrees = layer.rotation + (angle - initialAngle) * 180 / .pi
             if event.modifierFlags.contains(.shift) { degrees = (degrees / 15).rounded() * 15 }
             let normalized = ((degrees + 180).truncatingRemainder(dividingBy: 360) + 360).truncatingRemainder(dividingBy: 360) - 180
-            store.editLayer(layer.id) { $0.rotation = normalized }
+            updated.rotation = normalized
         case .resize(let index):
-            resize(layer, corner: index, to: point, keepAspect: layer.preservesAspect || event.modifierFlags.contains(.shift))
+            updated = resized(layer, corner: index, to: point, keepAspect: layer.preservesAspect || event.modifierFlags.contains(.shift))
         case .pan: break
+        }
+        previewLayer = updated
+        if let previewLayerIndex, snapshot?.layers.indices.contains(previewLayerIndex) == true {
+            snapshot?.layers[previewLayerIndex] = CanvasRenderLayer(updated, preview: true)
+        }
+        invalidatePreview(updated)
+        invalidateGuides()
+    }
+
+    private func invalidatePreview(_ layer: CanvasLayer) {
+        let rect = CanvasRenderLayer(layer, preview: true).bounds
+        let viewRect = CGRect(x: origin.x + rect.minX * scale, y: origin.y + rect.minY * scale,
+                              width: rect.width * scale, height: rect.height * scale)
+        // Include selection handles and the rotation handle outside the photo.
+        setNeedsDisplay(viewRect.insetBy(dx: -40, dy: -40))
+    }
+
+    private func invalidateGuides() {
+        guard let size = snapshot?.size else { return }
+        if guideX {
+            setNeedsDisplay(CGRect(x: origin.x + size.width * scale / 2 - 2, y: origin.y,
+                                   width: 4, height: size.height * scale))
+        }
+        if guideY {
+            setNeedsDisplay(CGRect(x: origin.x, y: origin.y + size.height * scale / 2 - 2,
+                                   width: size.width * scale, height: 4))
         }
     }
 
-    private func resize(_ layer: CanvasLayer, corner: Int, to point: CGPoint, keepAspect: Bool) {
+    private func resized(_ layer: CanvasLayer, corner: Int, to point: CGPoint, keepAspect: Bool) -> CanvasLayer {
         let sign = cornerSigns[corner]
         let anchor = CanvasGeometry.worldPoint(CGPoint(x: -sign.x * layer.size.width / 2, y: -sign.y * layer.size.height / 2),
                                                center: layer.center, rotation: layer.rotation)
@@ -351,7 +426,9 @@ final class CanvasWorkspaceView: NSView {
         size.width = min(32000, size.width); size.height = min(32000, size.height)
         let center = CanvasGeometry.worldPoint(CGPoint(x: sign.x * size.width / 2, y: sign.y * size.height / 2),
                                                center: anchor, rotation: layer.rotation)
-        store.editLayer(layer.id) { $0.size = size; $0.center = center }
+        var updated = layer
+        updated.size = size; updated.center = center
+        return updated
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -359,21 +436,30 @@ final class CanvasWorkspaceView: NSView {
         finishInteraction(clearKeyboard: false)
     }
 
-    private func finishInteraction(clearKeyboard: Bool) {
-        if didDrag { store.endContinuousChange() }
-        interaction = nil; initialLayer = nil; didDrag = false
+    private func finishInteraction(clearKeyboard: Bool, commit: Bool = true) {
+        let finalLayer = previewLayer
+        let revision = interactionRevision
+        let hadPreview = previewLayer != nil
+        previewLayer = nil; previewLayerIndex = nil; interactionRevision = nil
+        interaction = nil; initialLayer = nil
         rightClickStart = nil; rightClickLayerID = nil; rightClickDidDrag = false
         if clearKeyboard { spacePressed = false }
         guideX = false; guideY = false
+        if commit, let finalLayer, let revision {
+            store?.commitTransform(finalLayer, expectedRevision: revision)
+        }
+        if hadPreview { snapshotRevision = nil }
+        synchronizeDocument()
         NSCursor.arrow.set(); needsDisplay = true
     }
 
     override func keyDown(with event: NSEvent) {
         guard acceptsInteraction else { super.keyDown(with: event); return }
         if event.keyCode == 53, interaction != nil || rightClickStart != nil {
-            finishInteraction(clearKeyboard: true)
+            finishInteraction(clearKeyboard: true, commit: false)
             return
         }
+        if interaction != nil || rightClickStart != nil { finishInteraction(clearKeyboard: true) }
         if event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "z": event.modifierFlags.contains(.shift) ? store.redo() : store.undo(); return
@@ -411,7 +497,18 @@ final class CanvasWorkspaceView: NSView {
         zoom = min(12, max(0.2, zoom * factor))
         let after = canvasPoint(point)
         pan.x += (after.x - before.x) * scale; pan.y += (after.y - before.y) * scale
-        store.displayedZoom = zoom; needsDisplay = true
+        // The viewport updates immediately; the toolbar percentage does not
+        // need to rebuild the SwiftUI workspace for every wheel event.
+        zoomPublication?.cancel()
+        let update = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.store?.displayedZoom = self.zoom
+            self.zoomPublication = nil
+            self.needsDisplay = true
+        }
+        zoomPublication = update
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: update)
+        needsDisplay = true
     }
     override func magnify(with event: NSEvent) {
         guard acceptsInteraction, bounds.contains(eventPoint(event)), interaction == nil, rightClickStart == nil else { return }

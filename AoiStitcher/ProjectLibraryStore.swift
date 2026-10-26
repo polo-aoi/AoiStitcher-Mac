@@ -6,6 +6,9 @@ import UniformTypeIdentifiers
 nonisolated enum ProjectOperation: String, Codable, CaseIterable, Identifiable, Sendable {
     case freeCanvas, longStitch, gridCollage, compression
 
+    // Compression remains decodable for saved export history; only current tools appear in menus.
+    static var allCases: [ProjectOperation] { [.gridCollage, .freeCanvas, .longStitch] }
+
     var id: String { rawValue }
     var maximumPhotoCount: Int? { self == .gridCollage ? 16 : nil }
     var title: String {
@@ -13,7 +16,7 @@ nonisolated enum ProjectOperation: String, Codable, CaseIterable, Identifiable, 
         case .freeCanvas: return "自由画布"
         case .longStitch: return "长图拼接"
         case .gridCollage: return "标准拼图"
-        case .compression: return "图片压缩"
+        case .compression: return "图片压缩（已移出）"
         }
     }
     var systemImage: String {
@@ -26,45 +29,26 @@ nonisolated enum ProjectOperation: String, Codable, CaseIterable, Identifiable, 
     }
 }
 
-nonisolated enum ProjectColorLabel: String, Codable, CaseIterable, Identifiable, Sendable {
-    case none, red, yellow, green, blue, purple
-
-    var id: String { rawValue }
-    var title: String {
-        switch self {
-        case .none: return "无颜色"
-        case .red: return "红色"
-        case .yellow: return "黄色"
-        case .green: return "绿色"
-        case .blue: return "蓝色"
-        case .purple: return "紫色"
-        }
-    }
-}
-
 nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
     var id: UUID
     var fileName: String
     var name: String
     var position: CGPoint
-    var rating: Int = 0
-    var colorLabel: ProjectColorLabel = .none
+    var groupID: UUID?
     // Retain identity and originals so export history and undo remain valid after removal.
     var isRemoved: Bool = false
 
-    init(id: UUID, fileName: String, name: String, position: CGPoint,
-         rating: Int = 0, colorLabel: ProjectColorLabel = .none, isRemoved: Bool = false) {
+    init(id: UUID, fileName: String, name: String, position: CGPoint, groupID: UUID? = nil, isRemoved: Bool = false) {
         self.id = id
         self.fileName = fileName
         self.name = name
         self.position = position
-        self.rating = rating
-        self.colorLabel = colorLabel
+        self.groupID = groupID
         self.isRemoved = isRemoved
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, fileName, name, position, rating, colorLabel, isRemoved
+        case id, fileName, name, position, groupID, isRemoved
     }
 
     init(from decoder: Decoder) throws {
@@ -73,9 +57,39 @@ nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
         fileName = try values.decode(String.self, forKey: .fileName)
         name = try values.decode(String.self, forKey: .name)
         position = try values.decode(CGPoint.self, forKey: .position)
-        rating = try values.decodeIfPresent(Int.self, forKey: .rating) ?? 0
-        colorLabel = try values.decodeIfPresent(ProjectColorLabel.self, forKey: .colorLabel) ?? .none
+        groupID = try values.decodeIfPresent(UUID.self, forKey: .groupID)
+        // Old ratings and color labels are deliberately ignored when reading existing projects.
         isRemoved = try values.decodeIfPresent(Bool.self, forKey: .isRemoved) ?? false
+    }
+}
+
+/// Shared by drawing, imports and layout edits so a card always has the same footprint.
+nonisolated struct ProjectMaterialLayout: Sendable {
+    static let thumbnailRange: ClosedRange<Double> = 48...240
+    let thumbnailSize: CGFloat
+    let gap: CGFloat = 16
+
+    init(thumbnailSize: CGFloat) {
+        self.thumbnailSize = thumbnailSize.isFinite
+            ? min(CGFloat(Self.thumbnailRange.upperBound), max(CGFloat(Self.thumbnailRange.lowerBound), thumbnailSize))
+            : 128
+    }
+
+    var cardSize: CGSize { CGSize(width: thumbnailSize + 16, height: thumbnailSize + 40) }
+    var columnStride: CGFloat { cardSize.width + gap }
+    var rowStride: CGFloat { cardSize.height + gap }
+
+    static func ordered(_ assets: [ProjectAsset]) -> [ProjectAsset] {
+        assets.sorted { left, right in
+            if left.position.y != right.position.y { return left.position.y < right.position.y }
+            if left.position.x != right.position.x { return left.position.x < right.position.x }
+            return left.id.uuidString < right.id.uuidString
+        }
+    }
+
+    func rescaledPosition(_ point: CGPoint, from previous: ProjectMaterialLayout) -> CGPoint {
+        CGPoint(x: point.x * columnStride / previous.columnStride,
+                y: point.y * rowStride / previous.rowStride)
     }
 }
 
@@ -87,6 +101,11 @@ nonisolated struct ProjectExportRecord: Identifiable, Codable, Sendable {
     var outputPath: String
 }
 
+nonisolated struct ProjectPhotoGroup: Identifiable, Codable, Equatable, Sendable {
+    var id: UUID
+    var assetIDs: [UUID]
+}
+
 nonisolated struct ProjectDocument: Identifiable, Codable, Sendable {
     var id: UUID
     var name: String
@@ -95,10 +114,149 @@ nonisolated struct ProjectDocument: Identifiable, Codable, Sendable {
     var assets: [ProjectAsset]
     var exports: [ProjectExportRecord]
     var thumbnailSize: Double
+    var groupThumbnailSize: Double
+    var thumbnailSizesLinked: Bool
     // Separate from thumbnail geometry so browsing never changes saved asset positions.
     var viewZoom: Double? = nil
+    var groups: [ProjectPhotoGroup]
+    // Includes grouped and removed identities so returning photos keeps their material order.
+    var materialOrder: [UUID]
 
     var activeAssets: [ProjectAsset] { assets.filter { !$0.isRemoved } }
+    var orderedActiveAssets: [ProjectAsset] {
+        let byID = Dictionary(uniqueKeysWithValues: assets.filter { !$0.isRemoved }.map { ($0.id, $0) })
+        return materialOrder.compactMap { byID[$0] }
+    }
+
+    init(id: UUID, name: String, createdAt: Date, modifiedAt: Date, assets: [ProjectAsset],
+         exports: [ProjectExportRecord], thumbnailSize: Double, viewZoom: Double? = nil,
+         groups: [ProjectPhotoGroup]? = nil, groupThumbnailSize: Double? = nil,
+         thumbnailSizesLinked: Bool = true, materialOrder: [UUID]? = nil) {
+        self.id = id
+        self.name = name
+        self.createdAt = createdAt
+        self.modifiedAt = modifiedAt
+        self.assets = assets
+        self.exports = exports
+        self.thumbnailSize = thumbnailSize
+        self.groupThumbnailSize = groupThumbnailSize ?? thumbnailSize
+        self.thumbnailSizesLinked = thumbnailSizesLinked
+        self.viewZoom = viewZoom
+        self.groups = groups ?? Self.migratedGroups(assets)
+        self.materialOrder = materialOrder ?? ProjectMaterialLayout.ordered(assets).map(\.id)
+        synchronizeGroups()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, createdAt, modifiedAt, assets, exports, thumbnailSize, viewZoom, groups
+        case groupThumbnailSize, thumbnailSizesLinked, materialOrder
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        name = try values.decode(String.self, forKey: .name)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        modifiedAt = try values.decode(Date.self, forKey: .modifiedAt)
+        assets = try values.decode([ProjectAsset].self, forKey: .assets)
+        exports = try values.decode([ProjectExportRecord].self, forKey: .exports)
+        thumbnailSize = try values.decode(Double.self, forKey: .thumbnailSize)
+        groupThumbnailSize = try values.decodeIfPresent(Double.self, forKey: .groupThumbnailSize) ?? thumbnailSize
+        thumbnailSizesLinked = try values.decodeIfPresent(Bool.self, forKey: .thumbnailSizesLinked) ?? true
+        viewZoom = try values.decodeIfPresent(Double.self, forKey: .viewZoom)
+        groups = try values.decodeIfPresent([ProjectPhotoGroup].self, forKey: .groups) ?? Self.migratedGroups(assets)
+        materialOrder = try values.decodeIfPresent([UUID].self, forKey: .materialOrder)
+            ?? ProjectMaterialLayout.ordered(assets).map(\.id)
+        synchronizeGroups()
+    }
+
+    private static func migratedGroups(_ assets: [ProjectAsset]) -> [ProjectPhotoGroup] {
+        var result: [ProjectPhotoGroup] = []
+        var indices: [UUID: Int] = [:]
+        for asset in ProjectMaterialLayout.ordered(assets) where !asset.isRemoved {
+            guard let groupID = asset.groupID else { continue }
+            if let index = indices[groupID] {
+                result[index].assetIDs.append(asset.id)
+            } else {
+                indices[groupID] = result.count
+                result.append(ProjectPhotoGroup(id: groupID, assetIDs: [asset.id]))
+            }
+        }
+        return result
+    }
+
+    /// Membership is stored once in row order; asset flags remain compatible with older projects.
+    mutating func synchronizeGroups() {
+        let activeIDs = Set(assets.lazy.filter { !$0.isRemoved }.map(\.id))
+        var membership: [UUID: UUID] = [:]
+        var seenGroups: Set<UUID> = []
+        groups = groups.compactMap { group in
+            guard seenGroups.insert(group.id).inserted else { return nil }
+            let ids = group.assetIDs.filter { id in
+                guard activeIDs.contains(id), membership[id] == nil else { return false }
+                membership[id] = group.id
+                return true
+            }
+            return ids.isEmpty ? nil : ProjectPhotoGroup(id: group.id, assetIDs: ids)
+        }
+        for index in assets.indices { assets[index].groupID = membership[assets[index].id] }
+        synchronizeMaterialOrder()
+    }
+
+    mutating func synchronizeMaterialOrder() {
+        let validIDs = Set(assets.map(\.id))
+        var seen: Set<UUID> = []
+        materialOrder = materialOrder.filter { validIDs.contains($0) && seen.insert($0).inserted }
+        for asset in assets where seen.insert(asset.id).inserted { materialOrder.append(asset.id) }
+    }
+}
+
+nonisolated private struct ProjectEditSnapshot: Sendable {
+    var assets: [ProjectAsset]
+    var groups: [ProjectPhotoGroup]
+    var materialOrder: [UUID]
+}
+
+/// Serial writes preserve edit order without encoding or disk access on the interaction thread.
+nonisolated private final class ProjectMetadataWriter: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.aoistitcher.project-metadata", qos: .utility)
+    private var failures: [UUID: String] = [:] // Accessed only on queue.
+
+    func enqueue(_ document: ProjectDocument, at url: URL, completion: @escaping @Sendable (String?) -> Void) {
+        queue.async {
+            do {
+                try Self.write(document, at: url)
+                self.failures[document.id] = nil
+                completion(nil)
+            } catch {
+                var message = error.localizedDescription
+                do {
+                    let recoveryURL = url.deletingLastPathComponent().appendingPathComponent("project.unsaved.json")
+                    try JSONEncoder().encode(document).write(to: recoveryURL, options: .atomic)
+                    message += " 最新修改已另存至 project.unsaved.json。"
+                } catch {
+                    message += " 备份也未能写入：\(error.localizedDescription)"
+                }
+                self.failures[document.id] = message
+                completion(message)
+            }
+        }
+    }
+
+    func flush() -> [String] { queue.sync { Array(failures.values) } }
+    func failedProjectIDs() -> [UUID] { queue.sync { Array(failures.keys) } }
+
+    static func write(_ document: ProjectDocument, at url: URL) throws {
+        // A damaged file is never silently replaced by an older in-memory snapshot.
+        if FileManager.default.fileExists(atPath: url.path) {
+            let previous = try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: url))
+            try ProjectLibraryStore.validate(previous, expectedID: document.id)
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(document).write(to: url, options: .atomic)
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent().appendingPathComponent("project.unsaved.json"))
+    }
 }
 
 nonisolated struct ProjectSummary: Identifiable, Sendable {
@@ -151,8 +309,13 @@ nonisolated private struct ProjectImportRequest: Sendable {
     let viewZoom: CGFloat
 }
 
+/// Thumbnail arrivals refresh only views that display previews, not every mounted editor.
+@MainActor final class ProjectThumbnailUpdates: ObservableObject {
+    func invalidate() { objectWillChange.send() }
+}
+
 @MainActor final class ProjectLibraryStore: ObservableObject {
-    static let projectsDirectory: URL = {
+    nonisolated static let projectsDirectory: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         return base.appendingPathComponent("aoipic/Projects", isDirectory: true)
@@ -162,15 +325,28 @@ nonisolated private struct ProjectImportRequest: Sendable {
     @Published private(set) var currentProject: ProjectDocument?
     @Published private(set) var isImporting = false
     @Published var message: String?
+    let thumbnailUpdates = ProjectThumbnailUpdates()
 
     // Updated by the material board; these are viewport measurements, not project edits.
     var boardViewportWidth: CGFloat = 800
     var boardViewZoom: CGFloat = 1
 
-    private var editHistory: [UUID: [[ProjectAsset]]] = [:]
+    private let directory: URL
+    private var editHistory: [UUID: [ProjectEditSnapshot]] = [:]
+    private var documents: [UUID: ProjectDocument] = [:]
+    private let metadataWriter = ProjectMetadataWriter()
+    private var saveObservers: Set<AnyCancellable> = []
     private let thumbnails = NSCache<NSString, NSImage>()
+    private let thumbnailQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.aoistitcher.project-thumbnails"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
     private var thumbnailRequests: Set<String> = []
     private var failedThumbnails: Set<String> = []
+    private var thumbnailNotificationScheduled = false
     private var importQueue: [ProjectImportRequest] = []
 
     var canUndoEdit: Bool {
@@ -178,13 +354,20 @@ nonisolated private struct ProjectImportRequest: Sendable {
         return !(editHistory[id]?.isEmpty ?? true)
     }
 
-    init() {
+    init(projectsDirectory: URL = ProjectLibraryStore.projectsDirectory) {
+        directory = projectsDirectory
         thumbnails.countLimit = 2_000
         thumbnails.totalCostLimit = 128 * 1024 * 1024
         refreshProjects()
+        NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
+            .merge(with: NotificationCenter.default.publisher(for: NSWindow.willCloseNotification))
+            .sink { [weak self] _ in _ = self?.flushPendingSaves() }
+            .store(in: &saveObservers)
     }
 
     deinit {
+        _ = metadataWriter.flush()
+        thumbnailQueue.cancelAllOperations()
         for request in importQueue {
             request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() }
         }
@@ -192,8 +375,8 @@ nonisolated private struct ProjectImportRequest: Sendable {
 
     func refreshProjects() {
         do {
-            try FileManager.default.createDirectory(at: Self.projectsDirectory, withIntermediateDirectories: true)
-            let entries = try FileManager.default.contentsOfDirectory(at: Self.projectsDirectory,
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let entries = try FileManager.default.contentsOfDirectory(at: directory,
                                                                       includingPropertiesForKeys: [.isDirectoryKey],
                                                                       options: [.skipsHiddenFiles])
             var summaries: [ProjectSummary] = []
@@ -219,7 +402,9 @@ nonisolated private struct ProjectImportRequest: Sendable {
                                        createdAt: now, modifiedAt: now, assets: [], exports: [], thumbnailSize: 128)
         do {
             try FileManager.default.createDirectory(at: assetDirectory(projectID: document.id), withIntermediateDirectories: true)
-            try saveDocument(document)
+            try Self.validate(document, expectedID: document.id)
+            try ProjectMetadataWriter.write(document, at: metadataURL(id: document.id))
+            documents[document.id] = document
             currentProject = document
             boardViewZoom = 1
             updateSummary(document)
@@ -269,7 +454,23 @@ nonisolated private struct ProjectImportRequest: Sendable {
         }
     }
 
-    func closeProject() { currentProject = nil }
+    func closeProject() {
+        guard flushPendingSaves() else { return }
+        currentProject = nil
+    }
+
+    @discardableResult
+    func flushPendingSaves() -> Bool {
+        for id in metadataWriter.failedProjectIDs() {
+            if let document = documents[id] { try? saveDocument(document) }
+        }
+        let failures = metadataWriter.flush()
+        guard failures.isEmpty else {
+            message = "项目尚未保存成功，当前修改仍保留在内存中：\(failures.joined(separator: "；"))"
+            return false
+        }
+        return true
+    }
 
     func importPanel() {
         guard currentProject != nil else { return }
@@ -300,19 +501,19 @@ nonisolated private struct ProjectImportRequest: Sendable {
         let request = importQueue.removeFirst()
         let projectID = request.projectID
         let destination = assetDirectory(projectID: projectID)
-        let protectedDirectory = Self.projectsDirectory
+        let protectedDirectories = [Self.projectsDirectory, directory]
         isImporting = true
-        Task { [weak self] in
+        // Keep the project store alive if its window closes during background copying.
+        Task { [self] in
             let result = await Task.detached(priority: .userInitiated) {
                 defer { request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() } }
-                return Self.copyImages(request.urls, to: destination, excluding: protectedDirectory)
+                return Self.copyImages(request.urls, to: destination, excluding: protectedDirectories)
             }.value
-            guard let self else { return }
             do {
                 // Load the project that initiated this import, even if the user has since opened another.
                 var document = try self.readDocument(id: projectID)
                 if !result.assets.isEmpty {
-                    let cardHeight = CGFloat(document.thumbnailSize) + 62
+                    let cardHeight = ProjectMaterialLayout(thumbnailSize: CGFloat(document.thumbnailSize)).cardSize.height
                     let start = request.point
                         ?? CGPoint(x: 24, y: document.activeAssets.isEmpty ? 24 : (document.activeAssets.map(\.position.y).max() ?? 24) + cardHeight + 24)
                     // A homepage drop can start before its board has been laid out. Use the live
@@ -326,6 +527,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
                         asset.position = CGPoint(x: start.x + CGFloat(index % layout.columns) * layout.columnStride,
                                                  y: start.y + CGFloat(index / layout.columns) * layout.rowStride)
                         document.assets.append(asset)
+                        document.materialOrder.append(asset.id)
                     }
                     document.modifiedAt = Date()
                     try self.saveDocument(document)
@@ -348,7 +550,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
 
     func assetURL(_ asset: ProjectAsset) -> URL {
         guard let projectID = currentProject?.id else {
-            return Self.projectsDirectory.appendingPathComponent(asset.fileName)
+            return directory.appendingPathComponent(asset.fileName)
         }
         return assetDirectory(projectID: projectID).appendingPathComponent(asset.fileName)
     }
@@ -360,62 +562,170 @@ nonisolated private struct ProjectImportRequest: Sendable {
         if let cached = thumbnails.object(forKey: key as NSString) { return cached }
         guard !failedThumbnails.contains(key), thumbnailRequests.insert(key).inserted else { return nil }
         let url = assetURL(asset)
-        Task { [weak self] in
-            let image = await Task.detached(priority: .utility) { Self.readThumbnail(url, maximum: pixelSize) }.value
-            guard let self else { return }
-            self.thumbnailRequests.remove(key)
-            guard let image else {
-                self.failedThumbnails.insert(key)
-                return
+        thumbnailQueue.addOperation { [weak self] in
+            let image = Self.readThumbnail(url, maximum: pixelSize)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.thumbnailRequests.remove(key)
+                guard let image else {
+                    self.failedThumbnails.insert(key)
+                    return
+                }
+                let preview = NSImage(cgImage: image, size: CGSize(width: image.width, height: image.height))
+                self.thumbnails.setObject(preview, forKey: key as NSString, cost: image.bytesPerRow * image.height)
+                self.scheduleThumbnailNotification()
             }
-            let preview = NSImage(cgImage: image, size: CGSize(width: image.width, height: image.height))
-            self.thumbnails.setObject(preview, forKey: key as NSString, cost: image.bytesPerRow * image.height)
-            // NSCache is not published; refresh observed boards when an asynchronous preview arrives.
-            self.objectWillChange.send()
         }
         return nil
     }
 
-    private func editAssets(_ ids: Set<UUID>, change: (inout ProjectAsset) -> Void) {
-        guard !ids.isEmpty, var document = documentForEditing() else { return }
-        var previous: [ProjectAsset] = []
-        for index in document.assets.indices {
-            let asset = document.assets[index]
-            guard ids.contains(asset.id), !asset.isRemoved else { continue }
-            change(&document.assets[index])
-            if document.assets[index] != asset { previous.append(asset) }
+    private func scheduleThumbnailNotification() {
+        guard !thumbnailNotificationScheduled else { return }
+        thumbnailNotificationScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self else { return }
+            self.thumbnailNotificationScheduled = false
+            self.thumbnailUpdates.invalidate()
         }
-        guard !previous.isEmpty, commitCurrent(document) else { return }
+    }
+
+    private func editDocument(_ change: (inout ProjectDocument) -> Void) {
+        guard var document = documentForEditing() else { return }
+        var previous = ProjectEditSnapshot(assets: document.assets, groups: document.groups,
+                                           materialOrder: document.materialOrder)
+        change(&document)
+        document.synchronizeGroups()
+        guard document.assets != previous.assets || document.groups != previous.groups
+                || document.materialOrder != previous.materialOrder,
+              commitCurrent(document) else { return }
+        previous.assets = zip(previous.assets, document.assets).compactMap { old, new in old == new ? nil : old }
         editHistory[document.id, default: []].append(previous)
         if editHistory[document.id, default: []].count > 50 { editHistory[document.id]?.removeFirst() }
     }
 
     func moveAssets(_ positions: [UUID: CGPoint]) {
-        editAssets(Set(positions.keys)) { asset in
-            guard let point = positions[asset.id], point.x.isFinite, point.y.isFinite else { return }
-            asset.position = CGPoint(x: max(0, point.x), y: max(0, point.y))
+        guard !positions.isEmpty else { return }
+        editDocument { document in
+            for index in document.assets.indices {
+                let asset = document.assets[index]
+                guard !asset.isRemoved, asset.groupID == nil,
+                      let point = positions[asset.id], point.x.isFinite, point.y.isFinite else { continue }
+                document.assets[index].position = CGPoint(x: max(0, point.x), y: max(0, point.y))
+            }
         }
     }
 
-    func setRating(_ ids: Set<UUID>, rating: Int) {
-        guard (0...5).contains(rating) else { return }
-        editAssets(ids) { $0.rating = rating }
+    /// Reorder only the displayed subset. Filtered, grouped and removed slots retain their place.
+    func reorderMaterials(_ orderedVisibleIDs: [UUID]) {
+        guard !orderedVisibleIDs.isEmpty else { return }
+        editDocument { document in
+            let requested = Set(orderedVisibleIDs)
+            let eligible = Set(document.activeAssets.filter { $0.groupID == nil }.map(\.id))
+            guard requested.count == orderedVisibleIDs.count, requested.isSubset(of: eligible) else { return }
+            var replacement = orderedVisibleIDs.makeIterator()
+            document.materialOrder = document.materialOrder.map { id in
+                requested.contains(id) ? replacement.next()! : id
+            }
+        }
     }
 
-    func setColor(_ ids: Set<UUID>, color: ProjectColorLabel) {
-        editAssets(ids) { $0.colorLabel = color }
+    @discardableResult
+    func createGroup(_ ids: Set<UUID>) -> UUID? {
+        guard let document = currentProject else { return nil }
+        let chosen = document.orderedActiveAssets.filter { ids.contains($0.id) }
+        guard chosen.count >= 2 else { return nil }
+        let groupID = UUID()
+        let memberIDs = chosen.map(\.id)
+        let membership = Set(memberIDs)
+        editDocument { document in
+            for index in document.groups.indices { document.groups[index].assetIDs.removeAll { membership.contains($0) } }
+            document.groups.append(ProjectPhotoGroup(id: groupID, assetIDs: memberIDs))
+        }
+        return currentProject?.groups.contains(where: { $0.id == groupID }) == true ? groupID : nil
+    }
+
+    func gatherAssets(_ ids: Set<UUID>, at point: CGPoint) {
+        createGroup(ids)
+    }
+
+    func ungroupAssets(_ ids: Set<UUID>) {
+        guard let document = currentProject else { return }
+        let groupIDs = Set(document.activeAssets.filter { ids.contains($0.id) }.compactMap(\.groupID))
+        guard !groupIDs.isEmpty else { return }
+        editDocument { $0.groups.removeAll { groupIDs.contains($0.id) } }
+    }
+
+    func returnAssetsToMaterials(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        editDocument { document in
+            for index in document.groups.indices { document.groups[index].assetIDs.removeAll { ids.contains($0) } }
+        }
+    }
+
+    func dissolveGroup(_ id: UUID) {
+        editDocument { $0.groups.removeAll { $0.id == id } }
+    }
+
+    func moveGroup(_ id: UUID, by offset: Int) {
+        editDocument { document in
+            guard let index = document.groups.firstIndex(where: { $0.id == id }) else { return }
+            let target = index + offset
+            guard document.groups.indices.contains(target), target != index else { return }
+            let group = document.groups.remove(at: index)
+            document.groups.insert(group, at: target)
+        }
+    }
+
+    func moveGroupAsset(_ assetID: UUID, in groupID: UUID, by offset: Int) {
+        guard let group = currentProject?.groups.first(where: { $0.id == groupID }),
+              let index = group.assetIDs.firstIndex(of: assetID) else { return }
+        var ids = group.assetIDs
+        let target = index + offset
+        guard ids.indices.contains(target), target != index else { return }
+        ids.remove(at: index)
+        ids.insert(assetID, at: target)
+        setGroupAssetOrder(ids, in: groupID)
+    }
+
+    func setGroupAssetOrder(_ ids: [UUID], in groupID: UUID) {
+        editDocument { document in
+            guard let index = document.groups.firstIndex(where: { $0.id == groupID }),
+                  Set(ids) == Set(document.groups[index].assetIDs), ids.count == document.groups[index].assetIDs.count else { return }
+            document.groups[index].assetIDs = ids
+        }
+    }
+
+    func addAssets(_ ids: Set<UUID>, to groupID: UUID) {
+        editDocument { document in
+            guard let target = document.groups.firstIndex(where: { $0.id == groupID }) else { return }
+            let existing = Set(document.groups[target].assetIDs)
+            let additions = document.orderedActiveAssets.filter { ids.contains($0.id) && !existing.contains($0.id) }.map(\.id)
+            guard !additions.isEmpty else { return }
+            let moving = Set(additions)
+            for index in document.groups.indices { document.groups[index].assetIDs.removeAll { moving.contains($0) } }
+            document.groups[target].assetIDs.append(contentsOf: additions)
+        }
     }
 
     func removeAssets(_ ids: Set<UUID>) {
-        editAssets(ids) { $0.isRemoved = true }
+        guard !ids.isEmpty else { return }
+        editDocument { document in
+            for index in document.assets.indices where ids.contains(document.assets[index].id) {
+                document.assets[index].isRemoved = true
+            }
+        }
     }
 
     func undoLastEdit() {
         guard var document = documentForEditing(), let previous = editHistory[document.id]?.last else { return }
-        let byID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        let byID = Dictionary(uniqueKeysWithValues: previous.assets.map { ($0.id, $0) })
         for index in document.assets.indices {
             if let asset = byID[document.assets[index].id] { document.assets[index] = asset }
         }
+        document.groups = previous.groups
+        let previousIDs = Set(previous.materialOrder)
+        document.materialOrder = previous.materialOrder + document.materialOrder.filter { !previousIDs.contains($0) }
+        document.synchronizeGroups()
         guard commitCurrent(document) else { return }
         editHistory[document.id]?.removeLast()
     }
@@ -423,11 +733,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
     func arrangeAssets(viewportWidth: CGFloat, zoom: CGFloat) {
         guard let document = currentProject else { return }
         let layout = assetLayout(thumbnailSize: document.thumbnailSize, viewportWidth: viewportWidth, zoom: zoom, startX: 24)
-        let ordered = document.activeAssets.sorted { left, right in
-            let leftRow = floor(left.position.y / layout.rowStride)
-            let rightRow = floor(right.position.y / layout.rowStride)
-            return leftRow == rightRow ? left.position.x < right.position.x : leftRow < rightRow
-        }
+        let ordered = document.orderedActiveAssets.filter { $0.groupID == nil }
         let positions = Dictionary(uniqueKeysWithValues: ordered.enumerated().map { index, asset in
             (asset.id, CGPoint(x: 24 + CGFloat(index % layout.columns) * layout.columnStride,
                                y: 24 + CGFloat(index / layout.columns) * layout.rowStride))
@@ -437,16 +743,14 @@ nonisolated private struct ProjectImportRequest: Sendable {
 
     private func assetLayout(thumbnailSize: Double, viewportWidth: CGFloat, zoom: CGFloat, startX: CGFloat)
         -> (columns: Int, columnStride: CGFloat, rowStride: CGFloat) {
-        let cardWidth = CGFloat(thumbnailSize) + 16
-        let columnStride = cardWidth + 20
-        let rowStride = CGFloat(thumbnailSize) + 62 + 20
+        let layout = ProjectMaterialLayout(thumbnailSize: CGFloat(thumbnailSize))
         let safeWidth = viewportWidth.isFinite ? max(1, viewportWidth) : 800
         let safeZoom = zoom.isFinite ? min(2, max(0.02, zoom)) : 1
         // The board adds 24 screen points on each side, outside the scaled logical coordinates.
-        let availableWidth = max(cardWidth, (safeWidth - 48) / safeZoom - startX)
+        let availableWidth = max(layout.cardSize.width, (safeWidth - 48) / safeZoom - startX)
         // A pathological screen measurement should never overflow the integer conversion.
-        let columns = max(1, Int(min(10_000, floor((availableWidth + 20) / columnStride))))
-        return (columns, columnStride, rowStride)
+        let columns = max(1, Int(min(10_000, floor((availableWidth + layout.gap) / layout.columnStride))))
+        return (columns, layout.columnStride, layout.rowStride)
     }
 
     func setViewZoom(_ value: Double) {
@@ -459,11 +763,55 @@ nonisolated private struct ProjectImportRequest: Sendable {
     }
 
     func setThumbnailSize(_ size: Double) {
-        guard size.isFinite, var document = documentForEditing() else { return }
-        let clamped = min(224, max(72, size))
-        guard document.thumbnailSize != clamped else { return }
-        document.thumbnailSize = clamped
+        setThumbnailSize(size, forGroup: false)
+    }
+
+    func setGroupThumbnailSize(_ size: Double) {
+        setThumbnailSize(size, forGroup: true)
+    }
+
+    func setThumbnailSizesLinked(_ linked: Bool) {
+        guard var document = documentForEditing(), document.thumbnailSizesLinked != linked else { return }
+        // Relocking preserves both current values; the next slider gesture chooses the shared size.
+        document.thumbnailSizesLinked = linked
         _ = commitCurrent(document)
+    }
+
+    private func setThumbnailSize(_ size: Double, forGroup: Bool) {
+        guard size.isFinite, var document = documentForEditing() else { return }
+        let clamped = min(ProjectMaterialLayout.thumbnailRange.upperBound,
+                          max(ProjectMaterialLayout.thumbnailRange.lowerBound, size))
+        let updatesMaterials = !forGroup || document.thumbnailSizesLinked
+        let updatesGroups = forGroup || document.thumbnailSizesLinked
+        let leftSize = updatesMaterials ? clamped : document.thumbnailSize
+        let rightSize = updatesGroups ? clamped : document.groupThumbnailSize
+        let leftSizeChanged = document.thumbnailSize != leftSize
+        guard leftSizeChanged || document.groupThumbnailSize != rightSize
+                || (updatesMaterials && (document.viewZoom ?? 1) != 1) else { return }
+        let previousLayout = ProjectMaterialLayout(thumbnailSize: CGFloat(document.thumbnailSize))
+        let layout = ProjectMaterialLayout(thumbnailSize: CGFloat(leftSize))
+        if leftSizeChanged {
+            for index in document.assets.indices {
+                document.assets[index].position = layout.rescaledPosition(document.assets[index].position, from: previousLayout)
+            }
+        }
+        document.thumbnailSize = leftSize
+        document.groupThumbnailSize = rightSize
+        if updatesMaterials { document.viewZoom = 1 }
+        guard commitCurrent(document) else { return }
+        if updatesMaterials { boardViewZoom = 1 }
+        // Undo restores edits in today's card geometry, even after the thumbnail slider changes.
+        if leftSizeChanged, let history = editHistory[document.id] {
+            editHistory[document.id] = history.map { snapshot in
+                var snapshot = snapshot
+                snapshot.assets = snapshot.assets.map { asset in
+                    var asset = asset
+                    asset.position = layout.rescaledPosition(asset.position, from: previousLayout)
+                    return asset
+                }
+                return snapshot
+            }
+        }
     }
 
     func captureExport(operation: ProjectOperation, sourceURLs: [URL]) -> ProjectExportContext? {
@@ -517,12 +865,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
     }
 
     private func documentForEditing() -> ProjectDocument? {
-        guard let id = currentProject?.id else { return nil }
-        do { return try readDocument(id: id) }
-        catch {
-            message = "读取项目最新资料失败：\(error.localizedDescription)"
-            return nil
-        }
+        currentProject
     }
 
     private func summary(_ document: ProjectDocument) -> ProjectSummary {
@@ -536,7 +879,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
     }
 
     private func projectDirectory(id: UUID) -> URL {
-        Self.projectsDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+        directory.appendingPathComponent(id.uuidString, isDirectory: true)
     }
     private func assetDirectory(projectID: UUID) -> URL {
         projectDirectory(id: projectID).appendingPathComponent("Originals", isDirectory: true)
@@ -546,31 +889,55 @@ nonisolated private struct ProjectImportRequest: Sendable {
     }
 
     private func readDocument(id: UUID) throws -> ProjectDocument {
-        let document = try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: metadataURL(id: id)))
-        try validate(document, expectedID: id)
+        if let document = documents[id] { return document }
+        let url = metadataURL(id: id)
+        let recoveryURL = url.deletingLastPathComponent().appendingPathComponent("project.unsaved.json")
+        let primary = Result { () throws -> ProjectDocument in
+            let document = try JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: url))
+            try Self.validate(document, expectedID: id)
+            return document
+        }
+        if FileManager.default.fileExists(atPath: recoveryURL.path),
+           let recovery = try? JSONDecoder().decode(ProjectDocument.self, from: Data(contentsOf: recoveryURL)),
+           (try? Self.validate(recovery, expectedID: id)) != nil,
+           (try? primary.get()).map({ recovery.modifiedAt > $0.modifiedAt }) ?? true {
+            documents[id] = recovery
+            message = "已恢复「\(recovery.name)」上次未保存的修改。原项目资料仍保留，请检查存储位置是否可写。"
+            return recovery
+        }
+        let document = try primary.get()
+        documents[id] = document
         return document
     }
 
     private func saveDocument(_ document: ProjectDocument) throws {
-        try validate(document, expectedID: document.id)
+        try Self.validate(document, expectedID: document.id)
+        documents[document.id] = document
         let url = metadataURL(id: document.id)
-        // Never replace metadata that cannot be decoded, even if an older in-memory copy exists.
-        if FileManager.default.fileExists(atPath: url.path) { _ = try readDocument(id: document.id) }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(document).write(to: url, options: .atomic)
+        metadataWriter.enqueue(document, at: url) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor [weak self] in
+                self?.message = "保存项目失败，当前修改仍保留在内存中：\(error)"
+            }
+        }
     }
 
-    private func validate(_ document: ProjectDocument, expectedID: UUID) throws {
+    nonisolated fileprivate static func validate(_ document: ProjectDocument, expectedID: UUID) throws {
         let assetIDs = Set(document.assets.map(\.id))
+        let groupedIDs = document.groups.flatMap(\.assetIDs)
         guard document.id == expectedID,
-              document.thumbnailSize.isFinite, (72...224).contains(document.thumbnailSize),
+              document.thumbnailSize.isFinite, ProjectMaterialLayout.thumbnailRange.contains(document.thumbnailSize),
+              document.groupThumbnailSize.isFinite, ProjectMaterialLayout.thumbnailRange.contains(document.groupThumbnailSize),
               document.viewZoom.map({ $0.isFinite && (0.02...2).contains($0) }) ?? true,
               assetIDs.count == document.assets.count,
+              document.materialOrder.count == assetIDs.count, Set(document.materialOrder) == assetIDs,
               Set(document.assets.map(\.fileName)).count == document.assets.count,
               Set(document.exports.map(\.id)).count == document.exports.count,
+              Set(document.groups.map(\.id)).count == document.groups.count,
+              Set(groupedIDs).count == groupedIDs.count,
+              document.groups.allSatisfy({ !$0.assetIDs.isEmpty && $0.assetIDs.allSatisfy { assetIDs.contains($0) } }),
               document.assets.allSatisfy({ asset in
-                  (0...5).contains(asset.rating) && !asset.fileName.isEmpty && asset.fileName != "." && asset.fileName != ".." &&
+                  !asset.fileName.isEmpty && asset.fileName != "." && asset.fileName != ".." &&
                   !asset.fileName.contains("/") && !asset.fileName.contains("\\") &&
                   asset.position.x.isFinite && asset.position.y.isFinite && asset.position.x >= 0 && asset.position.y >= 0
               }),
@@ -579,10 +946,10 @@ nonisolated private struct ProjectImportRequest: Sendable {
               }) else { throw ProjectLibraryError.invalidMetadata }
     }
 
-    nonisolated private static func copyImages(_ urls: [URL], to directory: URL, excluding protectedDirectory: URL) -> ProjectImportResult {
+    nonisolated private static func copyImages(_ urls: [URL], to directory: URL, excluding protectedDirectories: [URL]) -> ProjectImportResult {
         var result = ProjectImportResult(assets: [], failures: [])
         let manager = FileManager.default
-        let protectedPath = protectedDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        let protectedPaths = protectedDirectories.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
         let resourceKeys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
                                                 .isHiddenKey, .isPackageKey, .contentTypeKey]
         var imageURLs: [URL] = []
@@ -595,7 +962,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
                 return 0
             }
             let canonical = url.standardizedFileURL.resolvingSymlinksInPath()
-            guard canonical.path != protectedPath && !canonical.path.hasPrefix(protectedPath + "/") else {
+            guard !protectedPaths.contains(where: { canonical.path == $0 || canonical.path.hasPrefix($0 + "/") }) else {
                 if isRoot { result.recordFailure("\(url.lastPathComponent)：不能导入应用的项目资料目录") }
                 return 0
             }

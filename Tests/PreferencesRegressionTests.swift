@@ -17,18 +17,36 @@ enum PreferencesRegressionTests {
         defaults.set("untouched", forKey: "unrelated-value")
         defaults.set(DragPanMode.keyboard.rawValue, forKey: AppPreferences.gridPanModeKey)
         defaults.set(LongStitchPanKey.command.rawValue, forKey: AppPreferences.gridPanKeyKey)
+        let defaultWorkspaces: [AppWorkspace] = [.gridCollage, .freeCanvas, .longStitch]
+        let legacyWorkspaceOrder = #"["border","longStitch","compression","freeCanvas","gridCollage","longStitch","unknown"]"#
+        defaults.set(legacyWorkspaceOrder, forKey: AppPreferences.workspaceOrderKey)
+        check(AppPreferences.workspaceOrder(from: "") == defaultWorkspaces &&
+              AppPreferences.workspaceOrder(from: "[]") == defaultWorkspaces,
+              "Empty workspace preferences use standard collage, free canvas and long stitch")
+        check(AppPreferences.workspaceOrder(from: legacyWorkspaceOrder) == [.longStitch, .freeCanvas, .gridCollage],
+              "Legacy workspace order drops removed tools and duplicates while preserving remaining custom order")
+        check(AppPreferences.workspaceOrder(from: #"["compression","freeCanvas","border"]"#) == [.freeCanvas, .gridCollage, .longStitch],
+              "Legacy partial workspace order fills missing supported tools without restoring removed ones")
+        let customWorkspaces: [AppWorkspace] = [.longStitch, .gridCollage, .freeCanvas]
+        check(AppPreferences.workspaceOrder(from: AppPreferences.encodeWorkspaceOrder(customWorkspaces)) == customWorkspaces,
+              "The remaining workspace order survives saving and reopening")
         AppPreferences.restoreExportDefaults(in: defaults)
         check(defaults.string(forKey: "exportWidth") == "2560" && defaults.bool(forKey: "exportPNG"), "Export reset restores width and format")
         check(defaults.integer(forKey: "colorSchemeStyle") == 2 && defaults.string(forKey: "lastExportDir") == "/tmp", "Export reset preserves theme and remembered folders")
         check(defaults.string(forKey: AppPreferences.gridPanModeKey) == DragPanMode.keyboard.rawValue &&
               defaults.string(forKey: AppPreferences.gridPanKeyKey) == LongStitchPanKey.command.rawValue,
               "Export reset preserves standard collage shortcuts")
+        check(defaults.string(forKey: AppPreferences.workspaceOrderKey) == legacyWorkspaceOrder,
+              "Export reset preserves the customized workspace order")
         AppPreferences.restoreDefaults(in: defaults)
         check(defaults.integer(forKey: "colorSchemeStyle") == 1 && defaults.object(forKey: "lastExportDir") == nil, "Software reset restores theme and remembered folders")
         check(defaults.string(forKey: "unrelated-value") == "untouched", "Software reset affects only owned preferences")
         check(defaults.object(forKey: AppPreferences.gridPanModeKey) == nil &&
               defaults.object(forKey: AppPreferences.gridPanKeyKey) == nil,
               "Software reset removes standard collage overrides so the default drag mode returns")
+        check(defaults.object(forKey: AppPreferences.workspaceOrderKey) == nil &&
+              AppPreferences.workspaceOrder(from: defaults.string(forKey: AppPreferences.workspaceOrderKey) ?? "") == defaultWorkspaces,
+              "Software reset restores the three-tool default workspace order")
         check(AppPreferences.exportWidth(" 2200 ") == 2200, "Width validation accepts whitespace")
         check(["0", "-1", "16385", "abc", "1.5"].allSatisfy { AppPreferences.exportWidth($0) == nil }, "Width validation rejects invalid and unsafe dimensions")
         let decoder = JSONDecoder()

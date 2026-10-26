@@ -210,7 +210,10 @@ nonisolated enum CanvasImageLoader {
 
 @MainActor final class CanvasStore: ObservableObject {
     static let maximumPaperLayers = 5
-    @Published private(set) var document = CanvasDocument()
+    @Published private(set) var document = CanvasDocument() {
+        didSet { documentRevision &+= 1 }
+    }
+    private(set) var documentRevision: UInt64 = 0
     @Published var selectedID: UUID?
     @Published var isLoading = false
     @Published var isExporting = false
@@ -253,10 +256,31 @@ nonisolated enum CanvasImageLoader {
 
     func mutate(_ action: (inout CanvasDocument) -> Void) {
         if !continuousChange { rememberChange() }
-        let oldBackground = document.background
-        action(&document)
-        if document.background != oldBackground { document.backgroundIsExplicit = true }
-        document.layers = CanvasLayerOrdering.normalized(document.layers)
+        var updated = document
+        action(&updated)
+        if updated.background != document.background { updated.backgroundIsExplicit = true }
+        updated.layers = CanvasLayerOrdering.normalized(updated.layers)
+        document = updated
+    }
+
+    /// A native drag keeps its intermediate geometry outside the document.
+    /// Commit once, and never overwrite an import, undo or inspector edit that
+    /// arrived while that drag was in progress.
+    @discardableResult
+    func commitTransform(_ layer: CanvasLayer, expectedRevision: UInt64) -> Bool {
+        guard expectedRevision == documentRevision,
+              let current = document.layers.first(where: { $0.id == layer.id }),
+              !current.locked,
+              layer.center.x.isFinite, layer.center.y.isFinite,
+              layer.size.width.isFinite, layer.size.height.isFinite,
+              layer.size.width > 0, layer.size.height > 0, layer.rotation.isFinite,
+              current.center != layer.center || current.size != layer.size || current.rotation != layer.rotation else { return false }
+        editLayer(layer.id) {
+            $0.center = layer.center
+            $0.size = layer.size
+            $0.rotation = layer.rotation
+        }
+        return true
     }
 
     private func rememberChange() {

@@ -6,6 +6,7 @@ struct GridCollageDragPreview {
     let frame: CGRect
     let radius: CGFloat
     let targetID: String?
+    let isPan: Bool
 }
 
 /// A single event owner keeps swapping and in-frame panning mutually exclusive.
@@ -21,6 +22,7 @@ struct GridCollageInteractionReader: NSViewRepresentable {
 
     func makeNSView(context: Context) -> GridCollageInteractionView {
         let view = GridCollageInteractionView()
+        view.wantsLayer = true
         updateNSView(view, context: context)
         return view
     }
@@ -47,6 +49,10 @@ final class GridCollageInteractionView: NSView {
         let slotFrame: CGRect
         let isPan: Bool
         let isRightMouse: Bool
+        let layout: GridCollageLayout
+        let gap: CGFloat
+        let padding: CGFloat
+        let radius: CGFloat
         var didDrag = false
         var isCancelled = false
     }
@@ -61,6 +67,12 @@ final class GridCollageInteractionView: NSView {
     private var session: GestureSession?
     private var spacePressed = false
     private var hasPreview = false
+    private var localPreview: GridCollageDragPreview?
+    private var previewImage: NSImage?
+    private var publishedTargetID: String?
+    /// A menu command can finish editing before the physical mouse release.
+    /// Keep consuming that original sequence even if a command switches tools.
+    private var pendingMouseRelease: Int?
     private var monitor: Any?
     private var observers: [NSObjectProtocol] = []
 
@@ -109,9 +121,19 @@ final class GridCollageInteractionView: NSView {
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
         cancelInteraction(deferPreviewUpdate: true)
+        pendingMouseRelease = nil
     }
 
     private func handle(_ event: NSEvent) -> NSEvent? {
+        if let button = pendingMouseRelease, event.window === window {
+            let dragged: NSEvent.EventType = button == 1 ? .rightMouseDragged : .leftMouseDragged
+            let released: NSEvent.EventType = button == 1 ? .rightMouseUp : .leftMouseUp
+            let pressed: NSEvent.EventType = button == 1 ? .rightMouseDown : .leftMouseDown
+            if event.type == released { pendingMouseRelease = nil; return nil }
+            if event.type == dragged { return nil }
+            // Recover when focus/window changes caused the original release to be lost.
+            if event.type == pressed { pendingMouseRelease = nil }
+        }
         let isKeyboardEvent = [.keyDown, .keyUp, .flagsChanged].contains(event.type)
         guard isActive, let store, !store.isLoading, let window,
               window.isKeyWindow, window.attachedSheet == nil,
@@ -134,6 +156,10 @@ final class GridCollageInteractionView: NSView {
             return event
         }
         if event.type == .keyDown {
+            if event.modifierFlags.contains(.command), session != nil {
+                finishBeforeCommand()
+                return event
+            }
             if event.keyCode == 53, session != nil {
                 // Keep ownership until mouse-up; an aborted drag must not
                 // turn into a SwiftUI click or a different gesture midway.
@@ -174,10 +200,15 @@ final class GridCollageInteractionView: NSView {
             }
             if event.type == released {
                 if !session.isCancelled { updateGesture(at: point) }
-                if let current = self.session, current.didDrag, !current.isPan, !current.isCancelled,
-                   let target = slot(at: point, excludingControls: false), target.id != current.slot.id,
-                   current.photoIDs[target.id] == target.photoID {
-                    store.swapImages(current.slot.id, target.id)
+                if let current = self.session, current.didDrag, !current.isCancelled {
+                    if current.isPan, let preview = localPreview {
+                        store.setPan(CGPoint(x: preview.slot.transform.translateX,
+                                             y: preview.slot.transform.translateY),
+                                     for: current.slot.id, viewport: current.slotFrame.size)
+                    } else if let target = slot(at: point, excludingControls: false), target.id != current.slot.id,
+                              current.photoIDs[target.id] == target.photoID {
+                        store.swapImages(current.slot.id, target.id)
+                    }
                 }
                 finishGesture()
                 return nil
@@ -188,7 +219,7 @@ final class GridCollageInteractionView: NSView {
         }
 
         guard let slot = slot(at: point, excludingControls: true), slot.hasImage,
-              let frame = layout?.slotRects[slot.id], frame.width > 0, frame.height > 0 else { return event }
+              let layout, let frame = layout.slotRects[slot.id], frame.width > 0, frame.height > 0 else { return event }
         if event.type == .leftMouseDown || (event.type == .rightMouseDown && panMode == .rightMouse) {
             let keyboardPan = panMode == .keyboard && (panKey == .space
                 ? spacePressed : event.modifierFlags.contains(panKey.modifierFlags))
@@ -196,7 +227,10 @@ final class GridCollageInteractionView: NSView {
                                      rootNode: store.state.rootNode,
                                      photoIDs: store.state.slots.mapValues(\.photoID), startPoint: point,
                                      slotFrame: frame, isPan: event.type == .rightMouseDown || keyboardPan,
-                                     isRightMouse: event.type == .rightMouseDown)
+                                     isRightMouse: event.type == .rightMouseDown, layout: layout,
+                                     gap: store.state.style.gap, padding: store.state.style.padding,
+                                     radius: store.state.style.borderRadius)
+            previewImage = (slot.previewImage ?? slot.image).map { NSImage(cgImage: $0, size: .zero) }
             window.makeFirstResponder(self)
             store.selectSlot(slot.id)
             return nil
@@ -217,7 +251,7 @@ final class GridCollageInteractionView: NSView {
     }
 
     private var layout: GridCollageLayout? {
-        store.map { GridCollageLayoutEngine.layout(state: $0.state, in: canvasFrame) }
+        session?.layout ?? store.map { GridCollageLayoutEngine.layout(state: $0.state, in: canvasFrame) }
     }
 
     private var toolbarFrame: CGRect {
@@ -255,32 +289,85 @@ final class GridCollageInteractionView: NSView {
             self.session = session
         }
         NSCursor.closedHand.set()
+        var previewSlot = session.slot
+        let target = session.isPan ? nil : slot(at: point, excludingControls: false)
+        let radius = min(store.state.style.borderRadius * canvasFrame.width / 1000,
+                         min(session.slotFrame.width, session.slotFrame.height) / 2)
         if session.isPan {
-            store.setPan(CGPoint(x: session.slot.transform.translateX + delta.x / session.slotFrame.width,
-                                 y: session.slot.transform.translateY + delta.y / session.slotFrame.height),
-                         for: session.slot.id, viewport: session.slotFrame.size)
-        } else {
-            let target = slot(at: point, excludingControls: false)
-            let radius = min(store.state.style.borderRadius * canvasFrame.width / 1000,
-                             min(session.slotFrame.width, session.slotFrame.height) / 2)
+            previewSlot.transform.translateX += delta.x / session.slotFrame.width
+            previewSlot.transform.translateY += delta.y / session.slotFrame.height
+            if let imageSize = previewSlot.imageSize {
+                previewSlot.transform = GridCollageLayoutEngine.clampedTransform(
+                    previewSlot.transform, imageSize: imageSize,
+                    viewport: session.slotFrame.size, fill: previewSlot.fill)
+            }
+        }
+        let preview = GridCollageDragPreview(
+            slot: previewSlot,
+            frame: session.isPan ? session.slotFrame : session.slotFrame.offsetBy(dx: delta.x, dy: delta.y),
+            radius: radius, targetID: target?.id == session.slot.id ? nil : target?.id, isPan: session.isPan)
+        if let old = localPreview { setNeedsDisplay(old.frame.insetBy(dx: -3, dy: -3)) }
+        localPreview = preview
+        setNeedsDisplay(preview.frame.insetBy(dx: -3, dy: -3))
+        // Publish only gesture/target transitions. Pointer movement stays in this view.
+        if !hasPreview || publishedTargetID != preview.targetID {
             hasPreview = true
-            onPreviewChange?(GridCollageDragPreview(
-                slot: session.slot, frame: session.slotFrame.offsetBy(dx: delta.x, dy: delta.y), radius: radius,
-                targetID: target?.id == session.slot.id ? nil : target?.id
-            ))
+            publishedTargetID = preview.targetID
+            onPreviewChange?(preview)
         }
     }
 
+    override func draw(_ dirtyRect: NSRect) {
+        // This view owns a transparent backing layer. Clear the invalidated
+        // region so a finished/moved preview never leaves cached pixels behind.
+        NSGraphicsContext.current?.cgContext.clear(dirtyRect)
+        guard let preview = localPreview, let image = previewImage,
+              let imageSize = preview.slot.imageSize else { return }
+        NSGraphicsContext.saveGraphicsState()
+        let clip = NSBezierPath(roundedRect: preview.frame, xRadius: preview.radius, yRadius: preview.radius)
+        clip.addClip()
+        NSGraphicsContext.current?.imageInterpolation = .medium
+        let imageRect = GridCollageLayoutEngine.imageRect(imageSize: imageSize, viewport: preview.frame,
+                                                         transform: preview.slot.transform, fill: preview.slot.fill)
+        image.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        NSGraphicsContext.restoreGraphicsState()
+        NSColor.controlAccentColor.setStroke()
+        clip.lineWidth = 2
+        clip.stroke()
+    }
+
     private func isCurrent(_ session: GestureSession) -> Bool {
-        guard let store else { return false }
+        guard let store, let slot = store.state.slots[session.slot.id] else { return false }
         return !store.isLoading && store.state.activeTemplateId == session.templateID &&
             store.state.rootNode == session.rootNode &&
-            store.state.slots[session.slot.id]?.photoID == session.slot.photoID
+            store.state.style.gap == session.gap && store.state.style.padding == session.padding &&
+            store.state.style.borderRadius == session.radius &&
+            slot.photoID == session.slot.photoID && slot.transform == session.slot.transform &&
+            slot.fill == session.slot.fill && slot.imageURL == session.slot.imageURL &&
+            slot.editedImageURL == session.slot.editedImageURL && slot.editRecipe == session.slot.editRecipe
+    }
+
+    private func finishBeforeCommand() {
+        guard let session else { return }
+        let button = session.isRightMouse ? 1 : 0
+        // Export/undo/menu actions must observe the crop currently being shown.
+        // A swap still requires a mouse release over a destination, so discard it.
+        if session.isPan, session.didDrag, !session.isCancelled,
+           isCurrent(session), let preview = localPreview {
+            store?.setPan(CGPoint(x: preview.slot.transform.translateX,
+                                  y: preview.slot.transform.translateY),
+                          for: session.slot.id, viewport: session.slotFrame.size)
+        }
+        spacePressed = false
+        finishGesture()
+        pendingMouseRelease = button
     }
 
     private func stopKeyboardPan() {
         guard let session, session.isPan, !session.isRightMouse else { return }
-        self.session?.isCancelled = true
+        // Releasing the pan modifier stops movement at the current crop. Escape
+        // and focus/layout cancellation still discard the uncommitted gesture.
+        finishBeforeCommand()
         NSCursor.arrow.set()
     }
 
@@ -288,10 +375,14 @@ final class GridCollageInteractionView: NSView {
         let wasInteracting = session != nil || hasPreview
         session = nil
         clearPreview(deferPreviewUpdate: deferPreviewUpdate)
+        previewImage = nil
         if wasInteracting { restoreCursor() }
     }
 
     private func clearPreview(deferPreviewUpdate: Bool = false) {
+        if let preview = localPreview { setNeedsDisplay(preview.frame.insetBy(dx: -3, dy: -3)) }
+        localPreview = nil
+        publishedTargetID = nil
         if hasPreview {
             hasPreview = false
             if deferPreviewUpdate {

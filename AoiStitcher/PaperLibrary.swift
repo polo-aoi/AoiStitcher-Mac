@@ -118,7 +118,7 @@ struct PaperLibraryView: View {
                     .buttonStyle(.borderedProminent)
                 Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
             }
-            Text("点击纸张展开，选择后可作为底图加入画布。每页最多显示 10 张，原文件会复制到 aoipic 资源目录。")
+            Text("点击纸张展开，选择后可作为底图加入画布。每页最多显示 10 张，原文件会复制到 AoiStitcher 资源目录。")
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Divider()

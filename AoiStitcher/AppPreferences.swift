@@ -23,24 +23,20 @@ nonisolated struct CanvasInteractionSettings: Equatable {
 }
 
 nonisolated enum AppWorkspace: String, CaseIterable, Identifiable {
-    case border, freeCanvas, longStitch, compression, gridCollage
+    case gridCollage, freeCanvas, longStitch
 
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .border: return "边框水印"
         case .freeCanvas: return "自由画布"
         case .longStitch: return "长图拼接"
-        case .compression: return "图片压缩"
         case .gridCollage: return "标准拼图"
         }
     }
     var systemImage: String {
         switch self {
-        case .border: return "rectangle.dashed"
         case .freeCanvas: return "rectangle.on.rectangle"
         case .longStitch: return "rectangle.split.1x2"
-        case .compression: return "arrow.down.right.and.arrow.up.left"
         case .gridCollage: return "square.grid.2x2"
         }
     }
@@ -53,7 +49,6 @@ enum AppPreferences {
     static let gridPanModeKey = "gridCollage.panMode"
     static let gridPanKeyKey = "gridCollage.panKey"
     static let workspaceOrderKey = "workspaceOrder.v1"
-    static let libraryLabelsKey = "projectLibrary.showsRatingsAndColors"
     static let canvasWheelBehaviorKey = "freeCanvas.wheelBehavior"
     static let canvasGestureBehaviorKey = "freeCanvas.gestureBehavior"
     static let canvasZoomSensitivityKey = "freeCanvas.zoomSensitivity"
@@ -63,7 +58,7 @@ enum AppPreferences {
     static let canvasInteractionKeys = [canvasWheelBehaviorKey, canvasGestureBehaviorKey,
         canvasZoomSensitivityKey, canvasReverseZoomKey, canvasPanModeKey, canvasPanKeyKey]
     static let exportKeys = ["exportWidth", "exportPNG"]
-    static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey, libraryLabelsKey]
+    static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey]
 
     static func workspaceOrder(from storedOrder: String) -> [AppWorkspace] {
         let identifiers = (try? JSONDecoder().decode([String].self, from: Data(storedOrder.utf8))) ?? []
@@ -97,7 +92,6 @@ enum AppPreferences {
         defaults.removeObject(forKey: gridPanModeKey)
         defaults.removeObject(forKey: gridPanKeyKey)
         defaults.removeObject(forKey: workspaceOrderKey)
-        defaults.removeObject(forKey: libraryLabelsKey)
         for key in preferenceKeys where key.hasPrefix("last") { defaults.removeObject(forKey: key) }
     }
 

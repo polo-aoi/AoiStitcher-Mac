@@ -21,11 +21,11 @@ struct AboutView: View {
                 Image(nsImage: NSApplication.shared.applicationIconImage)
                     .resizable().scaledToFit().frame(width: 72, height: 72)
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("aoipic").font(.title.weight(.semibold))
+                    Text("AoiStitcher").font(.title.weight(.semibold))
                     Text("版本 \(AppIdentity.version)").font(.callout).foregroundStyle(.secondary)
                 }
             }
-            Text("为照片创作而做的 Mac 图片工具。长图拼接、自由画布与批量图片压缩，在一个工作台完成。")
+            Text("为照片创作而做的 Mac 图片工具。项目素材库、标准拼图、自由画布与长图拼接，在一个工作台完成。")
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
                 Text("免费 · 开源").font(.callout.weight(.medium))
@@ -36,7 +36,7 @@ struct AboutView: View {
             EditorSection("作者 · Aoi") {
                 Text("我是 Aoi，一个在 AI 时代尝试用 AI 解决身边困难的人。我生活在小县城，在化工厂倒班，工作之外会抽时间学习拍摄、AI 编程，慢慢提升自己。")
                     .fixedSize(horizontal: false, vertical: true)
-                Text("我非科班出身，凭着一腔热血和热爱，自费开发一些应用，希望能给大家带来帮助。现在使用 aoipic 的人还不多，但每一条建议，我都会认真思考，再利用业余时间把更新做出来。")
+                Text("我非科班出身，凭着一腔热血和热爱，自费开发一些应用，希望能给大家带来帮助。现在使用 AoiStitcher 的人还不多，但每一条建议，我都会认真思考，再利用业余时间把更新做出来。")
                     .fixedSize(horizontal: false, vertical: true)
                 Text("我想把这个拼图软件一点点打磨好。使用中遇到问题，或有任何建议，欢迎联系我。")
                     .fixedSize(horizontal: false, vertical: true)
@@ -84,7 +84,7 @@ struct SupportAuthorView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("支持作者").font(.title2.weight(.semibold))
-            Text("aoipic 免费开源。如果它帮到了你，欢迎打赏支持后续开发。")
+            Text("AoiStitcher 免费开源。如果它帮到了你，欢迎打赏支持后续开发。")
                 .fixedSize(horizontal: false, vertical: true)
             Picker("打赏方式", selection: $method) {
                 ForEach(SupportMethod.allCases) { Text($0.rawValue).tag($0) }

@@ -62,7 +62,7 @@ struct EditorSidebarHeader<Actions: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
-                Text("aoipic").font(.title2.weight(.semibold))
+                Text("AoiStitcher").font(.title2.weight(.semibold))
                 Spacer()
                 Picker("外观", selection: $theme) {
                     Image(systemName: "sun.max").tag(1)

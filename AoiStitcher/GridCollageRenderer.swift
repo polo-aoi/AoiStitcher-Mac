@@ -213,7 +213,7 @@ nonisolated enum GridCollageRenderer {
     }
 
     /// ImageIO applies EXIF orientation exactly once, matching the loader used
-    /// by the rest of aoipic. Decode at source resolution, never at UI resolution.
+    /// by the rest of AoiStitcher. Decode at source resolution, never at UI resolution.
     private static func loadOriginal(at url: URL) throws -> CGImage {
         guard let source = CGImageSourceCreateWithURL(url as CFURL,
                                                      [kCGImageSourceShouldCache: false] as CFDictionary),

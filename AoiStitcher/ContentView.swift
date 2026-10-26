@@ -1,6 +1,29 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
+import Combine
+
+/// Pointer-only changes update the small floating preview, not the editor/sidebar.
+private final class LongStitchDragDisplay: ObservableObject {
+    @Published var center = CGPoint.zero
+    var pointerLocation: NSPoint?
+    var insertionCenters: [CGFloat] = []
+}
+
+private struct LongStitchFloatingPhoto: View {
+    @ObservedObject var display: LongStitchDragDisplay
+    let image: NSImage
+    let size: CGSize
+
+    var body: some View {
+        Image(nsImage: image).resizable().scaledToFit()
+            .frame(width: size.width, height: size.height)
+            .overlay { Rectangle().strokeBorder(Color.accentColor, lineWidth: 2) }
+            .position(display.center)
+            .allowsHitTesting(false)
+            .transaction { $0.animation = nil }
+    }
+}
 
 // ==========================================
 // 2. 主界面
@@ -42,9 +65,8 @@ struct LongStitchView: View {
     @State private var dragClickOffsetInCanvas: CGFloat = 0
     @State private var dragPointerOffset: CGSize = .zero
     @State private var dragInsertionIndex: Int?
-    @State private var dragPreviewCenter: CGPoint = .zero
+    @State private var dragDisplay = LongStitchDragDisplay()
     @State private var dragPreviewSize: CGSize = .zero
-    @State private var dragPointerLocation: NSPoint?
     @State private var dragAutoScrollTimer: Timer?
     @State private var selectedImageID: UUID?
     @State private var selectedWatermarkEdge: LongStitchEdge?
@@ -126,7 +148,6 @@ struct LongStitchView: View {
                             ZStack {
                                 if !images.isEmpty {
                                     stitchCanvas(entries: entries, layout: layout)
-                                        .animation(.easeOut(duration: 0.14), value: dragInsertionIndex)
                                 }
                             }
                         }
@@ -166,9 +187,8 @@ struct LongStitchView: View {
                         if let draggedItemID,
                            let item = images.first(where: { $0.id == draggedItemID }),
                            dragPreviewSize.width > 0 {
-                            dragPreview(item)
-                                .frame(width: dragPreviewSize.width, height: dragPreviewSize.height)
-                                .position(dragPreviewCenter)
+                            LongStitchFloatingPhoto(display: dragDisplay, image: item.displayImage,
+                                                    size: dragPreviewSize)
                                 .zIndex(10)
                                 .allowsHitTesting(false)
                                 .transaction { $0.animation = nil }
@@ -187,8 +207,13 @@ struct LongStitchView: View {
                     .onChange(of: viewportCoordinateView) { _, _ in refreshCanvasGeometry() }
                 }
                 .dropDestination(for: URL.self) { urls, _ in
+                    guard isActive, editingItem == nil,
+                          !projectImportInProgress, localImportCount == 0,
+                          !isExporting else { return false }
+                    let files = urls.filter(\.isFileURL)
+                    guard !files.isEmpty else { return false }
                     let group = DispatchGroup()
-                    for url in urls {
+                    for url in files {
                         group.enter()
                         loadAndAddImage(from: url) { group.leave() }
                     }
@@ -197,6 +222,7 @@ struct LongStitchView: View {
                     }
                     return true
                 }
+                .allowsHitTesting(isActive)
             }
             .onAppear { if isActive { setupEventMonitor() } }
             .onDisappear(perform: removeEventMonitor)
@@ -377,7 +403,6 @@ struct LongStitchView: View {
         .frame(width: layout.canvasSize.width, height: layout.canvasSize.height)
         .clipped()
         .overlay { Rectangle().stroke(Color.black.opacity(0.12), lineWidth: 1 / max(0.001, canvasScale)) }
-        .shadow(color: .black.opacity(0.14), radius: 13, y: 5)
         .background { LongStitchViewportReader(view: $canvasCoordinateView) }
     }
 
@@ -404,15 +429,6 @@ struct LongStitchView: View {
             .frame(width: size.width, height: size.height)
             .contentShape(Rectangle())
         }
-    }
-
-    private func dragPreview(_ item: StitchItem) -> some View {
-        Image(nsImage: item.displayImage)
-            .resizable()
-            .scaledToFit()
-            .opacity(0.96)
-            .overlay { Rectangle().strokeBorder(Color.accentColor, lineWidth: 2) }
-            .shadow(color: .black.opacity(0.24), radius: 12, y: 6)
     }
 
     private func selectedImageToolbar(_ item: StitchItem) -> some View {
@@ -466,7 +482,8 @@ struct LongStitchView: View {
             dragClickOffsetInCanvas = 0
             dragPointerOffset = .zero
             dragPreviewSize = .zero
-            dragPointerLocation = nil
+            dragDisplay.pointerLocation = nil
+            dragDisplay.insertionCenters = []
         }
     }
 
@@ -675,7 +692,7 @@ struct LongStitchView: View {
         let watermarkSnapshot = watermarks
         let savePanel = NSSavePanel()
         savePanel.allowedContentTypes = [snapshot.exportPNG ? .png : .jpeg]
-        savePanel.nameFieldStringValue = snapshot.exportPNG ? "aoipic_Output.png" : "aoipic_Output.jpg"
+        savePanel.nameFieldStringValue = snapshot.exportPNG ? "AoiStitcher_Output.png" : "AoiStitcher_Output.jpg"
         if !lastExportDir.isEmpty { savePanel.directoryURL = URL(fileURLWithPath: lastExportDir) }
         savePanel.begin { response in
             guard response == .OK, let url = savePanel.url else { return }
@@ -737,8 +754,8 @@ struct LongStitchView: View {
             }
         }
         if watermarkFrames != nextWatermarkFrames { watermarkFrames = nextWatermarkFrames }
-        if draggedItemID != nil, let dragPointerLocation {
-            updateCanvasDrag(atWindowPoint: dragPointerLocation)
+        if draggedItemID != nil, let point = dragDisplay.pointerLocation {
+            updateCanvasDrag(atWindowPoint: point)
         }
     }
 
@@ -940,7 +957,13 @@ struct LongStitchView: View {
                     dragPointerOffset = CGSize(width: viewportPoint.x - viewportRect.midX,
                                                height: viewportPoint.y - viewportRect.midY)
                     dragPreviewSize = viewportRect.size
-                    dragPreviewCenter = CGPoint(x: viewportRect.midX, y: viewportRect.midY)
+                    dragDisplay.center = CGPoint(x: viewportRect.midX, y: viewportRect.midY)
+                    let origin = settings.direction.isVertical ? layout.contentRect.minY : layout.contentRect.minX
+                    var centers = [origin + axisLength(rect.size) / 2]
+                    for (otherIndex, other) in images.enumerated() where other.id != item.id {
+                        centers.append(centers.last! + axisLength(layout.photoRects[otherIndex].size) + CGFloat(settings.spacing))
+                    }
+                    dragDisplay.insertionCenters = centers
                     return nil
                 }
             }
@@ -972,24 +995,18 @@ struct LongStitchView: View {
 
     private func updateCanvasDrag(atWindowPoint point: NSPoint) {
         guard let canvasCoordinateView, let viewportCoordinateView,
-              let draggedItemID,
-              let item = images.first(where: { $0.id == draggedItemID }),
+              draggedItemID != nil,
               let currentIndex = dragInsertionIndex else { return }
-        if dragPointerLocation != point { dragPointerLocation = point }
+        dragDisplay.pointerLocation = point
         let viewportPoint = viewportCoordinateView.convert(point, from: nil)
         let center = CGPoint(x: viewportPoint.x - dragPointerOffset.width,
                              y: viewportPoint.y - dragPointerOffset.height)
-        if dragPreviewCenter != center { dragPreviewCenter = center }
+        if dragDisplay.center != center { dragDisplay.center = center }
 
         // Use fixed insertion-slot centers, independent of placeholder animation.
-        let layout = LongStitchLayout(aspects: images.map(\.displayAspect), settings: settings)
-        guard let sourceIndex = images.firstIndex(where: { $0.id == item.id }) else { return }
-        let origin = settings.direction.isVertical ? layout.contentRect.minY : layout.contentRect.minX
+        let centers = dragDisplay.insertionCenters
+        guard centers.indices.contains(currentIndex) else { return }
         let visualCenter = axisCoordinate(canvasCoordinateView.convert(point, from: nil)) - dragClickOffsetInCanvas
-        var centers: [CGFloat] = [origin + axisLength(layout.photoRects[sourceIndex].size) / 2]
-        for (index, other) in images.enumerated() where other.id != draggedItemID {
-            centers.append(centers.last! + axisLength(layout.photoRects[index].size) + CGFloat(settings.spacing))
-        }
         var index = currentIndex
         let hysteresis = 8 / max(0.001, hostingScrollView?.magnification ?? 1)
         while index > 0 {
@@ -1005,7 +1022,7 @@ struct LongStitchView: View {
             index += 1
         }
         if index != currentIndex {
-            withAnimation(.easeOut(duration: 0.14)) { dragInsertionIndex = index }
+            dragInsertionIndex = index
         }
     }
 
@@ -1013,7 +1030,7 @@ struct LongStitchView: View {
         guard dragAutoScrollTimer == nil else { return }
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { _ in
             guard self.draggedItemID != nil,
-                  let point = self.dragPointerLocation,
+                  let point = self.dragDisplay.pointerLocation,
                   let viewportCoordinateView = self.viewportCoordinateView,
                   let scrollView = self.hostingScrollView,
                   scrollView.documentView != nil else { return }

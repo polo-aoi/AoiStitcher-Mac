@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		372C22EA2F7CCA8D004D2B43 /* aoipic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = aoipic.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		372C22EA2F7CCA8D004D2B43 /* AoiStitcher.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AoiStitcher.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -40,7 +40,7 @@
 		372C22EB2F7CCA8D004D2B43 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				372C22EA2F7CCA8D004D2B43 /* aoipic.app */,
+				372C22EA2F7CCA8D004D2B43 /* AoiStitcher.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -67,7 +67,7 @@
 			packageProductDependencies = (
 			);
 			productName = AoiStitcher;
-			productReference = 372C22EA2F7CCA8D004D2B43 /* aoipic.app */;
+			productReference = 372C22EA2F7CCA8D004D2B43 /* AoiStitcher.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -250,20 +250,20 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 8;
+				CURRENT_PROJECT_VERSION = 9;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = aoipic;
+				INFOPLIST_KEY_CFBundleDisplayName = AoiStitcher;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "polo-aoi.AoiStitcher";
-				PRODUCT_NAME = aoipic;
+				PRODUCT_NAME = AoiStitcher;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -281,20 +281,20 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 8;
+				CURRENT_PROJECT_VERSION = 9;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = aoipic;
+				INFOPLIST_KEY_CFBundleDisplayName = AoiStitcher;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.6;
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "polo-aoi.AoiStitcher";
-				PRODUCT_NAME = aoipic;
+				PRODUCT_NAME = AoiStitcher;
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;

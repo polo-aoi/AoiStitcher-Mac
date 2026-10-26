@@ -306,23 +306,10 @@ struct GridCollageView: View {
                                 toolbarSize: selectedToolbarSize
                             ))
                     }
-                    if let dragPreview {
-                        GridCollagePhoto(slot: dragPreview.slot, viewport: dragPreview.frame.size)
-                            .clipShape(RoundedRectangle(cornerRadius: dragPreview.radius))
-                            .opacity(0.96)
-                            .overlay {
-                                RoundedRectangle(cornerRadius: dragPreview.radius)
-                                    .strokeBorder(Color.accentColor, lineWidth: 2)
-                            }
-                            .shadow(color: .black.opacity(0.24), radius: 12, y: 6)
-                            .position(x: dragPreview.frame.midX, y: dragPreview.frame.midY)
-                            .allowsHitTesting(false)
-                            .transaction { $0.animation = nil }
-                    }
                 }
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .clipped()
-                .background {
+                .overlay {
                     GridCollageInteractionReader(store: store, isActive: canInteract,
                                                  canvasFrame: fitted, toolbarSize: selectedToolbarSize,
                                                  panMode: panMode, panKey: panKey,
@@ -339,6 +326,7 @@ struct GridCollageView: View {
             store.importDroppedURLs(urls)
             return true
         }
+        .allowsHitTesting(canInteract)
         .overlay {
             if store.photoCount == 0 {
                 VStack(spacing: 10) {
@@ -530,7 +518,7 @@ struct GridCollageView: View {
         panel.allowedContentTypes = [format.type]
         panel.canCreateDirectories = true
         panel.isExtensionHidden = false
-        panel.nameFieldStringValue = "aoipic-拼图.\(format.fileExtension)"
+        panel.nameFieldStringValue = "AoiStitcher-拼图.\(format.fileExtension)"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             export(snapshot: snapshot, width: width, format: format, projectContext: projectContext, to: url)
@@ -630,6 +618,7 @@ private struct GridCollageCanvas: View {
                             radius: min(state.style.borderRadius * factor, min(rect.width, rect.height) / 2),
                             isActive: isActive,
                             isDragged: dragPreview?.slot.id == slot.id,
+                            isPanning: dragPreview?.isPan == true && dragPreview?.slot.id == slot.id,
                             isSwapTarget: dragPreview?.targetID == slot.id
                         )
                         .frame(width: rect.width, height: rect.height)
@@ -648,7 +637,6 @@ private struct GridCollageCanvas: View {
             .frame(width: proxy.size.width, height: proxy.size.height)
             .background(Color(nsColor: state.style.backgroundColor.nsColor))
             .clipShape(RoundedRectangle(cornerRadius: 3))
-            .shadow(color: .black.opacity(0.14), radius: 13, y: 5)
             .coordinateSpace(name: "aoipic-grid-canvas")
         }
         .accessibilityElement(children: .contain)
@@ -668,6 +656,7 @@ private struct GridCollageSlotView: View {
     let radius: CGFloat
     let isActive: Bool
     let isDragged: Bool
+    let isPanning: Bool
     let isSwapTarget: Bool
 
     @State private var isHovered = false
@@ -686,7 +675,7 @@ private struct GridCollageSlotView: View {
 
             if slot.hasImage {
                 GridCollagePhoto(slot: slot, viewport: viewport)
-                    .opacity(isDragged ? 0.22 : 1)
+                    .opacity(isPanning ? 0 : (isDragged ? 0.22 : 1))
             } else if store.photoCount > 0 {
                 VStack(spacing: 7) {
                     Image(systemName: "plus")
@@ -761,7 +750,8 @@ private struct GridCollageSlotView: View {
 
     private func receiveDrop(_ providers: [NSItemProvider]) -> Bool {
         guard isActive, acceptsDrops, !store.isLoading,
-              let targetPhotoID = store.state.slots[slot.id]?.photoID else { return false }
+              let targetSlot = store.state.slots[slot.id] else { return false }
+        let targetPhotoID = targetSlot.photoID
         let generation = UUID()
         dropGeneration = generation
         let templateID = store.state.activeTemplateId
@@ -776,9 +766,10 @@ private struct GridCollageSlotView: View {
     private func isCurrentDrop(_ generation: UUID, templateID: String, targetPhotoID: UUID) -> Bool {
         // State-backed lifetime and identity checks remain current even when
         // a provider finishes after the originating View value is obsolete.
-        acceptsDrops && dropGeneration == generation && !store.isLoading &&
-            store.state.activeTemplateId == templateID &&
-            store.state.slots[slot.id]?.photoID == targetPhotoID
+        guard acceptsDrops, dropGeneration == generation, !store.isLoading,
+              store.state.activeTemplateId == templateID,
+              store.state.slots[slot.id] != nil else { return false }
+        return store.state.slots[slot.id]?.photoID == targetPhotoID
     }
 }
 

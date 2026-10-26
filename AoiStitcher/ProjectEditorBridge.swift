@@ -71,7 +71,7 @@ final class ProjectEditorBridge: ObservableObject {
     @discardableResult
     func send(operation: ProjectOperation, urls: [URL], mode: ProjectImportMode = .append) -> Bool {
         let current = status(for: operation)
-        guard !urls.isEmpty, request == nil, !current.isBusy else { return false }
+        guard operation != .compression, !urls.isEmpty, request == nil, !current.isBusy else { return false }
         let resultingCount = (mode == .append ? current.count : 0) + urls.count
         if let maximum = operation.maximumPhotoCount, resultingCount > maximum { return false }
         request = ProjectEditorRequest(operation: operation, urls: urls, mode: mode)

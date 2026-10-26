@@ -8,7 +8,7 @@ import ImageIO
 }
 
 @main struct CanvasRegressionTests {
-    @MainActor static func main() throws {
+    @MainActor static func main() async throws {
         var checks = 0
         func check(_ condition: @autoclosure () -> Bool, _ description: String) {
             guard condition() else { fatalError("FAIL: " + description) }
@@ -128,7 +128,7 @@ import ImageIO
         checks += testCanvasOrientation(image)
         checks += try CropRegressionTests.run()
         checks += try PreferencesRegressionTests.run()
-        checks += try ProjectLibraryRegressionTests.run()
+        checks += try await ProjectLibraryRegressionTests.run()
         print("PASS: \(checks) canvas, crop, and project checks (layouts, history, layers, keyboard, rotation, crop geometry, native gestures, source quality, PNG/JPEG)")
     }
 

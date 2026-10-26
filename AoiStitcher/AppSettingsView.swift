@@ -157,7 +157,6 @@ struct ExportSettingsView: View {
 
 struct AppSettingsView: View {
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
-    @AppStorage(AoiBorderContact.userDefaultsKey) private var contactEmail = ""
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
     @Environment(\.openWindow) private var openWindow
     @State private var restored = false
@@ -194,18 +193,8 @@ struct AppSettingsView: View {
             Divider()
             EditorSection("导出") { ExportSettingsFields() }
             Divider()
-            EditorSection("开发者联系") {
-                TextField("开发者邮箱", text: $contactEmail)
-                    .textFieldStyle(.roundedBorder)
-                    .textContentType(.emailAddress)
-                    .accessibilityLabel("开发者联系邮箱")
-                Text("边框工作区的“提交效果”确认后会复制这个邮箱。")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Divider()
             HStack {
-                Button { openWindow(id: "about") } label: { Label("关于 aoipic", systemImage: "info.circle") }
+                Button { openWindow(id: "about") } label: { Label("关于 AoiStitcher", systemImage: "info.circle") }
                 Spacer()
                 Button { openWindow(id: "support-author") } label: { Label("支持作者", systemImage: "heart") }
             }
