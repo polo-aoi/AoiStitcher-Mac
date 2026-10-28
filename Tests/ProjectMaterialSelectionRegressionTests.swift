@@ -14,7 +14,7 @@ import QuickLookUI
 
         let first = ProjectAsset(id: UUID(), fileName: "first.png", name: "first.png", position: .zero)
         let second = ProjectAsset(id: UUID(), fileName: "second.png", name: "second.png",
-                                  position: CGPoint(x: 148, y: 0))
+                                  position: CGPoint(x: ProjectMaterialLayout(thumbnailSize: 128).groupColumnStride, y: 0))
         let assets = [first, second]
         let scroll = NSScrollView(frame: CGRect(x: 0, y: 0, width: 500, height: 176))
         let board = ProjectMaterialDocumentView(frame: .zero)
@@ -59,7 +59,7 @@ import QuickLookUI
         click(CGPoint(x: 24, y: 24), modifiers: .command)
         try check(selection == Set(assets.map(\.id)), "Explicit command-click still supports multiple photos")
 
-        for point in [CGPoint(x: 150, y: 24), CGPoint(x: 420, y: 24), CGPoint(x: 24, y: 155)] {
+        for point in [CGPoint(x: 138, y: 24), CGPoint(x: 420, y: 24), CGPoint(x: 24, y: 155)] {
             configure(Set(assets.map(\.id)))
             let previousClears = clears
             click(point)
@@ -90,12 +90,20 @@ import QuickLookUI
 
         for groupRow in [false, true] {
             setGroupRowMode(groupRow)
+            let margin: CGFloat = groupRow ? 4 : 12
+            configure([])
+            click(CGPoint(x: margin + 3.5, y: margin + 3.5))
+            try check(selection == [first.id],
+                      "\(groupRow): newly exposed photo edges remain clickable after reducing card padding")
+            configure(Set(assets.map(\.id)))
+            click(CGPoint(x: margin + 1, y: margin + 64))
+            try check(selection.isEmpty,
+                      "\(groupRow): the remaining narrow padding still clears selection")
             for size in [CGSize(width: 64, height: 128), CGSize(width: 128, height: 64)] {
                 let image = NSImage(size: size)
                 board.configure(assets: assets, selection: Set(assets.map(\.id)), thumbnailSize: 128,
                                 viewZoom: 1, fitRequest: 0, thumbnails: [first.id: image], assetURLs: [:],
                                 badges: [:], operations: [], isActive: true)
-                let margin: CGFloat = groupRow ? 4 : 12
                 let blank = size.width < size.height
                     ? CGPoint(x: margin + 12, y: margin + 64)
                     : CGPoint(x: margin + 64, y: margin + 12)

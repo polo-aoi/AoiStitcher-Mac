@@ -37,7 +37,7 @@ import SwiftUI
             let currentRows = rows()
             try check(currentRows.compactMap(\.groupID) == model.order,
                       "\(label): all four rows remain present in displayed order")
-            let expectedHeight = model.thumbnailSize + 24
+            let expectedHeight = model.thumbnailSize + 14
             var previousBottom: CGFloat?
             for (index, row) in currentRows.enumerated() {
                 let frame = row.convert(row.bounds, to: host)
@@ -124,7 +124,8 @@ import SwiftUI
     func positionedAssets(in id: UUID) -> [ProjectAsset] {
         (assets[id] ?? []).enumerated().map { index, asset in
             var positioned = asset
-            positioned.position = CGPoint(x: CGFloat(index) * (thumbnailSize + 20), y: 0)
+            let layout = ProjectMaterialLayout(thumbnailSize: thumbnailSize)
+            positioned.position = CGPoint(x: CGFloat(index) * layout.groupColumnStride, y: 0)
             return positioned
         }
     }
@@ -150,7 +151,7 @@ import SwiftUI
                         isGroupSelected: model.chosenGroupID == id,
                         groupDragID: id
                     )
-                    .frame(height: model.thumbnailSize + 24)
+                    .frame(height: ProjectMaterialLayout(thumbnailSize: model.thumbnailSize).groupRowHeight)
                     .background(Color(nsColor: .controlBackgroundColor))
                     .overlay { Rectangle().strokeBorder(Color.gray).allowsHitTesting(false) }
                     .id(id)

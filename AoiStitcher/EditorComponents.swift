@@ -57,24 +57,10 @@ struct SelectedImageToolbarSizePreferenceKey: PreferenceKey {
 }
 
 struct EditorSidebarHeader<Actions: View>: View {
-    @Binding var theme: Int
     @ViewBuilder var actions: () -> Actions
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                Text("AoiStitcher").font(.title2.weight(.semibold))
-                Spacer()
-                Picker("外观", selection: $theme) {
-                    Image(systemName: "sun.max").tag(1)
-                    Image(systemName: "moon").tag(2)
-                }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 66)
-                .help("切换深浅色外观")
-                SettingsLink { Image(systemName: "gearshape").frame(width: 24, height: 24) }
-                    .buttonStyle(.borderless).help("软件设置").accessibilityLabel("软件设置")
-            }
-            HStack(spacing: 8, content: actions)
-        }.padding(EditorStyle.padding)
+        HStack(spacing: 8, content: actions)
+            .padding(EditorStyle.padding)
     }
 }
 

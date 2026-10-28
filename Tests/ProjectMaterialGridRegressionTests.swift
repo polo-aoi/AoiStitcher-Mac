@@ -31,6 +31,12 @@ nonisolated enum ProjectMaterialGridRegressionTests {
         let narrow = ProjectMaterialGridLayout(count: 20, viewportWidth: 260, thumbnailSize: 128)
         try check(wide.columns > narrow.columns && narrow.height > wide.height,
                   "A narrower divider position adds rows instead of horizontal overflow")
+        let compact = ProjectMaterialGridLayout(count: 20, viewportWidth: 440, thumbnailSize: 128)
+        try check(compact.columns == 3 && compact.scale == 1,
+                  "A 440-point viewport fits three full-size 128-point photos after tightening the spacing")
+        try check(compact.frame(at: 1).minX - compact.frame(at: 0).maxX == 6 &&
+                  compact.frame(at: compact.columns).minY - compact.frame(at: 0).maxY == 6,
+                  "Horizontal and vertical card gaps use the same compact spacing")
         let largest = ProjectMaterialGridLayout(count: 20, viewportWidth: 220, thumbnailSize: 240)
         try check(largest.columns == 1 && largest.frame(at: 0).maxX <= 220,
                   "A large thumbnail fits a narrow single-column viewport")

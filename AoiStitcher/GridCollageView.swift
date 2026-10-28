@@ -32,6 +32,8 @@ struct GridCollageView: View {
     @State private var dragPreview: GridCollageDragPreview?
     @State private var pendingSlotRemoval: (targetCount: Int, photos: [GridCollagePhotoRemoval])?
     @State private var selectedToolbarSize = CGSize(width: 250, height: 34)
+    @State private var acceptsFileDrops = false
+    @State private var fileDropGeneration = UUID()
 
     private var canInteract: Bool {
         isActive && !isExporting && !store.isLoading && !isPreparingCrop && cropSession == nil
@@ -50,7 +52,18 @@ struct GridCollageView: View {
             guard request?.operation == .gridCollage else { return }
             DispatchQueue.main.async { receiveProjectImages() }
         }
-        .onAppear { projectBridge.observeGrid(store) }
+        .onAppear {
+            acceptsFileDrops = canInteract
+            projectBridge.observeGrid(store)
+        }
+        .onDisappear {
+            acceptsFileDrops = false
+            fileDropGeneration = UUID()
+        }
+        .onChange(of: canInteract) { _, canImport in
+            acceptsFileDrops = canImport
+            fileDropGeneration = UUID()
+        }
         .onChange(of: store.isLoading) { _, loading in
             if !loading { receiveProjectImages() }
         }
@@ -106,7 +119,7 @@ struct GridCollageView: View {
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            EditorSidebarHeader(theme: $theme) {
+            EditorSidebarHeader {
                 Button { store.importPhotos() } label: {
                     Label(store.isLoading ? "正在添加…" : "添加照片", systemImage: "photo.badge.plus")
                         .frame(maxWidth: .infinity)
@@ -321,11 +334,9 @@ struct GridCollageView: View {
                 }
             }
         }
-        .dropDestination(for: URL.self) { urls, _ in
-            guard canInteract, !urls.isEmpty else { return false }
-            store.importDroppedURLs(urls)
-            return true
-        }
+        // Only the visible, idle editor registers a Finder destination.
+        .onDrop(of: canInteract ? [UTType.fileURL.identifier] : [],
+                isTargeted: nil, perform: receiveFileDrop)
         .allowsHitTesting(canInteract)
         .overlay {
             if store.photoCount == 0 {
@@ -573,6 +584,17 @@ struct GridCollageView: View {
         }
     }
 
+    private func receiveFileDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard canInteract, acceptsFileDrops else { return false }
+        let generation = UUID()
+        fileDropGeneration = generation
+        return EditorFileDropContent.loadFileURLs(from: providers) { urls in
+            guard acceptsFileDrops, fileDropGeneration == generation,
+                  !store.isLoading, !store.isExporting, !urls.isEmpty else { return }
+            store.importDroppedURLs(urls)
+        }
+    }
+
     private func receiveProjectImages() {
         guard !store.isLoading, !isExporting,
               let request = projectBridge.request, request.operation == .gridCollage else { return }
@@ -721,7 +743,7 @@ private struct GridCollageSlotView: View {
                 store.importPhotos(into: slot.id)
             }
         }
-        .onDrop(of: [UTType.fileURL.identifier],
+        .onDrop(of: isActive ? [UTType.fileURL.identifier] : [],
                 isTargeted: $isDropTarget, perform: receiveDrop)
         .onHover { hovering in
             isHovered = hovering
@@ -755,7 +777,7 @@ private struct GridCollageSlotView: View {
         let generation = UUID()
         dropGeneration = generation
         let templateID = store.state.activeTemplateId
-        return GridCollageDropContent.loadFileURLs(from: providers) { urls in
+        return EditorFileDropContent.loadFileURLs(from: providers) { urls in
             guard isCurrentDrop(generation, templateID: templateID, targetPhotoID: targetPhotoID),
                   !urls.isEmpty else { return }
             store.selectSlot(slot.id)
@@ -909,41 +931,5 @@ private extension CollageColor {
 
     var nsColor: NSColor {
         NSColor(deviceRed: red, green: green, blue: blue, alpha: alpha)
-    }
-}
-
-private enum GridCollageDropContent {
-    /// Collect a multi-file drop before importing, preserving the drag order.
-    /// One coordinated import avoids replacing the same target repeatedly.
-    static func loadFileURLs(from providers: [NSItemProvider],
-                             completion: @escaping ([URL]) -> Void) -> Bool {
-        let providers = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
-        guard !providers.isEmpty else { return false }
-        let group = DispatchGroup()
-        let lock = NSLock()
-        var loaded: [(Int, URL)] = []
-        for (index, provider) in providers.enumerated() {
-            group.enter()
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                defer { group.leave() }
-                let url: URL?
-                if let value = item as? URL {
-                    url = value
-                } else if let data = item as? Data {
-                    url = URL(dataRepresentation: data, relativeTo: nil)
-                } else if let value = item as? String {
-                    url = URL(string: value)
-                } else {
-                    url = nil
-                }
-                if let url, url.isFileURL {
-                    lock.lock(); loaded.append((index, url)); lock.unlock()
-                }
-            }
-        }
-        group.notify(queue: .main) {
-            completion(loaded.sorted { $0.0 < $1.0 }.map(\.1))
-        }
-        return true
     }
 }

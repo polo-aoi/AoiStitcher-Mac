@@ -15,7 +15,7 @@ struct ProjectDuplicateImportView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("发现重复素材")
                 .font(.title2.weight(.semibold))
-            Text("以下文件与当前项目中的素材重名，或来源路径和大小相同。请选择处理方式。")
+            Text("以下文件与当前项目中的素材重名，或来源路径和大小相同。替换项目素材会改用本次导入的照片，原文件保持不变。")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 

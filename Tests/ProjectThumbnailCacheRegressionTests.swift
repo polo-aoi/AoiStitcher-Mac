@@ -295,7 +295,12 @@ import UniformTypeIdentifiers
             throw NSError(domain: "ProjectThumbnailCacheRegressionTests", code: 4)
         }
         try check(replacedAsset.id == asset.id && replacedAsset.fileName == asset.fileName && replacedAsset.contentRevision != nil,
-                  "Overwriting preserves asset identity and original path but changes preview identity")
+                  "Replacing a source preserves asset identity and cache key but changes preview identity")
+        try check(replacedAsset.isReference && library.assetURL(replacedAsset).resolvingSymlinksInPath() == incoming.resolvingSymlinksInPath(),
+                  "Replacing an old copied photo switches it to the incoming original's location")
+        let retainedCopyBytes = try Data(contentsOf: originals.appendingPathComponent(asset.fileName))
+        try check(retainedCopyBytes == originalBytes,
+                  "Replacing an old copied photo leaves its stored copy unchanged")
         let replacedImage = try await waitForPreview(in: library, asset: replacedAsset)
         var proposedRect = CGRect(origin: .zero, size: replacedImage.size)
         let replacedPixels = replacedImage.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil)
@@ -308,14 +313,16 @@ import UniformTypeIdentifiers
         try check(undoneAsset.position == asset.position && undoneAsset.contentRevision == replacedAsset.contentRevision,
                   "Undo restores the old layout without reviving the prior image's content revision")
         try check(undoneAsset.name == replacedAsset.name && undoneAsset.fileName == replacedAsset.fileName &&
-                  undoneAsset.sourcePath == replacedAsset.sourcePath && undoneAsset.sourceFileSize == replacedAsset.sourceFileSize,
+                  undoneAsset.sourcePath == replacedAsset.sourcePath && undoneAsset.sourceFileSize == replacedAsset.sourceFileSize &&
+                  undoneAsset.isReference,
                   "Undo preserves the replacement original's file identity and source metadata")
         try check(library.thumbnail(for: undoneAsset) === replacedImage,
                   "Undo keeps the blue replacement preview ready instead of resurrecting the cached red image")
         try check(library.flushPendingSaves(), "The replacement's preview identity is saved with the project")
         let replacementReader = ProjectLibraryStore(projectsDirectory: projects)
         replacementReader.openProject(id: project.id)
-        try check(replacementReader.currentProject?.assets.first?.contentRevision == replacedAsset.contentRevision,
+        try check(replacementReader.currentProject?.assets.first?.contentRevision == replacedAsset.contentRevision &&
+                  replacementReader.currentProject?.assets.first?.isReference == true,
                   "A reopened project keeps the replacement preview identity")
 
         let legacyJSON = #"{"id":"00000000-0000-0000-0000-000000000001","fileName":"old.png","name":"old.png","position":[0,0]}"#

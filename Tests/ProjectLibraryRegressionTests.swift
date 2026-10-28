@@ -12,42 +12,6 @@ import CoreGraphics
             checks += 1
         }
 
-        // Filtering is scoped to successful exports of the chosen tool. Using one
-        // tool must not hide a photo from another tool's unfinished-work list.
-        let gridOnly: Set<ProjectOperation> = [.gridCollage]
-        let multipleTools: Set<ProjectOperation> = [.gridCollage, .freeCanvas]
-        var materialFilter = ProjectMaterialFilter()
-        try check(!materialFilter.isActive && materialFilter.includes(operations: []) &&
-                  materialFilter.includes(operations: multipleTools),
-                  "The default material filter includes both unused and exported photos")
-        materialFilter.status = .unused
-        try check(materialFilter.includes(operations: []) && !materialFilter.includes(operations: gridOnly),
-                  "Unused without a selected tool means no successful export in any tool")
-        materialFilter.status = .used
-        try check(!materialFilter.includes(operations: []) && materialFilter.includes(operations: gridOnly) &&
-                  materialFilter.includes(operations: multipleTools),
-                  "Used without a selected tool includes photos exported by one or several tools")
-        materialFilter.operation = .freeCanvas
-        materialFilter.status = .unused
-        try check(materialFilter.isActive && materialFilter.includes(operations: []) &&
-                  materialFilter.includes(operations: gridOnly) && !materialFilter.includes(operations: multipleTools),
-                  "A standard-collage export remains unused for free canvas until that tool exports it")
-        materialFilter.status = .used
-        try check(!materialFilter.includes(operations: []) && !materialFilter.includes(operations: gridOnly) &&
-                  materialFilter.includes(operations: multipleTools),
-                  "Used for free canvas matches that tool even when other export types also exist")
-        materialFilter.status = .all
-        try check(materialFilter.includes(operations: []) && materialFilter.includes(operations: gridOnly) &&
-                  materialFilter.includes(operations: multipleTools),
-                  "All statuses include both processed and unprocessed photos for the chosen tool")
-        materialFilter.status = .unused
-        try check(materialFilter.includes(operations: [.compression]),
-                  "Legacy compression exports do not count as successful free-canvas exports")
-        materialFilter = ProjectMaterialFilter()
-        try check(materialFilter.operation == nil && materialFilter.status == .all && !materialFilter.isActive &&
-                  materialFilter.includes(operations: []) && materialFilter.includes(operations: multipleTools),
-                  "Clearing the filter resets both tool and status without excluding any photo")
-
         // A project written before removal existed,
         // including an export from the compression workspace that has since moved out.
         // Keep the fixture independent of the new encoder so omitted fields stay omitted.
@@ -210,11 +174,11 @@ import CoreGraphics
         try check(library.flushPendingSaves(), "Rapid size changes retain the final value")
         let validState = try Data(contentsOf: metadata)
         library.setThumbnailSize(.nan)
-        library.createGroup([first.id, removed.id])
+        library.createGroup([removed.id, UUID()])
         _ = library.flushPendingSaves()
         let unchangedState = try Data(contentsOf: metadata)
         try check(library.currentProject?.thumbnailSize == 48 && unchangedState == validState && !library.canUndoEdit,
-                  "Invalid sizes and selections with fewer than two active photos leave saved metadata and undo unchanged")
+                  "Invalid sizes and selections with no active photos leave saved metadata and undo unchanged")
         persisted = try decoder.decode(ProjectDocument.self, from: validState)
         library.closeProject()
         library.openProject(id: fixture.id)

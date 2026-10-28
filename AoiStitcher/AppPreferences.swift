@@ -65,8 +65,8 @@ enum AppPreferences {
     static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey]
 
     /// The user-facing directory that holds every project folder. Defaults to
-    /// `~/Pictures/AoiStitcher 项目/` so copies and project data stay visible and
-    /// backup-friendly instead of buried in Application Support.
+    /// `~/Pictures/AoiStitcher 项目/` for project metadata and preview caches.
+    /// Imported photos remain in their original locations.
     static nonisolated func projectRootURL(in defaults: UserDefaults = .standard) -> URL {
         if let stored = defaults.string(forKey: projectRootKey),
            !stored.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

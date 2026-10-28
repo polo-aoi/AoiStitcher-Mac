@@ -121,7 +121,7 @@ struct FreeCanvasView: View {
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            EditorSidebarHeader(theme: $theme) {
+            EditorSidebarHeader {
                     Button { store.importImages() } label: {
                         Label("添加照片", systemImage: "photo.badge.plus").frame(maxWidth: .infinity)
                     }.buttonStyle(.borderedProminent).disabled(store.isLoading)

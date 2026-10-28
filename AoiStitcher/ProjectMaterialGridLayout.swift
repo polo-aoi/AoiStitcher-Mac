@@ -15,12 +15,13 @@ nonisolated struct ProjectMaterialGridLayout {
         self.count = max(0, count)
         self.viewportWidth = viewportWidth.isFinite ? max(1, viewportWidth) : 1
         margin = min(12, max(0, (self.viewportWidth - 1) / 2))
-        let base = ProjectMaterialLayout(thumbnailSize: thumbnailSize).cardSize
+        let materialLayout = ProjectMaterialLayout(thumbnailSize: thumbnailSize)
+        let base = materialLayout.cardSize
         let available = max(1, self.viewportWidth - 2 * margin)
         let requestedScale = zoom.isFinite ? min(2, max(0.02, zoom)) : 1
         scale = min(requestedScale, available / base.width)
         cardSize = CGSize(width: base.width * scale, height: base.height * scale)
-        gap = 8 * scale
+        gap = materialLayout.gap * scale
         columns = max(1, Int(min(CGFloat(max(1, self.count)), floor((available + gap) / (cardSize.width + gap)))))
     }
 

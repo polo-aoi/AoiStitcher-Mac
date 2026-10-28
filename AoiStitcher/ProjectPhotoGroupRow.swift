@@ -2,6 +2,10 @@ import SwiftUI
 import AppKit
 
 struct ProjectPhotoGroupRow: View {
+    static var outline: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+    }
+
     @ObservedObject var library: ProjectLibraryStore
     let group: ProjectPhotoGroup
     let members: [ProjectAsset]
@@ -24,10 +28,11 @@ struct ProjectPhotoGroupRow: View {
     let onGroupDragExit: () -> Void
     let onDropGroup: (UUID, Bool) -> Bool
     let onAssetDropTargetChange: (Bool) -> Void
+    var operations: [ProjectOperation] = ProjectOperation.allCases
     @State private var focusRequest = 0
 
     private var layout: ProjectMaterialLayout { ProjectMaterialLayout(thumbnailSize: thumbnailSize) }
-    private var columnStride: CGFloat { layout.cardSize.width + 4 }
+    private var columnStride: CGFloat { layout.groupColumnStride }
 
     private var rowAssets: [ProjectAsset] {
         members.enumerated().map { index, asset in
@@ -49,6 +54,7 @@ struct ProjectPhotoGroupRow: View {
                     onMove: reorderMembers,
                     onImport: { _, _ in }, onActivate: { _ in },
                     onThumbnailDemand: reportVisible,
+                    operations: operations,
                     onSend: onSend,
                     onRemove: library.returnAssetsToMaterials,
                     onImportPanel: library.importPanel,
@@ -67,31 +73,12 @@ struct ProjectPhotoGroupRow: View {
                     onAssetDropTargetChange: onAssetDropTargetChange,
                     focusRequest: focusRequest
                 )
-        }.frame(height: layout.cardSize.height + 8)
-        .contextMenu {
-            Button("选中整组") { onChoose(); focusRequest += 1 }
-            Button("将选中照片移回素材") { library.returnAssetsToMaterials(selection) }
-                .disabled(selection.isEmpty)
-            if selection.count == 1, let id = selection.first {
-                Button("照片向前一位") { library.moveGroupAsset(id, in: group.id, by: -1) }
-                    .disabled(group.assetIDs.first == id)
-                Button("照片向后一位") { library.moveGroupAsset(id, in: group.id, by: 1) }
-                    .disabled(group.assetIDs.last == id)
-            }
-            Divider()
-            Button("上移一组") { library.moveGroup(group.id, by: -1) }
-                .disabled(!canMoveUp)
-            Button("下移一组") { library.moveGroup(group.id, by: 1) }
-                .disabled(!canMoveDown)
-            Divider()
-            Button("解散分组，全部移回素材") { library.dissolveGroup(group.id) }
-        }
-        .background {
-            (isSelected ? Color.accentColor.opacity(0.04) : Color(nsColor: .controlBackgroundColor))
-        }
+        }.frame(height: layout.groupRowHeight)
+        .background(Color(nsColor: .controlBackgroundColor), in: Self.outline)
+        .clipShape(Self.outline)
         .overlay {
             ZStack {
-                Rectangle().strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: 1)
+                Self.outline.strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
                 if showDropLineBefore {
                     Rectangle().fill(Color.accentColor).frame(height: 3).frame(maxHeight: .infinity, alignment: .top)
                 }

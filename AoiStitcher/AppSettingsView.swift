@@ -233,7 +233,7 @@ struct AppSettingsView: View {
                 .font(.callout).foregroundStyle(.secondary)
                 .lineLimit(2).truncationMode(.middle)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("所有项目的素材副本和资料都存放在这里，方便备份和迁移。更改后重启应用生效。")
+            Text("这里保存项目资料和预览缓存，照片保留在原始位置。更改后重启应用生效。")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {

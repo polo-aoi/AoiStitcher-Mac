@@ -35,6 +35,8 @@ struct LongStitchView: View {
     @State private var images: [StitchItem] = []
     @State private var projectImportInProgress = false
     @State private var localImportCount = 0
+    @State private var acceptsFileDrops = false
+    @State private var fileDropGeneration = UUID()
     @ObservedObject private var preferences = LongStitchPreferences.shared
 
     // 💡 记忆储存：外观主题仅保留 1:浅色, 2:深色 (默认浅色)
@@ -84,6 +86,11 @@ struct LongStitchView: View {
     @State private var exportAlertTitle = ""
     @State private var exportAlertMessage = ""
 
+    private var canImportDroppedImages: Bool {
+        isActive && editingItem == nil && !projectImportInProgress
+            && localImportCount == 0 && !isExporting
+    }
+
     // 强制返回指定的 ColorScheme
     var currentColorScheme: ColorScheme {
         return colorSchemeStyle == 2 ? .dark : .light
@@ -92,7 +99,7 @@ struct LongStitchView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                EditorSidebarHeader(theme: $colorSchemeStyle) {
+                EditorSidebarHeader {
                     Button(action: importPhotos) {
                         Label("添加照片", systemImage: "photo.badge.plus").frame(maxWidth: .infinity)
                     }.buttonStyle(.borderedProminent).help("添加照片")
@@ -206,22 +213,10 @@ struct LongStitchView: View {
                     .onChange(of: canvasCoordinateView) { _, _ in refreshCanvasGeometry() }
                     .onChange(of: viewportCoordinateView) { _, _ in refreshCanvasGeometry() }
                 }
-                .dropDestination(for: URL.self) { urls, _ in
-                    guard isActive, editingItem == nil,
-                          !projectImportInProgress, localImportCount == 0,
-                          !isExporting else { return false }
-                    let files = urls.filter(\.isFileURL)
-                    guard !files.isEmpty else { return false }
-                    let group = DispatchGroup()
-                    for url in files {
-                        group.enter()
-                        loadAndAddImage(from: url) { group.leave() }
-                    }
-                    group.notify(queue: .main) {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { fitToScreen() }
-                    }
-                    return true
-                }
+                // Hidden workspaces stay mounted. Remove their file types so
+                // they cannot claim Finder drags above the visible editor.
+                .onDrop(of: canImportDroppedImages ? [UTType.fileURL.identifier] : [],
+                        isTargeted: nil, perform: receiveFileDrop)
                 .allowsHitTesting(isActive)
             }
             .onAppear { if isActive { setupEventMonitor() } }
@@ -235,8 +230,19 @@ struct LongStitchView: View {
             guard request?.operation == .longStitch else { return }
             DispatchQueue.main.async { receiveProjectImages() }
         }
-        .onAppear { publishProjectStatus() }
-        .onDisappear { publishProjectStatus() }
+        .onAppear {
+            acceptsFileDrops = canImportDroppedImages
+            publishProjectStatus()
+        }
+        .onDisappear {
+            acceptsFileDrops = false
+            fileDropGeneration = UUID()
+            publishProjectStatus()
+        }
+        .onChange(of: canImportDroppedImages) { _, canImport in
+            acceptsFileDrops = canImport
+            fileDropGeneration = UUID()
+        }
         .onChange(of: projectSignature) { _, _ in publishProjectStatus() }
         .onChange(of: projectImportInProgress) { _, importing in
             publishProjectStatus()
@@ -1138,6 +1144,18 @@ struct LongStitchView: View {
                 publishProjectStatus()
                 completion?()
             }
+        }
+    }
+
+    private func receiveFileDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard canImportDroppedImages, acceptsFileDrops else { return false }
+        let generation = UUID()
+        fileDropGeneration = generation
+        return EditorFileDropContent.loadFileURLs(from: providers) { urls in
+            guard acceptsFileDrops, fileDropGeneration == generation,
+                  !urls.isEmpty else { return }
+            // The batch importer decodes first, then appends in source order.
+            projectBridge.send(operation: .longStitch, urls: urls)
         }
     }
 

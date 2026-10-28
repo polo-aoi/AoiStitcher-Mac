@@ -19,7 +19,7 @@ import AppKit
         for groupRow in [false, true] {
             let first = ProjectAsset(id: UUID(), fileName: "first.png", name: "first.png", position: .zero)
             let second = ProjectAsset(id: UUID(), fileName: "second.png", name: "second.png",
-                                      position: CGPoint(x: 148, y: 0))
+                                      position: CGPoint(x: ProjectMaterialLayout(thumbnailSize: 128).groupColumnStride, y: 0))
             let scroll = NSScrollView(frame: CGRect(x: 0, y: 0, width: 500, height: 176))
             let board = ProjectMaterialDocumentView(frame: .zero)
             board.isGroupRow = groupRow
@@ -41,6 +41,13 @@ import AppKit
                       "\(groupRow): scrolling away retains a loaded thumbnail for the return frame")
             try check(coloredPixels(in: board, color: .blue) > 1_000,
                       "\(groupRow): new arrivals draw while previous thumbnails remain cached")
+            let redBounds = coloredPixelMetrics(in: board, color: .red).bounds
+            let blueBounds = coloredPixelMetrics(in: board, color: .blue).bounds
+            try check(redBounds.size == CGSize(width: 128, height: 128) &&
+                      blueBounds.size == redBounds.size,
+                      "\(groupRow): compact cards retain the full 128-point rendered photo size")
+            try check(blueBounds.minX - redBounds.maxX == (groupRow ? 8 : 12),
+                      "\(groupRow): rendered photo edges have the intended compact gap")
             for _ in 0..<5 { configure([:]) }
             try check(coloredPixels(in: board, color: .red) == initial,
                       "\(groupRow): empty asynchronous snapshots never flash a loaded photo to its placeholder")
@@ -116,6 +123,10 @@ import AppKit
     }
 
     private static func coloredPixels(in board: ProjectMaterialDocumentView, color: NSColor) -> Int {
+        coloredPixelMetrics(in: board, color: color).count
+    }
+
+    private static func coloredPixelMetrics(in board: ProjectMaterialDocumentView, color: NSColor) -> (count: Int, bounds: CGRect) {
         let width = 500, height = 220
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
                                       bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -129,15 +140,25 @@ import AppKit
         NSGraphicsContext.restoreGraphicsState()
         let target = color.usingColorSpace(.deviceRGB)!
         var count = 0
+        var minimumX = width, minimumY = height, maximumX = -1, maximumY = -1
         for y in 0..<height {
             for x in 0..<width {
                 guard let pixel = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
                 if abs(pixel.redComponent - target.redComponent) < 0.05,
                    abs(pixel.greenComponent - target.greenComponent) < 0.05,
                    abs(pixel.blueComponent - target.blueComponent) < 0.05,
-                   pixel.alphaComponent > 0.95 { count += 1 }
+                   pixel.alphaComponent > 0.95 {
+                    count += 1
+                    minimumX = min(minimumX, x)
+                    minimumY = min(minimumY, y)
+                    maximumX = max(maximumX, x)
+                    maximumY = max(maximumY, y)
+                }
             }
         }
-        return count
+        let bounds = count == 0 ? CGRect.zero : CGRect(x: minimumX, y: minimumY,
+                                                       width: maximumX - minimumX + 1,
+                                                       height: maximumY - minimumY + 1)
+        return (count, bounds)
     }
 }

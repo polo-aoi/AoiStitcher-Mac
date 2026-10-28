@@ -89,6 +89,10 @@ struct ProjectMaterialBoard: NSViewRepresentable {
         if let groupContainer {
             groupContainer.groupID = groupDragID
             groupContainer.memberCount = assets.count
+            groupContainer.assetIDs = Set(assets.map(\.id))
+            groupContainer.operations = operations
+            groupContainer.onSend = onSend
+            groupContainer.onReturnAssets = onRemove
             groupContainer.isSelected = isGroupSelected
             groupContainer.onChoose = onGroupChoose
             groupContainer.onGroupDragBegan = onGroupDragBegan
@@ -117,6 +121,7 @@ struct ProjectMaterialBoard: NSViewRepresentable {
         board.onUndo = onUndo
         board.isGroupRow = isGroupRow
         board.onFocus = onFocus
+        board.onGroupContextMenu = { [weak groupContainer] event in groupContainer?.menu(for: event) }
         board.onDropAssets = onDropAssets
         board.onGroupClearSelection = onGroupClearSelection
         board.onReorder = onReorder
@@ -158,7 +163,7 @@ private final class ProjectMaterialScrollView: ProjectOverlayScrollView {
     }
 }
 
-final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     var onSelectionChange: ((Set<UUID>) -> Void)?
     var onMove: (([UUID: CGPoint]) -> Void)?
     var onImport: (([URL], CGPoint) -> Void)?
@@ -177,6 +182,7 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
     var onFocus: (() -> Void)?
     var onDropAssets: ((Set<UUID>) -> Void)?
     var onGroupClearSelection: (() -> Void)?
+    var onGroupContextMenu: ((NSEvent) -> NSMenu?)?
     var onReorder: (([UUID]) -> Void)?
     var onThumbnailResize: ((CGFloat) -> Void)?
 
@@ -239,7 +245,7 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
     }
     private var thumbnailSize: CGFloat = 120
     private var zoom: CGFloat = 1
-    private var contentMargin: CGFloat { isGroupRow ? 4 : 24 }
+    private var contentMargin: CGFloat { isGroupRow ? ProjectMaterialLayout.groupMargin : 24 }
     private var lastConfiguredZoom: CGFloat?
     private var lastFitRequest = 0
     private var lastFocusRequest = 0
@@ -398,6 +404,12 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
 
     private var cardSize: CGSize { ProjectMaterialLayout(thumbnailSize: thumbnailSize).cardSize }
     private var displayScale: CGFloat { isGroupRow ? zoom : (gridLayout?.scale ?? zoom) }
+
+    private func thumbnailRect(in card: CGRect) -> CGRect {
+        let inset = ProjectMaterialLayout.cardInset * displayScale
+        return CGRect(x: card.minX + inset, y: card.minY + inset,
+                      width: thumbnailSize * displayScale, height: thumbnailSize * displayScale)
+    }
 
     private func mergeThumbnails(_ incoming: [UUID: NSImage], assets: [ProjectAsset],
                                  indices: [UUID: Int], urls: [UUID: URL]) -> Set<UUID> {
@@ -722,10 +734,7 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
         let candidates = spatialBuckets[Bucket(x: Int(floor(point.x / 256)), y: Int(floor(point.y / 256)))] ?? []
         return candidates.compactMap { id -> (Int, ProjectAsset)? in
             guard let index = assetIndices[id], let card = geometry[id] else { return nil }
-            let imageRect = CGRect(x: card.minX + 8 * displayScale,
-                                   y: card.minY + 8 * displayScale,
-                                   width: thumbnailSize * displayScale,
-                                   height: thumbnailSize * displayScale)
+            let imageRect = thumbnailRect(in: card)
             let photoRect = thumbnails[id].map { fittedImageRect($0, in: imageRect) } ?? imageRect
             guard photoRect.contains(point) else { return nil }
             return (index, assets[index])
@@ -775,8 +784,7 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
             card.lineWidth = 1
             card.stroke()
         }
-        let imageRect = CGRect(x: rect.minX + 8 * displayScale, y: rect.minY + 8 * displayScale,
-                               width: thumbnailSize * displayScale, height: thumbnailSize * displayScale)
+        let imageRect = thumbnailRect(in: rect)
         if let image = thumbnails[asset.id], image.size.width > 0, image.size.height > 0 {
             let destination = fittedImageRect(image, in: imageRect)
             image.draw(in: destination, from: .zero, operation: .sourceOver, fraction: 1,
@@ -806,12 +814,16 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
 
     override func menu(for event: NSEvent) -> NSMenu? {
         guard isActive else { return nil }
+        let point = convert(event.locationInWindow, from: nil)
+        if isGroupRow, thumbnailAsset(at: point) == nil {
+            clearMouseInteraction()
+            return onGroupContextMenu?(event)
+        }
         window?.makeFirstResponder(self)
         onFocus?()
         clearMouseInteraction()
         let menu = NSMenu(title: "项目素材")
         menu.autoenablesItems = false
-        let point = convert(event.locationInWindow, from: nil)
         contextMenuPoint = logicalPoint(point)
         let hit = thumbnailAsset(at: point)
         if let hit {
@@ -822,8 +834,11 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
         }
         contextMenuSelection = selectedIDs
         if !contextMenuSelection.isEmpty {
-            for (index, operation) in [ProjectOperation.gridCollage, .freeCanvas, .longStitch].enumerated() where operations.contains(operation) {
-                let item = actionItem("添加至\(operation.title)", action: #selector(sendFromMenu(_:)), key: String(index + 1))
+            let menuOperations: [ProjectOperation] = isGroupRow ? operations : [.gridCollage, .freeCanvas, .longStitch]
+            for operation in menuOperations
+                where operations.contains(operation) && ProjectOperation.allCases.contains(operation) {
+                let shortcut = ProjectOperation.allCases.firstIndex(of: operation).map { String($0 + 1) } ?? ""
+                let item = actionItem("添加至\(operation.title)", action: #selector(sendFromMenu(_:)), key: shortcut)
                 item.representedObject = operation.rawValue
                 item.image = NSImage(systemSymbolName: operation.systemImage, accessibilityDescription: nil)
                 menu.addItem(item)
@@ -831,11 +846,12 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
             menu.addItem(.separator())
             if !isGroupRow {
                 let gather = actionItem("新建照片组", action: #selector(gatherFromMenu(_:)), key: "\r")
-                gather.isEnabled = contextMenuSelection.count >= 2
+                gather.isEnabled = !contextMenuSelection.isEmpty
                 menu.addItem(gather)
                 menu.addItem(.separator())
             }
-            menu.addItem(actionItem(isGroupRow ? "移回项目素材" : "从项目移除", action: #selector(removeFromMenu(_:)), key: "\u{8}"))
+            menu.addItem(actionItem(isGroupRow ? "移回素材" : "从项目移除", action: #selector(removeFromMenu(_:)), key: "\u{8}"))
+            if isGroupRow { return menu }
             menu.addItem(.separator())
         }
         let undoItem = actionItem("撤销", action: #selector(undoFromMenu(_:)), key: "z")
@@ -867,7 +883,7 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
     }
 
     @objc private func gatherFromMenu(_ item: NSMenuItem) {
-        guard contextMenuSelection.count >= 2 else { return }
+        guard !contextMenuSelection.isEmpty else { return }
         onGather?(contextMenuSelection, contextMenuPoint)
     }
 
@@ -986,15 +1002,21 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
                                    sourceOrder: assets.map(\.id))
         selectOnMouseUp = nil
         ProjectMaterialDragState.shared.assetIDs = dragged.map(\.id)
-        let session = beginDraggingSession(with: [draggingItem], event: event, source: self)
+        beginPhotoDragging(with: event, item: draggingItem)
+        invalidateCards(Set(dragged.map(\.id)))
+    }
+
+    /// Kept separate from photo selection so native source-event regressions
+    /// can record the requested session without starting an interactive drag.
+    func beginPhotoDragging(with event: NSEvent, item: NSDraggingItem) {
+        let session = beginDraggingSession(with: [item], event: event, source: self)
         session.animatesToStartingPositionsOnCancelOrFail = false
         session.draggingFormation = .none
-        invalidateCards(Set(dragged.map(\.id)))
     }
 
     private func dragImage(for dragged: [ProjectAsset]) -> NSImage {
         let side = thumbnailSize * displayScale
-        let inset = 8 * displayScale
+        let inset = ProjectMaterialLayout.cardInset * displayScale
         let stackStep = min(5, side / 12)
         let layerCount = min(3, dragged.count)
         let stackExtent = CGFloat(max(0, layerCount - 1)) * stackStep
@@ -1041,6 +1063,10 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
     func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
 
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        finishPhotoDragging()
+    }
+
+    func finishPhotoDragging() {
         let draggedIDs = Set(dragContext?.ids ?? [])
         dragContext = nil
         ProjectMaterialDragState.shared.assetIDs = []
@@ -1076,13 +1102,14 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
             if !isGroupRow { updateInsertionMarker(at: convert(sender.draggingLocation, from: nil)) }
             return .move
         }
-        let nextAcceptsFileDrop = (onDropAssets != nil && sender.draggingPasteboard.availableType(from: [ProjectMaterialBoard.assetPasteboardType]) != nil)
+        let acceptsAssetDrop = onDropAssets != nil && !droppedAssetIDs(from: sender).isEmpty
+        let nextAcceptsFileDrop = acceptsAssetDrop
             || (!isGroupRow && sender.draggingPasteboard.availableType(from: [.fileURL]) != nil)
         if nextAcceptsFileDrop != acceptsFileDrop {
             acceptsFileDrop = nextAcceptsFileDrop
             setNeedsDisplay(visibleRect.insetBy(dx: -2, dy: -2))
         }
-        return acceptsFileDrop ? .copy : []
+        return acceptsFileDrop ? (acceptsAssetDrop ? .move : .copy) : []
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
@@ -1094,7 +1121,12 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        isActive && (isInternalDrag(sender) || acceptsFileDrop)
+        guard isActive else { return false }
+        if isInternalDrag(sender) { return true }
+        // Resolve final data again. Leaving a forwarding overlay can clear the
+        // hover flag immediately before AppKit asks the real row to prepare.
+        return (onDropAssets != nil && !droppedAssetIDs(from: sender).isEmpty)
+            || (!isGroupRow && !fileURLs(sender).isEmpty)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -1115,11 +1147,8 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
             onMove?(positions)
             return true
         }
-        if let onDropAssets,
-           let data = sender.draggingPasteboard.data(forType: ProjectMaterialBoard.assetPasteboardType),
-           let values = try? JSONDecoder().decode([String].self, from: data) {
-            let ids = Set(values.compactMap(UUID.init(uuidString:)))
-            guard !ids.isEmpty else { return false }
+        let ids = droppedAssetIDs(from: sender)
+        if let onDropAssets, !ids.isEmpty {
             onDropAssets(ids)
             acceptsFileDrop = false
             needsDisplay = true
@@ -1133,6 +1162,15 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
         acceptsFileDrop = false
         needsDisplay = true
         return true
+    }
+
+    private func droppedAssetIDs(from sender: NSDraggingInfo) -> Set<UUID> {
+        guard sender.draggingSource is ProjectMaterialDocumentView,
+              let data = sender.draggingPasteboard.data(forType: ProjectMaterialBoard.assetPasteboardType),
+              let values = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        let decoded = values.compactMap(UUID.init(uuidString:))
+        guard decoded.count == values.count else { return [] }
+        return Set(decoded)
     }
 
     private func movedPositions(to point: CGPoint) -> [UUID: CGPoint] {
@@ -1204,7 +1242,7 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
             updateSelection([])
         } else if event.keyCode == 49, modifiers.isEmpty {
             togglePreview()
-        } else if [36, 76].contains(event.keyCode), modifiers.isEmpty, selectedIDs.count >= 2, !isGroupRow {
+        } else if [36, 76].contains(event.keyCode), modifiers.isEmpty, !selectedIDs.isEmpty, !isGroupRow {
             onGather?(selectedIDs, .zero)
         } else if [123, 124, 125, 126].contains(event.keyCode), modifiers.isSubset(of: [.shift]) {
             navigateSelectionWithArrow(event.keyCode)

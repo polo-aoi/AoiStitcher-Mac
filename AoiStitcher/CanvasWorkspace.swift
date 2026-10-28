@@ -534,10 +534,10 @@ final class CanvasWorkspaceView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        isActive && !store.isLoading ? .copy : []
+        canImportDroppedImages ? .copy : []
     }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard isActive, !store.isLoading else { return false }
+        guard canImportDroppedImages else { return false }
         let paperType = NSPasteboard.PasteboardType("com.aoipic.paper-url")
         let paperURL = sender.draggingPasteboard.data(forType: paperType)
             .flatMap { String(data: $0, encoding: .utf8) }
@@ -550,5 +550,9 @@ final class CanvasWorkspaceView: NSView {
         let clamped = CGPoint(x: min(size.width, max(0, point.x)), y: min(size.height, max(0, point.y)))
         store.importURLs(urls, as: paperURL == nil ? .photo : .paper, at: clamped)
         return true
+    }
+
+    private var canImportDroppedImages: Bool {
+        isActive && !store.isLoading && !store.isExporting && window?.attachedSheet == nil
     }
 }

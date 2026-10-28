@@ -14,12 +14,20 @@ import Foundation
         setbuf(stdout, nil)
         let checks = try await ProjectLibraryRegressionTests.run()
         print("Project library: \(checks) checks passed")
+        let sourceChecks = try await ProjectSourceLocationRegressionTests.run()
+        print("Project source locations: \(sourceChecks) checks passed")
+        let orderingChecks = try ProjectHomeOrderingRegressionTests.run()
+        print("Project home ordering: \(orderingChecks) checks passed")
         let gridChecks = try ProjectMaterialGridRegressionTests.run()
         print("Material grid: \(gridChecks) checks passed")
         let groupChecks = try ProjectPhotoGroupInteractionTests.run()
         print("Photo group interaction: \(groupChecks) checks passed")
         let blankChecks = try await ProjectGroupBlankSelectionTests.run()
         print("Group blank selection: \(blankChecks) checks passed")
+        let blankDropChecks = try await ProjectGroupBlankDropTests.run()
+        print("Group blank drop: \(blankDropChecks) checks passed")
+        let transferChecks = try ProjectPhotoTransferRegressionTests.run()
+        print("Photo transfers: \(transferChecks) checks passed")
         let selectionChecks = try ProjectMaterialSelectionRegressionTests.run()
         print("Material selection: \(selectionChecks) checks passed")
         let layoutChecks = try ProjectPhotoGroupLayoutRegressionTests.run()
@@ -38,6 +46,8 @@ SWIFT
 
 library_sources=("$library_project_root"/AoiStitcher/**/*.swift)
 library_sources=("${(@)library_sources:#*/AoiStitcherApp.swift}")
+# The unused Xcode SwiftData template requires a macro plug-in in standalone swiftc.
+library_sources=("${(@)library_sources:#*/Item.swift}")
 xcrun swiftc -parse-as-library -swift-version 5 -default-isolation MainActor \
     -enable-upcoming-feature DisableOutwardActorInference \
     -enable-upcoming-feature GlobalActorIsolatedTypesUsability \
@@ -48,9 +58,13 @@ xcrun swiftc -parse-as-library -swift-version 5 -default-isolation MainActor \
     -target "$(uname -m)-apple-macos14.6" \
     "${library_sources[@]}" \
     "$library_project_root/Tests/ProjectLibraryRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectSourceLocationRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectHomeOrderingRegressionTests.swift" \
     "$library_project_root/Tests/ProjectMaterialGridRegressionTests.swift" \
     "$library_project_root/Tests/ProjectPhotoGroupInteractionTests.swift" \
     "$library_project_root/Tests/ProjectGroupBlankSelectionTests.swift" \
+    "$library_project_root/Tests/ProjectGroupBlankDropTests.swift" \
+    "$library_project_root/Tests/ProjectPhotoTransferRegressionTests.swift" \
     "$library_project_root/Tests/ProjectMaterialSelectionRegressionTests.swift" \
     "$library_project_root/Tests/ProjectPhotoGroupLayoutRegressionTests.swift" \
     "$library_project_root/Tests/ProjectThumbnailCacheRegressionTests.swift" \

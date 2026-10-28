@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import ImageIO
 import UniformTypeIdentifiers
 
 /// Keep pending imports alive if the main window closes, and finish metadata writes before quitting.
@@ -19,32 +20,50 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var library = ProjectLibraryStore()
+    @Environment(\.openSettings) private var openSettings
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
     @State private var mode = "library"
     @State private var homeRequest = 0
     @State private var workspaceBusy = false
+    @State private var directCollage: ProjectEditorRequest?
 
     var body: some View {
         Group {
             if let project = library.currentProject {
                 ProjectWorkspaceView(library: library, projectID: project.id,
                                      mode: $mode, homeRequest: homeRequest,
-                                     navigationBusy: $workspaceBusy)
+                                     navigationBusy: $workspaceBusy,
+                                     initialRequest: nil, onReturnHome: { library.closeProject() })
                     .id(project.id)
+            } else if let session = directCollage {
+                ProjectWorkspaceView(library: library, projectID: nil,
+                                     mode: $mode, homeRequest: homeRequest,
+                                     navigationBusy: $workspaceBusy,
+                                     initialRequest: session, onReturnHome: {
+                                         directCollage = nil
+                                         mode = "library"
+                                         workspaceBusy = false
+                                     })
+                    .id(session.id)
             } else {
-                ProjectHomeView(library: library)
+                ProjectHomeView(library: library) { operation, urls in
+                    mode = operation.rawValue
+                    directCollage = ProjectEditorRequest(operation: operation, urls: urls, mode: .replace)
+                }
             }
         }
         .frame(minWidth: 1020, minHeight: 740)
         .preferredColorScheme(theme == 2 ? .dark : .light)
         .background {
             ProjectWindowNavigation(
-                selectedWorkspace: library.currentProject == nil ? nil : mode,
+                selectedWorkspace: library.currentProject != nil || directCollage != nil ? mode : nil,
                 workspaces: AppPreferences.workspaceOrder(from: storedWorkspaceOrder),
                 homeEnabled: !workspaceBusy && !library.isImporting,
-                onHome: { if library.currentProject != nil { homeRequest += 1 } },
-                onSelectWorkspace: { mode = $0 }
+                showsProjectMaterials: directCollage == nil,
+                onHome: { if library.currentProject != nil || directCollage != nil { homeRequest += 1 } },
+                onSelectWorkspace: { mode = $0 },
+                onSettings: { openSettings() }
             ).frame(width: 0, height: 0)
         }
         .onChange(of: library.currentProject?.id) { _, _ in
@@ -68,62 +87,47 @@ struct ContentView: View {
 
 private struct ProjectHomeView: View {
     @ObservedObject var library: ProjectLibraryStore
-    @State private var showingNewProject = false
-    @State private var projectName = ""
+    let onStartCollage: (ProjectOperation, [URL]) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isDropTargeted = false
+    @State private var targetedOperation: ProjectOperation?
+    @State private var isCreateHovered = false
+    @State private var hoveredOperation: ProjectOperation?
+    @State private var showsProjectFocus = false
     @State private var renamingProject: ProjectSummary?
     @State private var renamingText = ""
     @State private var deletingProject: ProjectSummary?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 26) {
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("你的图片项目").font(.largeTitle.bold())
-                    Text("先把照片放进一个项目，再整理、拼图和记录成果。")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button { projectName = ""; showingNewProject = true } label: {
-                    Label("新建项目", systemImage: "plus")
-                        .padding(.horizontal, 8).padding(.vertical, 5)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut("n", modifiers: .command)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("你的图片项目").font(.largeTitle.bold())
+                Text("整理照片，或直接开始拼图。")
+                    .foregroundStyle(.secondary)
             }
 
-            Button(action: chooseProjectFolder) {
-                HStack(spacing: 18) {
-                    Image(systemName: "folder.badge.plus").font(.system(size: 34, weight: .light))
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(isDropTargeted ? "松开文件夹，创建项目" : "拖入文件夹，直接开始")
-                            .font(.title3.weight(.semibold))
-                        Text("以文件夹名称新建项目，导入其中及子文件夹里的照片。也可以直接拖入多张照片。")
-                            .font(.callout).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text("选择文件夹…").font(.callout)
-                }
-                .padding(24).frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.accentColor.opacity(isDropTargeted ? 0.15 : 0.05), in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.accentColor.opacity(isDropTargeted ? 1 : 0.3), style: StrokeStyle(lineWidth: 1.5, dash: [7, 5])))
-                .contentShape(Rectangle())
-            }.buttonStyle(.plain)
+            HStack(spacing: 18) {
+                createProjectCard
+                directCollageCard
+            }
 
             if library.projects.isEmpty {
                 Spacer()
                 VStack(spacing: 16) {
                     Image(systemName: "square.stack.3d.up").font(.system(size: 52, weight: .light))
                         .foregroundStyle(.secondary)
-                    Text("也可以先创建空项目").font(.title2.weight(.semibold))
-                    Text("导入照片，排序分组；用过哪些、导出了什么，都留在项目里。")
+                    Text("还没有图片项目").font(.title2.weight(.semibold))
+                    Text("从左上方创建项目整理照片，也可以从右上方直接开始拼图。")
                         .foregroundStyle(.secondary)
-                    Button("新建第一个项目") { showingNewProject = true }
-                        .buttonStyle(.borderedProminent)
                 }.frame(maxWidth: .infinity)
                 Spacer()
             } else {
-                Text("最近项目").font(.headline)
+                HStack {
+                    Text("全部项目").font(.headline)
+                    Spacer()
+                    Text("双击打开 · 按创建时间排序")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 ScrollView {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 16)], spacing: 16) {
                         ForEach(library.projects) { project in
@@ -134,7 +138,8 @@ private struct ProjectHomeView: View {
                                 onRename: { renamingProject = project; renamingText = project.name },
                                 onReveal: { library.revealProjectInFinder(id: project.id) },
                                 onDelete: { deletingProject = project },
-                                onRepair: { repairProject(project) }
+                                onRepair: { repairProject(project) },
+                                showsFocusRing: $showsProjectFocus
                             )
                         }
                     }.padding(2).projectOverlayScrollbars()
@@ -145,26 +150,9 @@ private struct ProjectHomeView: View {
         }
         .padding(36)
         .contentShape(Rectangle())
-        .dropDestination(for: URL.self) { urls, _ in
-            createProjectFromDrop(urls)
-        } isTargeted: { isDropTargeted = $0 }
-        .sheet(isPresented: $showingNewProject) {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("新建项目").font(.title2.weight(.semibold))
-                TextField("项目名称", text: $projectName).textFieldStyle(.roundedBorder)
-                    .onSubmit(createProject)
-                Text("项目只记录照片的原始位置，不复制原图；移动原文件后可用「修复项目」重新连接。也可以把文件夹拖到这里，直接用文件夹名称创建。")
-                    .font(.callout).foregroundStyle(.secondary)
-                HStack {
-                    Spacer()
-                    Button("取消") { showingNewProject = false }.keyboardShortcut(.cancelAction)
-                    Button("创建项目", action: createProject)
-                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                        .disabled(projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }.padding(24).frame(width: 410)
-                .contentShape(Rectangle())
-                .dropDestination(for: URL.self) { urls, _ in createProjectFromDrop(urls) }
+        .onKeyPress(.tab) {
+            showsProjectFocus = true
+            return .ignored
         }
         .sheet(item: $renamingProject) { project in
             VStack(alignment: .leading, spacing: 18) {
@@ -189,8 +177,137 @@ private struct ProjectHomeView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("项目内的照片副本和资料将一并移到废纸篓，不影响电脑上的原文件。此操作不可撤销。")
+            Text("项目资料和预览缓存将移到废纸篓，原始位置的照片会保留。旧项目中已有的照片副本也会随项目移到废纸篓。")
         }
+    }
+
+    private var entryShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+    }
+
+    private func entryHeading(symbol: String, title: String, subtitle: String,
+                              isEmphasized: Bool = false) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: symbol)
+                .font(.system(size: 32, weight: .light))
+                .frame(width: 40)
+                .foregroundStyle(Color.accentColor)
+                .scaleEffect(isEmphasized && !reduceMotion ? 1.06 : 1)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.title3.weight(.semibold))
+                Text(subtitle).font(.callout).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func entryBackground(isTargeted: Bool = false, isHovered: Bool = false) -> some View {
+        entryShape.fill(Color.accentColor.opacity(isTargeted ? 0.15 : (isHovered ? 0.09 : 0.05)))
+            .overlay(entryShape.strokeBorder(Color.accentColor.opacity(isTargeted ? 1 : (isHovered ? 0.6 : 0.3)),
+                                            style: StrokeStyle(lineWidth: 1.5, dash: [7, 5])))
+    }
+
+    private var createProjectCard: some View {
+        let hovered = isCreateHovered && !library.isImporting
+        return Button(action: chooseProjectSources) {
+            VStack(alignment: .leading, spacing: 18) {
+                entryHeading(symbol: "folder.badge.plus",
+                             title: isDropTargeted ? "松开，创建图片项目" : "创建图片项目",
+                             subtitle: "先整理、选图和分组，再开始拼图",
+                             isEmphasized: hovered || isDropTargeted)
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("点击选择，或拖入文件夹 / 图片", systemImage: "square.and.arrow.down")
+                        .font(.callout.weight(.medium))
+                    Text("照片保留在原始位置").font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(height: 62, alignment: .leading)
+            }
+            .padding(22)
+            .frame(maxWidth: .infinity).frame(height: 194)
+            .background(entryBackground(isTargeted: isDropTargeted, isHovered: hovered))
+            .contentShape(entryShape)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovered)
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut("n", modifiers: .command)
+        .disabled(library.isImporting)
+        .onHover { isCreateHovered = $0 }
+        .dropDestination(for: URL.self) { urls, _ in
+            createProjectFromDrop(urls)
+        } isTargeted: { isDropTargeted = $0 }
+    }
+
+    private var directCollageCard: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            entryHeading(symbol: "photo.on.rectangle.angled", title: "直接开始拼图",
+                         subtitle: "无需创建项目，进入后即可添加照片")
+            HStack(spacing: 8) {
+                ForEach(ProjectOperation.allCases) { operation in
+                    directCollageButton(operation)
+                }
+            }
+        }
+        .padding(22)
+        .frame(maxWidth: .infinity).frame(height: 194)
+        .background(entryBackground())
+    }
+
+    private func directCollageButton(_ operation: ProjectOperation) -> some View {
+        let targeted = targetedOperation == operation
+        let hovered = hoveredOperation == operation && !library.isImporting
+        return Button { onStartCollage(operation, []) } label: {
+            VStack(spacing: 6) {
+                Image(systemName: operation.systemImage).font(.system(size: 19))
+                    .scaleEffect((hovered || targeted) && !reduceMotion ? 1.06 : 1)
+                Text(operation.title).font(.callout.weight(.medium))
+            }
+            .frame(maxWidth: .infinity).frame(height: 62)
+            .foregroundStyle(Color.accentColor)
+            .background(Color.accentColor.opacity(targeted ? 0.18 : (hovered ? 0.11 : 0.06)),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.accentColor.opacity(targeted ? 1 : (hovered ? 0.55 : 0.2)), lineWidth: targeted ? 2 : 1))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovered)
+        }
+        .buttonStyle(.plain)
+        .disabled(library.isImporting)
+        .onHover { isHovered in
+            if isHovered { hoveredOperation = operation }
+            else if hoveredOperation == operation { hoveredOperation = nil }
+        }
+        .help("点击进入拼图，或将照片拖到这里")
+        .dropDestination(for: URL.self) { urls, _ in
+            startCollage(operation, urls: urls)
+        } isTargeted: { isTargeted in
+            if isTargeted { targetedOperation = operation }
+            else if targetedOperation == operation { targetedOperation = nil }
+        }
+    }
+
+    private func startCollage(_ operation: ProjectOperation, urls: [URL]) -> Bool {
+        guard !library.isImporting, !urls.isEmpty else { return false }
+        var seen: Set<URL> = []
+        var photos: [URL] = []
+        for url in urls {
+            let accessing = url.startAccessingSecurityScopedResource()
+            defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+            guard url.isFileURL,
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+                  let source = CGImageSourceCreateWithURL(url as CFURL,
+                      [kCGImageSourceShouldCache: false] as CFDictionary),
+                  CGImageSourceGetCount(source) > 0 else {
+                library.message = "请选择可读取的图片文件。文件夹可以从左侧创建图片项目。"
+                return false
+            }
+            if seen.insert(url.standardizedFileURL.resolvingSymlinksInPath()).inserted { photos.append(url) }
+        }
+        if let maximum = operation.maximumPhotoCount, photos.count > maximum {
+            library.message = "\(operation.title)最多支持 \(maximum) 张照片，请重新选择。"
+            return false
+        }
+        onStartCollage(operation, photos)
+        return true
     }
 
     private func confirmRename() {
@@ -214,25 +331,18 @@ private struct ProjectHomeView: View {
     private func createProjectFromDrop(_ urls: [URL]) -> Bool {
         let files = urls.filter(\.isFileURL)
         guard !files.isEmpty else { return false }
-        showingNewProject = false
         return library.createProject(importing: files)
     }
 
-    private func chooseProjectFolder() {
+    private func chooseProjectSources() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
         panel.prompt = "创建项目"
-        panel.message = "以所选文件夹命名项目，并导入其中的图片。"
+        panel.message = "选择照片文件夹或多张图片创建项目。文件夹中的子文件夹也会一并读取，原图保留在原始位置。"
         if panel.runModal() == .OK { _ = createProjectFromDrop(panel.urls) }
-    }
-
-    private func createProject() {
-        let name = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        showingNewProject = false
-        library.createProject(name: name)
     }
 }
 
@@ -269,18 +379,43 @@ private struct ProjectCoverCard: View {
     let onReveal: () -> Void
     let onDelete: () -> Void
     let onRepair: () -> Void
+    @Binding var showsFocusRing: Bool
+    @FocusState private var isFocused: Bool
+
+    private var cardShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+    }
 
     var body: some View {
-        Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: 0) {
-                coverArea
-                infoArea
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
+        VStack(alignment: .leading, spacing: 0) {
+            coverArea
+            infoArea
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: cardShape)
+        .clipShape(cardShape)
+        .overlay {
+            cardShape.strokeBorder(.quaternary).allowsHitTesting(false)
+            if isFocused && showsFocusRing {
+                cardShape.strokeBorder(Color.accentColor, lineWidth: 2).allowsHitTesting(false)
+            }
+        }
+        .contentShape(cardShape)
+        .onTapGesture(count: 2, perform: onOpen)
+        .simultaneousGesture(TapGesture().onEnded {
+            showsFocusRing = true
+            isFocused = true
+        })
+        .focusable()
+        .focused($isFocused)
+        .focusEffectDisabled()
+        .onKeyPress(.return) { onOpen(); return .handled }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(project.name)，共 \(project.assetCount) 张照片" +
+                            (project.missingCount > 0 ? "，\(project.missingCount) 张缺图" : ""))
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { onOpen() }
+        .help("双击打开项目素材")
         .contextMenu {
             Button("打开") { onOpen() }
             Button("重命名…") { onRename() }
@@ -339,7 +474,7 @@ private struct ProjectCoverCard: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(project.name).font(.title3.weight(.semibold)).lineLimit(1)
             HStack(spacing: 8) {
-                Text(project.modifiedAt, format: .dateTime.year().month().day().hour().minute()
+                Text(project.createdAt, format: .dateTime.year().month().day().hour().minute()
                     .locale(Locale(identifier: "zh_CN")))
                     .font(.caption).foregroundStyle(.secondary)
                 if project.missingCount > 0 {
@@ -354,15 +489,18 @@ private struct ProjectCoverCard: View {
 
 private struct ProjectWorkspaceView: View {
     @ObservedObject var library: ProjectLibraryStore
-    let projectID: UUID
+    let projectID: UUID?
     @Binding var mode: String
     let homeRequest: Int
     @Binding var navigationBusy: Bool
+    let initialRequest: ProjectEditorRequest?
+    let onReturnHome: () -> Void
     @StateObject private var bridge = ProjectEditorBridge()
     @StateObject private var canvasStore = CanvasStore()
     @StateObject private var gridCollageStore = GridCollageStore()
     @State private var isMaterialDispatchPresented = false
     @State private var confirmsReturnHome = false
+    @State private var didSendInitialRequest = false
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
 
     private var isBusy: Bool {
@@ -372,23 +510,27 @@ private struct ProjectWorkspaceView: View {
 
     var body: some View {
         ZStack {
-            ProjectLibraryView(library: library, projectID: projectID,
-                               isActive: mode == "library" && library.currentProject?.id == projectID,
-                               isDispatchPresented: $isMaterialDispatchPresented) { operation, urls, importMode in
-                guard bridge.send(operation: operation, urls: urls, mode: importMode) else {
-                    library.message = "目标工具正在处理，或添加后超过容量限制。请稍后重试。"
-                    return false
+            if let projectID {
+                ProjectLibraryView(library: library, projectID: projectID,
+                                   isActive: mode == "library" && library.currentProject?.id == projectID,
+                                   isDispatchPresented: $isMaterialDispatchPresented) { operation, urls, importMode in
+                    guard bridge.send(operation: operation, urls: urls, mode: importMode) else {
+                        library.message = "目标工具正在处理，或添加后超过容量限制。请稍后重试。"
+                        return false
+                    }
+                    mode = operation.rawValue
+                    return true
                 }
-                mode = operation.rawValue
-                return true
+                .opacity(mode == "library" ? 1 : 0)
+                .zIndex(mode == "library" ? 1 : 0)
+                .allowsHitTesting(mode == "library")
+                .disabled(mode != "library")
+                .accessibilityHidden(mode != "library")
             }
-            .opacity(mode == "library" ? 1 : 0)
-            .allowsHitTesting(mode == "library")
-            .disabled(mode != "library")
-            .accessibilityHidden(mode != "library")
             ForEach(AppPreferences.workspaceOrder(from: storedWorkspaceOrder)) { workspace in
                 workspaceView(workspace)
                     .opacity(mode == workspace.rawValue ? 1 : 0)
+                    .zIndex(mode == workspace.rawValue ? 1 : 0)
                     .allowsHitTesting(mode == workspace.rawValue)
                     .disabled(mode != workspace.rawValue)
                     .accessibilityHidden(mode != workspace.rawValue)
@@ -397,14 +539,23 @@ private struct ProjectWorkspaceView: View {
         .padding(8)
         .environmentObject(library)
         .environmentObject(bridge)
-        .onAppear { navigationBusy = isBusy }
+        .onAppear {
+            if let request = initialRequest, !request.urls.isEmpty, !didSendInitialRequest {
+                didSendInitialRequest = true
+                if request.operation == .gridCollage { gridCollageStore.setSlotCount(request.urls.count) }
+                bridge.send(operation: request.operation, urls: request.urls, mode: request.mode)
+            }
+            navigationBusy = isBusy
+        }
         .onChange(of: isBusy) { _, busy in navigationBusy = busy }
         .onChange(of: homeRequest) { _, _ in requestHome() }
         .alert("返回项目首页？", isPresented: $confirmsReturnHome) {
             Button("继续编辑", role: .cancel) {}
             Button("返回首页", role: .destructive, action: returnHome)
         } message: {
-            Text("当前有尚未导出的拼图，返回首页后将清空编辑器。项目素材、照片组和处理状态会自动保存。")
+            Text(projectID == nil
+                 ? "当前有尚未导出的拼图，返回首页后将清空编辑器。请先导出需要保留的作品。"
+                 : "当前有尚未导出的拼图，返回首页后将清空编辑器。项目素材、照片组和处理状态会自动保存。")
         }
     }
 
@@ -419,7 +570,7 @@ private struct ProjectWorkspaceView: View {
 
     private func returnHome() {
         guard !isBusy, library.currentProject?.id == projectID else { return }
-        library.closeProject()
+        onReturnHome()
     }
 
     @ViewBuilder private func workspaceView(_ workspace: AppWorkspace) -> some View {
@@ -431,49 +582,21 @@ private struct ProjectWorkspaceView: View {
     }
 }
 
-nonisolated struct ProjectMaterialFilter: Equatable {
-    enum Status: String, CaseIterable, Identifiable {
-        case all, unused, used
-        var id: Self { self }
-        var title: String {
-            switch self {
-            case .all: return "全部"
-            case .unused: return "未导出"
-            case .used: return "已导出"
-            }
-        }
-    }
-
-    var operation: ProjectOperation?
-    var status: Status = .all
-    var isActive: Bool { operation != nil || status != .all }
-    var summary: String { "\(operation?.title ?? "不限用途") · \(status.title)" }
-
-    func includes(operations: Set<ProjectOperation>) -> Bool {
-        let exported = operation.map { operations.contains($0) } ?? !operations.isEmpty
-        switch status {
-        case .all: return true
-        case .unused: return !exported
-        case .used: return exported
-        }
-    }
-}
-
 /// Rebuilt on document edits, not on selection changes or thumbnail completions.
 private struct ProjectMaterialCatalog {
     var assets: [ProjectAsset] = []
+    var materialAssets: [ProjectAsset] = []
     var byID: [UUID: ProjectAsset] = [:]
-    var usage: [UUID: Set<ProjectOperation>] = [:]
     var badges: [UUID: String] = [:]
 
     init(_ document: ProjectDocument? = nil) {
         guard let document else { return }
         assets = document.orderedActiveAssets
+        materialAssets = assets.filter { $0.groupID == nil }
         byID = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) })
         var counts: [UUID: [ProjectOperation: Int]] = [:]
         for record in document.exports {
             for id in Set(record.assetIDs) {
-                usage[id, default: []].insert(record.operation)
                 counts[id, default: [:]][record.operation, default: 0] += 1
             }
         }
@@ -506,26 +629,24 @@ private struct ProjectLibraryView: View {
     @State private var selectedWholeGroupID: UUID?
     @State private var groupSelection: Set<UUID> = []
     @State private var catalog = ProjectMaterialCatalog()
-    @State private var visibleAssets: [ProjectAsset] = []
-    @State private var filter = ProjectMaterialFilter()
-    @State private var showsFilter = false
-    @State private var search = ""
     @State private var arrangeRequest = 0
     @State private var dispatch: ProjectDispatch?
     @State private var draggedGroupID: UUID?
     @State private var groupDropInsertionIndex: Int?
     @State private var groupDropTargetID: UUID?
     @State private var assetDropTargetGroupID: UUID?
+    @State private var isBlankGroupDropTarget = false
 
-    private var showsModal: Bool { dispatch != nil || showsFilter }
+    private var showsModal: Bool { dispatch != nil }
 
     private var assets: [ProjectAsset] { catalog.assets }
+    private var materialAssets: [ProjectAsset] { catalog.materialAssets }
     private var groups: [ProjectPhotoGroup] { library.currentProject?.groups ?? [] }
     private var activeSelection: Set<UUID> { selectedGroupID == nil ? selection : groupSelection }
     private var selectedAssets: [ProjectAsset] { orderedForDispatch(activeSelection) }
     private var selectedCount: Int { selectedAssets.count }
     private var assetURLs: [UUID: URL] {
-        Dictionary(uniqueKeysWithValues: visibleAssets.map { ($0.id, library.assetURL($0)) })
+        Dictionary(uniqueKeysWithValues: materialAssets.map { ($0.id, library.assetURL($0)) })
     }
     private var operations: [ProjectOperation] {
         AppPreferences.workspaceOrder(from: storedWorkspaceOrder).compactMap { ProjectOperation(rawValue: $0.rawValue) }
@@ -543,10 +664,10 @@ private struct ProjectLibraryView: View {
                 groupPane
             } content: {
                     ZStack {
-                        ProjectThumbnailRefresh(library: library, assets: visibleAssets,
+                        ProjectThumbnailRefresh(library: library, assets: materialAssets,
                                                 isActive: isActive) { thumbnails, reportVisible in
                         ProjectMaterialBoard(
-                            assets: visibleAssets, selection: $selection,
+                            assets: materialAssets, selection: $selection,
                             thumbnailSize: CGFloat(library.currentProject?.thumbnailSize ?? 128),
                             viewZoom: .constant(1), fitRequest: arrangeRequest,
                             thumbnails: thumbnails, assetURLs: assetURLs, isActive: isActive && !showsModal,
@@ -561,7 +682,7 @@ private struct ProjectLibraryView: View {
                             },
                             operations: operations,
                             onSend: prepareDispatch,
-                            onGather: { ids, _ in createGroup(ids) },
+                            onGather: { ids, _ in _ = createGroup(ids) },
                             onUngroup: library.ungroupAssets,
                             onRemove: library.removeAssets,
                             onImportPanel: library.importPanel,
@@ -575,11 +696,11 @@ private struct ProjectLibraryView: View {
                             }
                         )
                         }
-                        if visibleAssets.isEmpty {
+                        if materialAssets.isEmpty {
                             VStack(spacing: 12) {
-                                Image(systemName: assets.isEmpty ? "photo.on.rectangle.angled" : "line.3.horizontal.decrease.circle")
+                                Image(systemName: assets.isEmpty ? "photo.on.rectangle.angled" : "rectangle.stack")
                                     .font(.system(size: 36)).foregroundStyle(.secondary)
-                                Text(assets.isEmpty ? "把照片或文件夹拖进来" : groups.isEmpty ? "没有符合条件的素材" : "这里显示未分组的照片")
+                                Text(assets.isEmpty ? "把照片或文件夹拖进来" : "这里显示未分组的照片")
                                     .font(.headline)
                                 Text(assets.isEmpty ? "也可以点击上方「导入素材」" : "右侧照片可拖回这里，或按 Delete 移回素材")
                                     .foregroundStyle(.secondary)
@@ -588,16 +709,14 @@ private struct ProjectLibraryView: View {
                     }
             }
             Divider()
-            materialActionBar
             HStack {
                 Text(library.currentProject?.name ?? "项目")
                     .lineLimit(1).truncationMode(.middle).frame(maxWidth: 200, alignment: .leading)
                 Text("·")
-                Text("未分组 \(visibleAssets.count) 张 · 项目共 \(assets.count) 张")
-                if filter.isActive { Text("· \(filter.summary)").lineLimit(1) }
+                Text("未分组 \(materialAssets.count) 张 · 项目共 \(assets.count) 张")
                 Spacer()
                 Text("空格预览 · 回车分组")
-            }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.bottom, 8)
+            }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 8)
         }
         .onAppear {
             guard library.currentProject?.id == projectID else { return }
@@ -605,13 +724,8 @@ private struct ProjectLibraryView: View {
             library.boardViewZoom = 1
         }
         .onChange(of: library.currentProject?.modifiedAt) { _, _ in refreshCatalog() }
-        .onChange(of: filter) { _, _ in refreshFiltering() }
-        .onChange(of: search) { _, _ in refreshFiltering() }
-        .onChange(of: isActive) { _, active in
-            if !active { showsFilter = false }
-        }
         .onChange(of: showsModal) { _, value in isDispatchPresented = value }
-        .onChange(of: visibleAssets.map(\.id)) { _, ids in selection.formIntersection(Set(ids)) }
+        .onChange(of: materialAssets.map(\.id)) { _, ids in selection.formIntersection(Set(ids)) }
         .sheet(item: $dispatch) { request in
             ProjectDispatchSheet(operation: request.operation, assets: request.assets) { orderedAssets, importMode in
                 if onSend(request.operation, orderedAssets.map { library.assetURL($0) }, importMode) {
@@ -622,31 +736,20 @@ private struct ProjectLibraryView: View {
         }
     }
 
-    private var materialActionBar: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if !didAddPhotos {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("选择想拼在一起的照片，按回车在右侧建一组。")
-                        .font(.callout.weight(.medium))
-                    Text("在空白处拖动框选，或按住 Shift 逐张选择。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+    private var groupActionBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            actionSelectionLabel
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 6)],
+                      alignment: .leading, spacing: 6) {
+                ForEach(operations) { operation in operationTarget(operation) }
             }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) {
-                    actionSelectionLabel
-                    ForEach(operations) { operation in operationTarget(operation) }
-                    Spacer(minLength: 0)
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    actionSelectionLabel
-                    HStack(spacing: 6) {
-                        ForEach(operations) { operation in operationTarget(operation) }
-                    }
-                }
+            if !didAddPhotos {
+                Text("选中照片，拖到下方空白处或按回车建组；按住 Shift 多选。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 12).padding(.vertical, 8)
+        .padding(.horizontal, 8).padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .windowBackgroundColor))
     }
@@ -671,18 +774,10 @@ private struct ProjectLibraryView: View {
             Button(action: library.importPanel) { Label("导入素材", systemImage: "plus") }
                 .buttonStyle(.borderedProminent).disabled(library.isImporting)
             if library.isImporting { ProgressView().controlSize(.small) }
-            TextField("搜索照片名称", text: $search)
-                .textFieldStyle(.roundedBorder).frame(minWidth: 90, idealWidth: 180, maxWidth: 220)
-            Button { showsFilter.toggle() } label: {
-                Label("筛选", systemImage: filter.isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-            }
-            .foregroundStyle(filter.isActive ? Color.accentColor : Color.primary)
-            .help(filter.isActive ? filter.summary : "筛选未分组素材")
-            .popover(isPresented: $showsFilter, arrowEdge: .bottom) { filterPopover }
-            Spacer(minLength: 0)
             Button("整理对齐") { arrangeRequest += 1 }
                 .disabled(!assets.contains { $0.groupID == nil })
                 .help("素材已按当前顺序自动对齐，点击回到排列起点")
+            Spacer(minLength: 0)
             thumbnailControls
         }.padding(.horizontal, 10).padding(.vertical, 8)
     }
@@ -729,41 +824,17 @@ private struct ProjectLibraryView: View {
         }.fixedSize()
     }
 
-    private var filterPopover: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("筛选素材").font(.headline)
-                Spacer()
-                Button("清除筛选") { filter = ProjectMaterialFilter() }.disabled(!filter.isActive)
-                    .buttonStyle(.borderless)
-            }
-            Picker("拼图方式", selection: $filter.operation) {
-                Text("不限").tag(Optional<ProjectOperation>.none)
-                ForEach(operations) { operation in Text(operation.title).tag(Optional(operation)) }
-            }
-            Picker("导出状态", selection: $filter.status) {
-                ForEach(ProjectMaterialFilter.Status.allCases) { status in Text(status.title).tag(status) }
-            }.pickerStyle(.segmented)
-            Text("选择拼图方式后，导出状态仅针对该方式。筛选用于中间的未分组素材。")
-                .font(.caption).foregroundStyle(.secondary)
-            HStack {
-                Text("\(visibleAssets.count) 张符合条件").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("完成") { showsFilter = false }
-            }
-        }.padding(16).frame(width: 300)
-    }
-
     private var groupPane: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text("照片组").font(.headline)
                 Text("\(groups.count)").foregroundStyle(.secondary).monospacedDigit()
                 Spacer()
-                Text("拖回素材或按 Delete").font(.caption).foregroundStyle(.secondary)
+                Text("拖到空白处建组").font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, 8).padding(.vertical, 8)
                 .contentShape(Rectangle())
                 .onTapGesture { if isActive && !showsModal { clearSelection() } }
+            groupActionBar
             Divider()
             ScrollViewReader { proxy in
                 ScrollView {
@@ -829,12 +900,13 @@ private struct ProjectLibraryView: View {
                                 onAssetDropTargetChange: { targeted in
                                     if targeted { assetDropTargetGroupID = group.id }
                                     else if assetDropTargetGroupID == group.id { assetDropTargetGroupID = nil }
-                                }
+                                },
+                                operations: operations
                             )
                             .id(group.id)
                             .overlay {
                                 if assetDropTargetGroupID == group.id {
-                                    RoundedRectangle(cornerRadius: 5)
+                                    ProjectPhotoGroupRow.outline
                                         .strokeBorder(Color.accentColor, lineWidth: 2)
                                         .allowsHitTesting(false)
                                 }
@@ -843,8 +915,8 @@ private struct ProjectLibraryView: View {
                         if groups.isEmpty {
                             VStack(spacing: 8) {
                                 Image(systemName: "rectangle.stack").font(.title)
-                                Text("每按一次回车，这里就多一组")
-                                Text("照片会展开排列，方便逐组拼图")
+                                Text("拖入一张或多张照片，新建一组")
+                                Text("也可选中照片后按回车")
                                     .font(.caption)
                             }.foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity).padding(.vertical, 40)
@@ -852,20 +924,36 @@ private struct ProjectLibraryView: View {
                     }.padding(4).projectOverlayScrollbars()
                         .projectGroupBlankSelection(isActive: isActive && !showsModal,
                                                     onClearSelection: clearSelection)
+                        .projectGroupBlankDrop(isActive: isActive && !showsModal,
+                                               validAssetIDs: Set(assets.map(\.id)),
+                                               onCreateGroup: createGroup,
+                                               onTargetChange: { isBlankGroupDropTarget = $0 })
                 }
                 .onChange(of: selectedGroupID) { _, id in
                     if let id { proxy.scrollTo(id) }
+                }
+                .overlay(alignment: .bottom) {
+                    if isBlankGroupDropTarget {
+                        Label("松开新建照片组", systemImage: "plus.rectangle.on.rectangle")
+                            .font(.callout.weight(.medium))
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(.regularMaterial, in: Capsule())
+                            .padding(12)
+                            .allowsHitTesting(false)
+                    }
                 }
             }
         }.background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private func createGroup(_ ids: Set<UUID>) {
-        guard let id = library.createGroup(ids) else { return }
+    @discardableResult
+    private func createGroup(_ ids: Set<UUID>) -> Bool {
+        guard let id = library.createGroup(ids) else { return false }
         selection.subtract(ids)
         selectedGroupID = id
         selectedWholeGroupID = id
         groupSelection = ids
+        return true
     }
 
     private func clearGroupDrag() {
@@ -878,7 +966,6 @@ private struct ProjectLibraryView: View {
     private func refreshCatalog() {
         guard library.currentProject?.id == projectID else { return }
         catalog = ProjectMaterialCatalog(library.currentProject)
-        refreshFiltering()
         if let id = selectedGroupID {
             if let group = groups.first(where: { $0.id == id }) {
                 groupSelection.formIntersection(group.assetIDs)
@@ -888,13 +975,6 @@ private struct ProjectLibraryView: View {
                 groupSelection = []
             }
         }
-    }
-
-    private func refreshFiltering() {
-        let searched = catalog.assets.filter {
-            $0.groupID == nil && (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search))
-        }
-        visibleAssets = searched.filter { filter.includes(operations: catalog.usage[$0.id, default: []]) }
     }
 
     private func orderedForDispatch(_ ids: Set<UUID>) -> [ProjectAsset] {
@@ -1109,6 +1189,7 @@ private struct ProjectOperationTarget: View {
             }
             .font(.callout.weight(.medium))
             .padding(.horizontal, 10).padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
         }
         .buttonStyle(ProjectOperationButtonStyle(highlighted: isTargeted || (isHovered && !isBusy),

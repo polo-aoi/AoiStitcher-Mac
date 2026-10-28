@@ -39,6 +39,10 @@ enum ProjectPhotoGroupDragPayload {
     }
 
     var onChoose: (() -> Void)?
+    var assetIDs: Set<UUID> = []
+    var operations: [ProjectOperation] = ProjectOperation.allCases
+    var onSend: ((ProjectOperation, Set<UUID>) -> Void)?
+    var onReturnAssets: ((Set<UUID>) -> Void)?
     var onGroupDragBegan: (() -> Void)?
     var onGroupDragEnded: (() -> Void)?
     var onGroupDragHover: ((UUID, Bool) -> Bool)?
@@ -63,6 +67,7 @@ enum ProjectPhotoGroupDragPayload {
         addSubview(scrollView)
         registerForDraggedTypes([ProjectPhotoGroupDragPayload.type, ProjectMaterialBoard.assetPasteboardType])
         handleView.onChoose = { [weak self] in self?.onChoose?() }
+        handleView.onContextMenu = { [weak self] event in self?.menu(for: event) }
         handleView.onDragBegan = { [weak self] in self?.onGroupDragBegan?() }
         handleView.onDragEnded = { [weak self] in self?.onGroupDragEnded?() }
     }
@@ -75,6 +80,51 @@ enum ProjectPhotoGroupDragPayload {
         handleView.frame = CGRect(x: bounds.minX, y: bounds.minY, width: width, height: bounds.height)
         scrollView.frame = CGRect(x: bounds.minX + width, y: bounds.minY,
                                   width: max(0, bounds.width - width), height: bounds.height)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard isActive, !assetIDs.isEmpty else { return nil }
+        let members = assetIDs
+        onChoose?()
+        let menu = NSMenu(title: "照片组")
+        menu.autoenablesItems = false
+        for operation in operations where ProjectOperation.allCases.contains(operation) {
+            let shortcut = ProjectOperation.allCases.firstIndex(of: operation).map { String($0 + 1) } ?? ""
+            let item = NSMenuItem(title: "添加至\(operation.title)",
+                                  action: #selector(sendGroupFromMenu(_:)), keyEquivalent: shortcut)
+            item.target = self
+            item.keyEquivalentModifierMask = []
+            item.image = NSImage(systemSymbolName: operation.systemImage, accessibilityDescription: nil)
+            item.representedObject = GroupMenuAction(operation: operation, assetIDs: members)
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let returnItem = NSMenuItem(title: "移回素材", action: #selector(returnGroupFromMenu(_:)), keyEquivalent: "\u{8}")
+        returnItem.target = self
+        returnItem.keyEquivalentModifierMask = []
+        returnItem.representedObject = members
+        menu.addItem(returnItem)
+        return menu
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard let menu = menu(for: event) else { return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    private struct GroupMenuAction {
+        let operation: ProjectOperation
+        let assetIDs: Set<UUID>
+    }
+
+    @objc private func sendGroupFromMenu(_ item: NSMenuItem) {
+        guard isActive, let action = item.representedObject as? GroupMenuAction else { return }
+        onSend?(action.operation, action.assetIDs)
+    }
+
+    @objc private func returnGroupFromMenu(_ item: NSMenuItem) {
+        guard isActive, let members = item.representedObject as? Set<UUID> else { return }
+        onReturnAssets?(members)
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -182,6 +232,8 @@ enum ProjectPhotoGroupDragPayload {
         isActive = false
         handleView.disconnect()
         onChoose = nil
+        onSend = nil
+        onReturnAssets = nil
         onGroupDragBegan = nil
         onGroupDragEnded = nil
         onGroupDragHover = nil
@@ -211,6 +263,7 @@ enum ProjectPhotoGroupDragPayload {
         }
     }
     var onChoose: (() -> Void)?
+    var onContextMenu: ((NSEvent) -> NSMenu?)?
     var onDragBegan: (() -> Void)?
     var onDragEnded: (() -> Void)?
     private var mouseDownPoint: CGPoint?
@@ -250,7 +303,11 @@ enum ProjectPhotoGroupDragPayload {
     }
 
     override func mouseDown(with event: NSEvent) {
-        guard isActive, groupID != nil, !event.modifierFlags.contains(.control) else { return }
+        guard isActive, groupID != nil else { return }
+        if event.modifierFlags.contains(.control) {
+            rightMouseDown(with: event)
+            return
+        }
         mouseDownPoint = convert(event.locationInWindow, from: nil)
     }
 
@@ -261,6 +318,17 @@ enum ProjectPhotoGroupDragPayload {
         isDragging = true
         onDragBegan?()
         beginGroupDragging(with: event, item: ProjectPhotoGroupDragPayload.item(for: groupID))
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard isActive else { return nil }
+        mouseDownPoint = nil
+        return onContextMenu?(event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard let menu = menu(for: event) else { return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -329,6 +397,7 @@ enum ProjectPhotoGroupDragPayload {
         isActive = false
         finishDrag()
         onChoose = nil
+        onContextMenu = nil
         onDragBegan = nil
         onDragEnded = nil
         discardCursorRects()
