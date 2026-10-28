@@ -10,6 +10,16 @@ final class ProjectMaterialDragState: ObservableObject {
     private init() {}
 }
 
+/// One viewport-sized request. Pixel density is measured by AppKit, while the
+/// cache chooses a small number of reusable resolution tiers.
+struct ProjectThumbnailDemand: Equatable {
+    var visibleIDs: Set<UUID>
+    var prefetchIDs: Set<UUID>
+    var maximumPixelSize: Int
+
+    var assetIDs: Set<UUID> { visibleIDs.union(prefetchIDs) }
+}
+
 /// Materials wrap to the viewport; group rows keep their compact horizontal layout.
 struct ProjectMaterialBoard: NSViewRepresentable {
     static let assetPasteboardType = NSPasteboard.PasteboardType("com.aoipic.project-assets")
@@ -27,6 +37,7 @@ struct ProjectMaterialBoard: NSViewRepresentable {
     var onImport: ([URL], CGPoint) -> Void
     var onActivate: (UUID) -> Void
     var onVisibleAssets: (Set<UUID>) -> Void = { _ in }
+    var onThumbnailDemand: (ProjectThumbnailDemand) -> Void = { _ in }
     var onViewportChange: (CGSize) -> Void = { _ in }
     var operations: [ProjectOperation] = ProjectOperation.allCases
     var onSend: (ProjectOperation, Set<UUID>) -> Void = { _, _ in }
@@ -38,11 +49,21 @@ struct ProjectMaterialBoard: NSViewRepresentable {
     var isGroupRow = false
     var onFocus: () -> Void = {}
     var onDropAssets: ((Set<UUID>) -> Void)? = nil
+    var onGroupChoose: () -> Void = {}
+    var onGroupClearSelection: () -> Void = {}
+    var isGroupSelected = false
+    var groupDragID: UUID? = nil
+    var onGroupDragBegan: () -> Void = {}
+    var onGroupDragEnded: () -> Void = {}
+    var onGroupDragHover: (UUID, Bool) -> Bool = { _, _ in false }
+    var onGroupDragExit: () -> Void = {}
+    var onDropGroup: (UUID, Bool) -> Bool = { _, _ in false }
+    var onAssetDropTargetChange: (Bool) -> Void = { _ in }
     var focusRequest = 0
     var onReorder: (([UUID]) -> Void)? = nil
     var onThumbnailResize: ((CGFloat) -> Void)? = nil
 
-    func makeNSView(context: Context) -> NSScrollView {
+    func makeNSView(context: Context) -> NSView {
         let scroll = ProjectMaterialScrollView()
         scroll.isGroupRow = isGroupRow
         scroll.hasVerticalScroller = !isGroupRow
@@ -56,12 +77,29 @@ struct ProjectMaterialBoard: NSViewRepresentable {
         scroll.contentView.wantsLayer = true
         scroll.contentView.layer?.masksToBounds = true
         scroll.documentView = ProjectMaterialDocumentView(frame: .zero)
-        updateNSView(scroll, context: context)
-        return scroll
+        let view: NSView = isGroupRow ? ProjectPhotoGroupContainerView(scrollView: scroll) : scroll
+        updateNSView(view, context: context)
+        return view
     }
 
-    func updateNSView(_ scroll: NSScrollView, context: Context) {
+    func updateNSView(_ view: NSView, context: Context) {
+        let groupContainer = view as? ProjectPhotoGroupContainerView
+        guard let scroll = groupContainer?.scrollView ?? (view as? NSScrollView) else { return }
         guard let board = scroll.documentView as? ProjectMaterialDocumentView else { return }
+        if let groupContainer {
+            groupContainer.groupID = groupDragID
+            groupContainer.memberCount = assets.count
+            groupContainer.isSelected = isGroupSelected
+            groupContainer.onChoose = onGroupChoose
+            groupContainer.onGroupDragBegan = onGroupDragBegan
+            groupContainer.onGroupDragEnded = onGroupDragEnded
+            groupContainer.onGroupDragHover = onGroupDragHover
+            groupContainer.onGroupDragExit = onGroupDragExit
+            groupContainer.onDropGroup = onDropGroup
+            groupContainer.onDropAssets = onDropAssets
+            groupContainer.onAssetDropTargetChange = onAssetDropTargetChange
+            groupContainer.isActive = isActive
+        }
         let selectionBinding = $selection
         let zoomBinding = $viewZoom
         board.onSelectionChange = { selectionBinding.wrappedValue = $0 }
@@ -69,6 +107,7 @@ struct ProjectMaterialBoard: NSViewRepresentable {
         board.onImport = onImport
         board.onActivate = onActivate
         board.onVisibleAssets = onVisibleAssets
+        board.onThumbnailDemand = onThumbnailDemand
         board.onViewportChange = onViewportChange
         board.onSend = onSend
         board.onGather = onGather
@@ -79,6 +118,7 @@ struct ProjectMaterialBoard: NSViewRepresentable {
         board.isGroupRow = isGroupRow
         board.onFocus = onFocus
         board.onDropAssets = onDropAssets
+        board.onGroupClearSelection = onGroupClearSelection
         board.onReorder = onReorder
         board.onThumbnailResize = onThumbnailResize
         board.onZoomChange = { zoomBinding.wrappedValue = Double($0) }
@@ -86,6 +126,10 @@ struct ProjectMaterialBoard: NSViewRepresentable {
                         viewZoom: viewZoom, fitRequest: fitRequest, thumbnails: thumbnails, assetURLs: assetURLs,
                         badges: badges, operations: operations, isActive: isActive)
         board.requestFocus(focusRequest)
+    }
+
+    static func dismantleNSView(_ view: NSView, coordinator: ()) {
+        (view as? ProjectPhotoGroupContainerView)?.disconnect()
     }
 }
 
@@ -114,12 +158,13 @@ private final class ProjectMaterialScrollView: ProjectOverlayScrollView {
     }
 }
 
-private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     var onSelectionChange: ((Set<UUID>) -> Void)?
     var onMove: (([UUID: CGPoint]) -> Void)?
     var onImport: (([URL], CGPoint) -> Void)?
     var onActivate: ((UUID) -> Void)?
     var onVisibleAssets: ((Set<UUID>) -> Void)?
+    var onThumbnailDemand: ((ProjectThumbnailDemand) -> Void)?
     var onViewportChange: ((CGSize) -> Void)?
     var onZoomChange: ((CGFloat) -> Void)?
     var onSend: ((ProjectOperation, Set<UUID>) -> Void)?
@@ -131,12 +176,19 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     var isGroupRow = false
     var onFocus: (() -> Void)?
     var onDropAssets: ((Set<UUID>) -> Void)?
+    var onGroupClearSelection: (() -> Void)?
     var onReorder: (([UUID]) -> Void)?
     var onThumbnailResize: ((CGFloat) -> Void)?
 
     private var assets: [ProjectAsset] = []
     private var selectedIDs: Set<UUID> = []
+    // SwiftUI supplies a moving viewport snapshot, not an authoritative list of
+    // loaded images. Keep recent decoded previews across snapshot changes.
+    private static let retainedThumbnailLimit = 256
     private var thumbnails: [UUID: NSImage] = [:]
+    private var thumbnailSources: [UUID: ThumbnailSource] = [:]
+    private var thumbnailLastUse: [UUID: UInt64] = [:]
+    private var thumbnailClock: UInt64 = 0
     private var assetURLs: [UUID: URL] = [:]
     private var badges: [UUID: String] = [:]
     private var operations: [ProjectOperation] = []
@@ -144,6 +196,10 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     private var contextMenuSelection: Set<UUID> = []
     private var contextMenuPoint = CGPoint.zero
     private var previewItems: [NSURL] = []
+    // Keep the preview order independent from the live selection. Finder keeps
+    // the selected set available while Quick Look moves the active item.
+    private var previewAssetIDs: [UUID] = []
+    private var previewIndex = 0
     private var pendingSelection: Set<UUID>?
     private var lastPublishedSelection: Set<UUID> = []
     private var lastExternalSelection: Set<UUID> = []
@@ -157,19 +213,23 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     private let marqueeLayer = CAShapeLayer()
     private let insertionLayer = CAShapeLayer()
     private var insertionIndex: Int?
-    private lazy var titleAttributes: [NSAttributedString.Key: Any] = {
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .center
-        paragraph.lineBreakMode = .byTruncatingMiddle
-        return [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.labelColor,
-                .paragraphStyle: paragraph]
-    }()
     private var tooltipRevision = -1
     private var tooltipAssetIDs: [UUID] = []
 
     private struct Bucket: Hashable {
         var x: Int
         var y: Int
+    }
+    private struct ThumbnailSource: Equatable {
+        var fileName: String
+        var url: URL?
+        var revision: UUID?
+
+        init(asset: ProjectAsset, url: URL?) {
+            fileName = asset.fileName
+            self.url = url
+            revision = asset.contentRevision
+        }
     }
     private var thumbnailSize: CGFloat = 120
     private var zoom: CGFloat = 1
@@ -192,6 +252,7 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     private var extraDragExtent = CGSize.zero
     private var acceptsFileDrop = false
     private var lastVisibleIDs: Set<UUID>?
+    private var lastThumbnailDemand: ProjectThumbnailDemand?
     private var visibleAssetsReportScheduled = false
 
     private struct MaterialDrag {
@@ -202,12 +263,15 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     }
 
     override var isFlipped: Bool { true }
+    override var isOpaque: Bool { true }
     override var acceptsFirstResponder: Bool { isActive }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        clipsToBounds = true
         wantsLayer = true
+        layer?.actions = ["contents": NSNull()]
         marqueeLayer.actions = ["path": NSNull(), "hidden": NSNull()]
         marqueeLayer.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor
         marqueeLayer.strokeColor = NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor
@@ -240,6 +304,12 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         marqueeLayer.frame = bounds
         insertionLayer.frame = bounds
         CATransaction.commit()
+        scheduleVisibleAssetsReport()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        scheduleVisibleAssetsReport()
     }
 
     func configure(assets: [ProjectAsset], selection: Set<UUID>, thumbnailSize: CGFloat,
@@ -267,12 +337,15 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         let size = ProjectMaterialLayout(thumbnailSize: thumbnailSize).thumbnailSize
         let sizeChanged = self.thumbnailSize != size
         let badgeChanged = self.badges != badges
-        let changedThumbnails: Set<UUID> = Set(thumbnails.compactMap { id, image in
-            self.thumbnails[id] === image ? nil : id
-        }).union(self.thumbnails.keys.filter { thumbnails[$0] == nil })
+        let namesChanged = self.assets.count != assets.count || zip(self.assets, assets).contains { previous, updated in
+            previous.name != updated.name
+        }
+        let indices = assetGeometryChanged
+            ? Dictionary(uniqueKeysWithValues: assets.enumerated().map { ($0.element.id, $0.offset) })
+            : assetIndices
+        let changedThumbnails = mergeThumbnails(thumbnails, assets: assets, indices: indices, urls: assetURLs)
         self.assets = assets
         self.thumbnailSize = size
-        self.thumbnails = thumbnails
         self.assetURLs = assetURLs
         self.badges = badges
         self.operations = operations
@@ -313,12 +386,65 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         } else {
             invalidateCards(changedThumbnails)
         }
-        if badgeChanged { tooltipRevision = -1 }
+        if badgeChanged || namesChanged { tooltipRevision = -1 }
         scheduleVisibleAssetsReport()
     }
 
     private var cardSize: CGSize { ProjectMaterialLayout(thumbnailSize: thumbnailSize).cardSize }
     private var displayScale: CGFloat { isGroupRow ? zoom : (gridLayout?.scale ?? zoom) }
+
+    private func mergeThumbnails(_ incoming: [UUID: NSImage], assets: [ProjectAsset],
+                                 indices: [UUID: Int], urls: [UUID: URL]) -> Set<UUID> {
+        var changed = Set<UUID>()
+        func discard(_ id: UUID) {
+            thumbnails.removeValue(forKey: id)
+            thumbnailSources.removeValue(forKey: id)
+            thumbnailLastUse.removeValue(forKey: id)
+            changed.insert(id)
+        }
+        for id in Array(thumbnails.keys) {
+            guard let index = indices[id], !assets[index].isRemoved,
+                  thumbnailSources[id] == ThumbnailSource(asset: assets[index], url: urls[id]) else {
+                discard(id)
+                continue
+            }
+        }
+        thumbnailClock &+= 1
+        for (id, image) in incoming {
+            guard let index = indices[id], !assets[index].isRemoved else { continue }
+            if let retained = thumbnails[id], Self.pixelCost(retained) > Self.pixelCost(image) {
+                thumbnailLastUse[id] = thumbnailClock
+                continue
+            }
+            if thumbnails[id] !== image { changed.insert(id) }
+            thumbnails[id] = image
+            thumbnailSources[id] = ThumbnailSource(asset: assets[index], url: urls[id])
+            thumbnailLastUse[id] = thumbnailClock
+        }
+
+        // Only visible images are pinned. Prefetch arrivals may be evicted to
+        // keep large Retina thumbnails within the same bounded memory budget.
+        let visible = visibleRect
+        let pinned = Set(thumbnails.keys.filter { geometry[$0]?.intersects(visible) == true })
+        let limit = max(Self.retainedThumbnailLimit, pinned.count)
+        let costLimit = (isGroupRow ? 8 : 32) * 1024 * 1024
+        var cost = thumbnails.values.reduce(0) { $0 + Self.pixelCost($1) }
+        if thumbnails.count > limit || cost > costLimit {
+            let evictionOrder = thumbnails.keys.filter { !pinned.contains($0) }.sorted {
+                (thumbnailLastUse[$0] ?? 0) < (thumbnailLastUse[$1] ?? 0)
+            }
+            for id in evictionOrder {
+                guard thumbnails.count > limit || cost > costLimit else { break }
+                if let image = thumbnails[id] { cost -= Self.pixelCost(image) }
+                discard(id)
+            }
+        }
+        return changed
+    }
+
+    private static func pixelCost(_ image: NSImage) -> Int {
+        image.representations.map { max(0, $0.pixelsWide) * max(0, $0.pixelsHigh) * 4 }.max() ?? 0
+    }
 
     private func rebuildGeometry() {
         if isGroupRow {
@@ -346,6 +472,7 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     }
 
     private func buckets(intersecting rect: CGRect) -> [Bucket] {
+        guard isFiniteVisibleRect(rect) else { return [] }
         let side: CGFloat = 256
         let x0 = Int(floor(rect.minX / side)), x1 = Int(floor(rect.maxX / side))
         let y0 = Int(floor(rect.minY / side)), y1 = Int(floor(rect.maxY / side))
@@ -354,6 +481,7 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     }
 
     private func assetIDs(intersecting rect: CGRect) -> Set<UUID> {
+        guard isFiniteVisibleRect(rect) else { return [] }
         let bucketCount = (floor(rect.width / 256) + 2) * (floor(rect.height / 256) + 2)
         if bucketCount > CGFloat(max(32, spatialBuckets.count * 2)) {
             return Set(geometry.compactMap { $0.value.intersects(rect) ? $0.key : nil })
@@ -362,6 +490,11 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
             $0.formUnion(spatialBuckets[$1] ?? [])
         }
         return Set(candidates.filter { geometry[$0]?.intersects(rect) == true })
+    }
+
+    private func isFiniteVisibleRect(_ rect: CGRect) -> Bool {
+        !rect.isNull && !rect.isInfinite && !rect.isEmpty
+            && rect.minX.isFinite && rect.minY.isFinite && rect.maxX.isFinite && rect.maxY.isFinite
     }
 
     private func invalidateCards(_ ids: Set<UUID>) {
@@ -522,8 +655,20 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
                 self.onViewportChange?(viewport)
             }
             let visible = self.visibleRect
-            let prefetchRect = visible.insetBy(dx: -80, dy: -80)
+            let pixels = max(1, Int(ceil(self.thumbnailSize * self.displayScale
+                                        * (self.window?.backingScaleFactor ?? 1))))
+            // Never convert unbounded geometry into a spatial bucket. An empty
+            // demand releases queued work without clearing already-drawn pixels.
+            guard self.isActive, self.isFiniteVisibleRect(visible) else {
+                self.publishThumbnailDemand(ProjectThumbnailDemand(visibleIDs: [], prefetchIDs: [],
+                                                                   maximumPixelSize: pixels))
+                return
+            }
+            let prefetchRect = visible.insetBy(
+                dx: -(self.isGroupRow ? max(80, self.cardSize.width * self.displayScale + 12) : 80),
+                dy: -(self.isGroupRow ? 80 : max(80, self.cardSize.height * self.displayScale + 12)))
             let ids = self.assetIDs(intersecting: prefetchRect)
+            let visibleIDs = self.assetIDs(intersecting: visible)
             let candidates = ids.compactMap { id -> Int? in
                 self.geometry[id]?.intersects(visible) == true ? self.assetIndices[id] : nil
             }.sorted().map { self.assets[$0] }
@@ -533,10 +678,20 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
                 self.tooltipAssetIDs = tooltipIDs
                 self.tooltipRevision = self.geometryRevision
             }
-            guard self.lastVisibleIDs != ids else { return }
-            self.lastVisibleIDs = ids
-            self.onVisibleAssets?(ids)
+            if self.lastVisibleIDs != ids {
+                self.lastVisibleIDs = ids
+                self.onVisibleAssets?(ids)
+            }
+            self.publishThumbnailDemand(ProjectThumbnailDemand(visibleIDs: visibleIDs,
+                                                                prefetchIDs: ids.subtracting(visibleIDs),
+                                                                maximumPixelSize: pixels))
         }
+    }
+
+    private func publishThumbnailDemand(_ demand: ProjectThumbnailDemand) {
+        guard lastThumbnailDemand != demand else { return }
+        lastThumbnailDemand = demand
+        onThumbnailDemand?(demand)
     }
 
     private func updateTooltips(for visibleAssets: [ProjectAsset]) {
@@ -557,9 +712,31 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         }.max(by: { $0.0 < $1.0 })?.1
     }
 
+    private func thumbnailAsset(at point: CGPoint) -> ProjectAsset? {
+        let candidates = spatialBuckets[Bucket(x: Int(floor(point.x / 256)), y: Int(floor(point.y / 256)))] ?? []
+        return candidates.compactMap { id -> (Int, ProjectAsset)? in
+            guard let index = assetIndices[id], let card = geometry[id] else { return nil }
+            let imageRect = CGRect(x: card.minX + 8 * displayScale,
+                                   y: card.minY + 8 * displayScale,
+                                   width: thumbnailSize * displayScale,
+                                   height: thumbnailSize * displayScale)
+            let photoRect = thumbnails[id].map { fittedImageRect($0, in: imageRect) } ?? imageRect
+            guard photoRect.contains(point) else { return nil }
+            return (index, assets[index])
+        }.max(by: { $0.0 < $1.0 })?.1
+    }
+
+    private func fittedImageRect(_ image: NSImage, in rect: CGRect) -> CGRect {
+        guard image.size.width > 0, image.size.height > 0 else { return rect }
+        let scale = min(rect.width / image.size.width, rect.height / image.size.height)
+        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        return CGRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill()
-        dirtyRect.fill()
+        dirtyRect.intersection(bounds).fill()
         let draggedIDs = Set(dragContext?.ids ?? [])
         let drawingIDs = assetIDs(intersecting: dirtyRect)
         for index in drawingIDs.compactMap({ assetIndices[$0] }).sorted() {
@@ -586,33 +763,24 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         if selectedIDs.contains(asset.id) {
             let card = NSBezierPath(roundedRect: rect.insetBy(dx: min(1, rect.width / 8), dy: min(1, rect.height / 8)),
                                     xRadius: min(8, rect.width / 8), yRadius: min(8, rect.height / 8))
-            NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
+            NSColor.controlAccentColor.withAlphaComponent(0.06).setFill()
             card.fill()
             NSColor.controlAccentColor.setStroke()
-            card.lineWidth = 1.5
+            card.lineWidth = 1
             card.stroke()
         }
         let imageRect = CGRect(x: rect.minX + 8 * displayScale, y: rect.minY + 8 * displayScale,
                                width: thumbnailSize * displayScale, height: thumbnailSize * displayScale)
         if let image = thumbnails[asset.id], image.size.width > 0, image.size.height > 0 {
-            let scale = min(imageRect.width / image.size.width, imageRect.height / image.size.height)
-            let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-            let destination = CGRect(x: imageRect.midX - size.width / 2, y: imageRect.midY - size.height / 2,
-                                     width: size.width, height: size.height)
+            let destination = fittedImageRect(image, in: imageRect)
             image.draw(in: destination, from: .zero, operation: .sourceOver, fraction: 1,
-                       respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high.rawValue])
+                       respectFlipped: true, hints: [.interpolation: NSImageInterpolation.medium.rawValue])
         } else if let placeholder = NSImage(systemSymbolName: "photo", accessibilityDescription: nil) {
             let side = min(36 * displayScale, imageRect.width)
             let symbolRect = CGRect(x: imageRect.midX - side / 2, y: imageRect.midY - side / 2, width: side, height: side)
             placeholder.draw(in: symbolRect, from: .zero, operation: .sourceOver, fraction: 0.4,
                              respectFlipped: true, hints: nil)
         }
-        let titleFont: CGFloat = 11
-        let titleY = imageRect.maxY + 5
-        guard rect.width >= 36, rect.maxY - titleY >= titleFont + 2 else { return }
-        let titleRect = CGRect(x: rect.minX + 3 * displayScale, y: titleY,
-                               width: rect.width - 6 * displayScale, height: titleFont + 5)
-        (asset.name as NSString).draw(in: titleRect, withAttributes: titleAttributes)
     }
 
     private func updateSelection(_ ids: Set<UUID>) {
@@ -639,8 +807,12 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         menu.autoenablesItems = false
         let point = convert(event.locationInWindow, from: nil)
         contextMenuPoint = logicalPoint(point)
-        if let hit = asset(at: point) {
+        let hit = thumbnailAsset(at: point)
+        if let hit {
             if !selectedIDs.contains(hit.id) { updateSelection([hit.id]) }
+        } else if isGroupRow {
+            updateSelection([])
+            onGroupClearSelection?()
         }
         contextMenuSelection = selectedIDs
         if !contextMenuSelection.isEmpty {
@@ -722,7 +894,15 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         marqueeRect = nil
         marqueeLayer.path = nil
         let additive = event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.command)
-        guard let hit = asset(at: mouseDownPoint) else {
+        // The dedicated leading handle selects or moves a group. Thumbnail
+        // clicks select a photo; gaps and trailing space clear the selection.
+        let hit = thumbnailAsset(at: mouseDownPoint)
+        guard let hit else {
+            if isGroupRow {
+                updateSelection([])
+                onGroupClearSelection?()
+                return
+            }
             marqueeBaseSelection = additive ? selectedIDs : []
             updateSelection(marqueeBaseSelection)
             marqueeStart = mouseDownPoint
@@ -1001,7 +1181,7 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         }
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         if let panel = visiblePreviewPanel {
-            if [49, 53].contains(event.keyCode), modifiers.isEmpty, !event.isARepeat { closePreview(panel) }
+            if handlePreviewKey(event, panel: panel, modifiers: modifiers) { return }
             return
         }
         let actionKeys: Set<UInt16> = [36, 49, 51, 76, 117]
@@ -1021,7 +1201,7 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         } else if [36, 76].contains(event.keyCode), modifiers.isEmpty, selectedIDs.count >= 2, !isGroupRow {
             onGather?(selectedIDs, .zero)
         } else if [123, 124, 125, 126].contains(event.keyCode), modifiers.isSubset(of: [.shift]) {
-            moveSelectionWithArrow(event.keyCode, step: modifiers.contains(.shift) ? 10 : 1)
+            navigateSelectionWithArrow(event.keyCode)
         } else {
             super.keyDown(with: event)
         }
@@ -1039,22 +1219,58 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
             closePreview(panel)
             return
         }
-        previewItems = assets.filter { selectedIDs.contains($0.id) }
-            .compactMap { assetURLs[$0.id].map { $0 as NSURL } }
-        guard !previewItems.isEmpty, let panel = QLPreviewPanel.shared() else { return }
-        // Let Quick Look acquire this responder before changing its data source or delegate.
-        panel.updateController()
-        panel.makeKeyAndOrderFront(self)
-        guard panel.dataSource === self else { return }
-        panel.reloadData()
-        panel.currentPreviewItemIndex = 0
+        guard let panel = QLPreviewPanel.shared() else { return }
+        presentPreview(acquireControl: {
+            panel.updateController()
+            guard let controller = panel.currentController as? ProjectMaterialDocumentView,
+                  controller === self else { return false }
+            // Closing clears our datasource, but Quick Look can retain this
+            // controller while hidden and omit a second begin callback.
+            panel.dataSource = self
+            panel.delegate = self
+            return true
+        }, synchronize: {
+            self.synchronizePreviewPanel(panel)
+        }, show: {
+            panel.makeKeyAndOrderFront(self)
+        })
     }
+
+    /// Keep the first visible frame behind the same preparation barrier for
+    /// both initial presentation and reopening on a different selected photo.
+    /// Closures allow regression checks without showing the system panel.
+    @discardableResult
+    func presentPreview(acquireControl: () -> Bool, synchronize: () -> Void, show: () -> Void) -> Bool {
+        guard isActive else { return false }
+        let candidates = assets.filter { assetURLs[$0.id] != nil }
+        previewAssetIDs = candidates.map(\.id)
+        previewItems = candidates.compactMap { assetURLs[$0.id].map { $0 as NSURL } }
+        guard !previewItems.isEmpty else { return false }
+        previewIndex = previewAssetIDs.firstIndex(where: { selectedIDs.contains($0) }) ?? 0
+        // updateController may invoke beginPreviewPanelControl, which must also
+        // synchronize before returning. Never expose a panel that still points
+        // at index zero or at the previous controller's data source.
+        guard acquireControl() else { return false }
+        synchronize()
+        show()
+        return true
+    }
+
+    private func synchronizePreviewPanel(_ panel: QLPreviewPanel) {
+        guard panel.dataSource === self, !previewItems.isEmpty else { return }
+        panel.reloadData()
+        panel.currentPreviewItemIndex = previewIndex
+    }
+
+    var preparedPreviewIndex: Int { previewIndex }
 
     private func closePreview(_ panel: QLPreviewPanel, restoreFocus: Bool = true) {
         panel.orderOut(self)
         if panel.dataSource === self { panel.dataSource = nil }
         if panel.delegate === self { panel.delegate = nil }
         previewItems = []
+        previewAssetIDs = []
+        previewIndex = 0
         if restoreFocus, isActive { window?.makeFirstResponder(self) }
     }
 
@@ -1066,6 +1282,7 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         guard isActive else { return }
         panel.dataSource = self
         panel.delegate = self
+        synchronizePreviewPanel(panel)
     }
 
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
@@ -1081,9 +1298,9 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
-        guard let event, event.type == .keyDown, [49, 53].contains(event.keyCode) else { return false }
-        if !event.isARepeat { closePreview(panel) }
-        return true
+        guard let event, event.type == .keyDown else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        return handlePreviewKey(event, panel: panel, modifiers: modifiers)
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -1115,27 +1332,62 @@ private final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPre
         return true
     }
 
-    private func moveSelectionWithArrow(_ key: UInt16, step: CGFloat) {
-        let selected = assets.filter { selectedIDs.contains($0.id) }
-        guard !selected.isEmpty else { return }
-        if !isGroupRow {
-            guard let onReorder, let gridLayout,
-                  let first = assets.firstIndex(where: { selectedIDs.contains($0.id) }),
-                  let last = assets.lastIndex(where: { selectedIDs.contains($0.id) }) else { return }
-            let delta = key == 123 ? -1 : key == 124 ? 1 : key == 126 ? -gridLayout.columns : gridLayout.columns
-            let boundary = delta < 0 ? first + delta : last + 1 + delta
-            let ids = assets.map(\.id)
-            let next = ProjectMaterialGridLayout.reordered(ids, moving: selectedIDs, insertionIndex: boundary)
-            if next != ids { onReorder(next) }
-            return
+    private func handlePreviewKey(_ event: NSEvent, panel: QLPreviewPanel,
+                                  modifiers: NSEvent.ModifierFlags) -> Bool {
+        guard modifiers.isEmpty else { return false }
+        if [49, 53].contains(event.keyCode) {
+            if !event.isARepeat { closePreview(panel) }
+            return true
         }
-        var dx: CGFloat = key == 123 ? -step : (key == 124 ? step : 0)
-        var dy: CGFloat = key == 126 ? -step : (key == 125 ? step : 0)
-        dx = max(dx, -(selected.map { $0.position.x }.min() ?? 0))
-        dy = max(dy, -(selected.map { $0.position.y }.min() ?? 0))
-        guard dx != 0 || dy != 0 else { return }
-        onMove?(Dictionary(uniqueKeysWithValues: selected.map {
-            ($0.id, CGPoint(x: $0.position.x + dx, y: $0.position.y + dy))
-        }))
+        guard [123, 124, 125, 126].contains(event.keyCode) else { return false }
+        navigatePreview(with: event.keyCode, panel: panel)
+        return true
+    }
+
+    private func navigatePreview(with key: UInt16, panel: QLPreviewPanel) {
+        navigatePreview(with: key) { panel.currentPreviewItemIndex = $0 }
+    }
+
+    func navigatePreview(with key: UInt16, setDisplayedIndex: (Int) -> Void) {
+        guard !previewAssetIDs.isEmpty else { return }
+        guard [123, 124, 125, 126].contains(key) else { return }
+        let delta = (key == 123 || key == 126) ? -1 : 1
+        let next = min(max(0, previewIndex + delta), previewAssetIDs.count - 1)
+        guard next != previewIndex else { return }
+        previewIndex = next
+        setDisplayedIndex(next)
+        updateSelection([previewAssetIDs[next]])
+        revealAsset(previewAssetIDs[next])
+    }
+
+    private func navigateSelectionWithArrow(_ key: UInt16) {
+        guard !assets.isEmpty else { return }
+        let columns = isGroupRow ? max(1, assets.count) : max(1, gridLayout?.columns ?? 1)
+        let delta: Int
+        switch key {
+        case 123: delta = -1
+        case 124: delta = 1
+        case 126: delta = -columns
+        case 125: delta = columns
+        default: return
+        }
+        let selectedIndices = assets.indices.filter { selectedIDs.contains(assets[$0].id) }
+        let anchor = delta < 0 ? selectedIndices.first : selectedIndices.last
+        let current = anchor ?? (delta < 0 ? assets.count : -1)
+        let target = min(max(0, current + delta), assets.count - 1)
+        guard target != current || anchor == nil else { return }
+        updateSelection([assets[target].id])
+        revealAsset(assets[target].id)
+    }
+
+    private func revealAsset(_ id: UUID) {
+        guard let rect = geometry[id], let scrollView = enclosingScrollView else { return }
+        let visible = scrollView.contentView.bounds
+        var origin = visible.origin
+        if rect.minX < visible.minX { origin.x = rect.minX - 8 }
+        else if rect.maxX > visible.maxX { origin.x = rect.maxX - visible.width + 8 }
+        if rect.minY < visible.minY { origin.y = rect.minY - 8 }
+        else if rect.maxY > visible.maxY { origin.y = rect.maxY - visible.height + 8 }
+        scroll(to: origin)
     }
 }

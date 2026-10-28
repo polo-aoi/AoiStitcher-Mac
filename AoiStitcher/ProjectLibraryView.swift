@@ -20,11 +20,17 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @StateObject private var library = ProjectLibraryStore()
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
+    @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
+    @State private var mode = "library"
+    @State private var homeRequest = 0
+    @State private var workspaceBusy = false
 
     var body: some View {
         Group {
             if let project = library.currentProject {
-                ProjectWorkspaceView(library: library, projectID: project.id)
+                ProjectWorkspaceView(library: library, projectID: project.id,
+                                     mode: $mode, homeRequest: homeRequest,
+                                     navigationBusy: $workspaceBusy)
                     .id(project.id)
             } else {
                 ProjectHomeView(library: library)
@@ -32,6 +38,19 @@ struct ContentView: View {
         }
         .frame(minWidth: 1020, minHeight: 740)
         .preferredColorScheme(theme == 2 ? .dark : .light)
+        .background {
+            ProjectWindowNavigation(
+                selectedWorkspace: library.currentProject == nil ? nil : mode,
+                workspaces: AppPreferences.workspaceOrder(from: storedWorkspaceOrder),
+                homeEnabled: !workspaceBusy && !library.isImporting,
+                onHome: { if library.currentProject != nil { homeRequest += 1 } },
+                onSelectWorkspace: { mode = $0 }
+            ).frame(width: 0, height: 0)
+        }
+        .onChange(of: library.currentProject?.id) { _, _ in
+            mode = "library"
+            workspaceBusy = false
+        }
         .onAppear { ProjectLibraryLifecycle.library = library }
         .alert("项目素材库", isPresented: Binding(
             get: { library.message != nil },
@@ -39,6 +58,11 @@ struct ContentView: View {
         )) {
             Button("确定") { library.message = nil }
         } message: { Text(library.message ?? "") }
+        .sheet(item: $library.duplicateImportRequest, onDismiss: {
+            library.cancelDuplicateImport()
+        }) { prompt in
+            ProjectDuplicateImportView(library: library, prompt: prompt)
+        }
     }
 }
 
@@ -175,25 +199,15 @@ private struct ProjectHomeView: View {
 private struct ProjectWorkspaceView: View {
     @ObservedObject var library: ProjectLibraryStore
     let projectID: UUID
-    @State private var mode = "library"
+    @Binding var mode: String
+    let homeRequest: Int
+    @Binding var navigationBusy: Bool
     @StateObject private var bridge = ProjectEditorBridge()
     @StateObject private var canvasStore = CanvasStore()
     @StateObject private var gridCollageStore = GridCollageStore()
     @State private var isMaterialDispatchPresented = false
-    @State private var pendingProjectChange: ProjectChange?
-    @State private var confirmsProjectChange = false
-    @State private var showsNewProject = false
-    @State private var newProjectName = ""
-    @State private var stagedNewProjectName: String?
+    @State private var confirmsReturnHome = false
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
-    @AppStorage("projectLibrary.showsProjectSidebar") private var showsProjects = false
-    @AppStorage("projectLibrary.showsGroupSidebar") private var showsGroups = true
-    @AppStorage("projectLibrary.projectSidebarWidth") private var projectSidebarWidth = 220.0
-
-    private enum ProjectChange {
-        case existing(UUID)
-        case create(String)
-    }
 
     private var isBusy: Bool {
         library.isImporting || bridge.activeExportCount > 0 || bridge.request != nil
@@ -201,170 +215,55 @@ private struct ProjectWorkspaceView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Button { showsProjects.toggle() } label: { Image(systemName: "sidebar.left") }
-                    .help(showsProjects ? "收起项目列表" : "显示项目列表")
-                    .accessibilityLabel("项目侧栏")
-                    .foregroundStyle(showsProjects ? Color.accentColor : Color.primary)
-                Text(library.currentProject?.name ?? "项目")
-                    .font(.headline).lineLimit(1).truncationMode(.middle)
-                    .frame(minWidth: 70, idealWidth: 170, maxWidth: 230, alignment: .leading)
-                    .layoutPriority(-1)
-                Spacer(minLength: 0)
-                HStack(spacing: 2) {
-                    Button { mode = "library" } label: {
-                        Label("项目素材", systemImage: "square.grid.3x3")
-                            .font(.callout.weight(mode == "library" ? .semibold : .regular))
-                            .padding(.horizontal, 10).padding(.vertical, 7)
-                            .background(mode == "library" ? Color.accentColor.opacity(0.13) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
-                    }.buttonStyle(.plain)
-                    ForEach(AppPreferences.workspaceOrder(from: storedWorkspaceOrder)) { workspace in
-                        workspaceNavigation(workspace)
-                    }
-                }.fixedSize()
-                Spacer(minLength: 0)
-                if bridge.activeExportCount > 0 { ProgressView().controlSize(.small) }
-                Button { showsGroups.toggle() } label: { Image(systemName: "sidebar.right") }
-                    .help(showsGroups ? "收起照片组" : "显示照片组")
-                    .accessibilityLabel("照片组侧栏")
-                    .foregroundStyle(showsGroups ? Color.accentColor : Color.primary)
-                    .disabled(mode != "library")
-                    .opacity(mode == "library" ? 1 : 0)
-            }.buttonStyle(.borderless).padding(.horizontal, 12).padding(.vertical, 8)
-            Divider()
-            ProjectSidebarSplit(isPresented: showsProjects, width: $projectSidebarWidth, edge: .leading,
-                                sidebarMinimum: 180, sidebarMaximum: 320, contentMinimum: 660) {
-                projectSidebar
-            } content: {
-                ZStack {
-                    ProjectLibraryView(library: library, projectID: projectID,
-                                       isActive: mode == "library" && library.currentProject?.id == projectID,
-                                       showsGroups: $showsGroups,
-                                       isDispatchPresented: $isMaterialDispatchPresented) { operation, urls, importMode in
-                        guard bridge.send(operation: operation, urls: urls, mode: importMode) else {
-                            library.message = "目标工具正在处理，或添加后超过容量限制。请稍后重试。"
-                            return false
-                        }
-                        mode = operation.rawValue
-                        return true
-                    }
-                    .opacity(mode == "library" ? 1 : 0)
-                    .allowsHitTesting(mode == "library")
-                    .disabled(mode != "library")
-                    .accessibilityHidden(mode != "library")
-                    ForEach(AppPreferences.workspaceOrder(from: storedWorkspaceOrder)) { workspace in
-                        workspaceView(workspace)
-                            .opacity(mode == workspace.rawValue ? 1 : 0)
-                            .allowsHitTesting(mode == workspace.rawValue)
-                            .disabled(mode != workspace.rawValue)
-                            .accessibilityHidden(mode != workspace.rawValue)
-                    }
-                }.padding(8)
+        ZStack {
+            ProjectLibraryView(library: library, projectID: projectID,
+                               isActive: mode == "library" && library.currentProject?.id == projectID,
+                               isDispatchPresented: $isMaterialDispatchPresented) { operation, urls, importMode in
+                guard bridge.send(operation: operation, urls: urls, mode: importMode) else {
+                    library.message = "目标工具正在处理，或添加后超过容量限制。请稍后重试。"
+                    return false
+                }
+                mode = operation.rawValue
+                return true
+            }
+            .opacity(mode == "library" ? 1 : 0)
+            .allowsHitTesting(mode == "library")
+            .disabled(mode != "library")
+            .accessibilityHidden(mode != "library")
+            ForEach(AppPreferences.workspaceOrder(from: storedWorkspaceOrder)) { workspace in
+                workspaceView(workspace)
+                    .opacity(mode == workspace.rawValue ? 1 : 0)
+                    .allowsHitTesting(mode == workspace.rawValue)
+                    .disabled(mode != workspace.rawValue)
+                    .accessibilityHidden(mode != workspace.rawValue)
             }
         }
+        .padding(8)
         .environmentObject(library)
         .environmentObject(bridge)
-        .alert("切换项目？", isPresented: $confirmsProjectChange) {
-            Button("取消", role: .cancel) { pendingProjectChange = nil }
-            Button("切换项目", role: .destructive) {
-                if let change = pendingProjectChange { performProjectChange(change) }
-                pendingProjectChange = nil
-            }
+        .onAppear { navigationBusy = isBusy }
+        .onChange(of: isBusy) { _, busy in navigationBusy = busy }
+        .onChange(of: homeRequest) { _, _ in requestHome() }
+        .alert("返回项目首页？", isPresented: $confirmsReturnHome) {
+            Button("继续编辑", role: .cancel) {}
+            Button("返回首页", role: .destructive, action: returnHome)
         } message: {
-            Text("当前有尚未导出的拼图编辑，切换后将清空编辑器。项目素材、照片组和处理状态会自动保存。")
-        }
-        .sheet(isPresented: $showsNewProject, onDismiss: {
-            guard let name = stagedNewProjectName else { return }
-            stagedNewProjectName = nil
-            requestProjectChange(.create(name))
-        }) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("新建项目").font(.title2.weight(.semibold))
-                TextField("项目名称", text: $newProjectName)
-                    .textFieldStyle(.roundedBorder).onSubmit(stageNewProject)
-                Text("创建后可拖入图片或文件夹。").font(.callout).foregroundStyle(.secondary)
-                HStack {
-                    Spacer()
-                    Button("取消") { showsNewProject = false }.keyboardShortcut(.cancelAction)
-                    Button("创建", action: stageNewProject)
-                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                        .disabled(newProjectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }.padding(24).frame(width: 360)
+            Text("当前有尚未导出的拼图，返回首页后将清空编辑器。项目素材、照片组和处理状态会自动保存。")
         }
     }
 
-    private var projectSidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("项目").font(.headline)
-                Spacer()
-                Button {
-                    newProjectName = ""
-                    stagedNewProjectName = nil
-                    showsNewProject = true
-                } label: { Image(systemName: "plus") }
-                    .help("新建项目").disabled(isBusy)
-            }.padding(12)
-            Divider()
-            ScrollView {
-                LazyVStack(spacing: 4) {
-                    ForEach(library.projects) { project in
-                        Button { requestProjectChange(.existing(project.id)) } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: "folder")
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(project.name).font(.callout).lineLimit(2)
-                                    Text("\(project.assetCount) 张素材").font(.caption).foregroundStyle(.secondary)
-                                }
-                                Spacer(minLength: 0)
-                            }
-                            .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-                            .background(project.id == projectID ? Color.accentColor.opacity(0.13) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 6))
-                            .contentShape(Rectangle())
-                        }.buttonStyle(.plain).disabled(isBusy)
-                    }
-                }.padding(6).projectOverlayScrollbars()
-            }
-        }.background(Color(nsColor: .windowBackgroundColor))
-    }
-
-    private func stageNewProject() {
-        let name = newProjectName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !isBusy else { return }
-        stagedNewProjectName = name
-        showsNewProject = false
-    }
-
-    private func requestProjectChange(_ change: ProjectChange) {
-        guard !isBusy else { return }
-        if case .existing(let id) = change, id == projectID { return }
-        if bridge.statuses.values.contains(where: { $0.hasUnexportedChanges }) {
-            pendingProjectChange = change
-            confirmsProjectChange = true
-        } else {
-            performProjectChange(change)
-        }
-    }
-
-    private func performProjectChange(_ change: ProjectChange) {
+    private func requestHome() {
         guard !isBusy, library.currentProject?.id == projectID else { return }
-        guard library.flushPendingSaves() else { return }
-        switch change {
-        case .existing(let id): library.openProject(id: id)
-        case .create(let name): library.createProject(name: name)
+        if bridge.statuses.values.contains(where: { $0.hasUnexportedChanges }) {
+            confirmsReturnHome = true
+        } else {
+            returnHome()
         }
     }
 
-    private func workspaceNavigation(_ workspace: AppWorkspace) -> some View {
-        ProjectWorkspaceNavigationTarget(
-            operation: ProjectOperation(rawValue: workspace.rawValue)!,
-            isSelected: mode == workspace.rawValue,
-            onChoose: { mode = workspace.rawValue }
-        )
+    private func returnHome() {
+        guard !isBusy, library.currentProject?.id == projectID else { return }
+        library.closeProject()
     }
 
     @ViewBuilder private func workspaceView(_ workspace: AppWorkspace) -> some View {
@@ -373,28 +272,6 @@ private struct ProjectWorkspaceView: View {
         case .longStitch: LongStitchView(isActive: mode == workspace.rawValue)
         case .gridCollage: GridCollageView(store: gridCollageStore, isActive: mode == workspace.rawValue)
         }
-    }
-}
-
-private struct ProjectWorkspaceNavigationTarget: View {
-    let operation: ProjectOperation
-    let isSelected: Bool
-    let onChoose: () -> Void
-
-    var body: some View {
-        Button(action: onChoose) {
-            HStack(spacing: 6) {
-                Image(systemName: operation.systemImage)
-                Text(operation.title)
-            }
-            .font(.callout.weight(isSelected ? .semibold : .regular))
-            .padding(.horizontal, 10).padding(.vertical, 7)
-            .background(Color.accentColor.opacity(isSelected ? 0.13 : 0),
-                        in: RoundedRectangle(cornerRadius: 8))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(operation.title)
     }
 }
 
@@ -462,7 +339,6 @@ private struct ProjectLibraryView: View {
     @ObservedObject var library: ProjectLibraryStore
     let projectID: UUID
     let isActive: Bool
-    @Binding var showsGroups: Bool
     @Binding var isDispatchPresented: Bool
     let onSend: (ProjectOperation, [URL], ProjectImportMode) -> Bool
     @EnvironmentObject private var bridge: ProjectEditorBridge
@@ -471,15 +347,19 @@ private struct ProjectLibraryView: View {
     @AppStorage("projectLibrary.groupSidebarWidth") private var groupSidebarWidth = 340.0
     @State private var selection: Set<UUID> = []
     @State private var selectedGroupID: UUID?
+    @State private var selectedWholeGroupID: UUID?
     @State private var groupSelection: Set<UUID> = []
     @State private var catalog = ProjectMaterialCatalog()
     @State private var visibleAssets: [ProjectAsset] = []
-    @State private var visibleThumbnailIDs: Set<UUID> = []
     @State private var filter = ProjectMaterialFilter()
     @State private var showsFilter = false
     @State private var search = ""
     @State private var arrangeRequest = 0
     @State private var dispatch: ProjectDispatch?
+    @State private var draggedGroupID: UUID?
+    @State private var groupDropInsertionIndex: Int?
+    @State private var groupDropTargetID: UUID?
+    @State private var assetDropTargetGroupID: UUID?
 
     private var showsModal: Bool { dispatch != nil || showsFilter }
 
@@ -488,14 +368,6 @@ private struct ProjectLibraryView: View {
     private var activeSelection: Set<UUID> { selectedGroupID == nil ? selection : groupSelection }
     private var selectedAssets: [ProjectAsset] { orderedForDispatch(activeSelection) }
     private var selectedCount: Int { selectedAssets.count }
-    private var thumbnails: [UUID: NSImage] {
-        var result: [UUID: NSImage] = [:]
-        let previewPixels = Int(ceil((library.currentProject?.thumbnailSize ?? 128) * 2))
-        for asset in visibleAssets where visibleThumbnailIDs.contains(asset.id) {
-            if let image = library.thumbnail(for: asset, maximumPixelSize: previewPixels) { result[asset.id] = image }
-        }
-        return result
-    }
     private var assetURLs: [UUID: URL] {
         Dictionary(uniqueKeysWithValues: visibleAssets.map { ($0.id, library.assetURL($0)) })
     }
@@ -510,12 +382,13 @@ private struct ProjectLibraryView: View {
         VStack(spacing: 0) {
             libraryToolbar
             Divider()
-            ProjectSidebarSplit(isPresented: showsGroups, width: $groupSidebarWidth, edge: .trailing,
+            ProjectSidebarSplit(isPresented: true, width: $groupSidebarWidth, edge: .trailing,
                                 sidebarMinimum: 220, sidebarMaximum: 650, contentMinimum: 260) {
                 groupPane
             } content: {
                     ZStack {
-                        ProjectThumbnailRefresh(updates: library.thumbnailUpdates) {
+                        ProjectThumbnailRefresh(library: library, assets: visibleAssets,
+                                                isActive: isActive) { thumbnails, reportVisible in
                         ProjectMaterialBoard(
                             assets: visibleAssets, selection: $selection,
                             thumbnailSize: CGFloat(library.currentProject?.thumbnailSize ?? 128),
@@ -525,7 +398,7 @@ private struct ProjectLibraryView: View {
                             onMove: library.moveAssets,
                             onImport: { urls, point in library.importURLs(urls, at: point) },
                             onActivate: { id in selection = [id] },
-                            onVisibleAssets: { visibleThumbnailIDs = $0 },
+                            onThumbnailDemand: reportVisible,
                             onViewportChange: { size in
                                 guard library.currentProject?.id == projectID else { return }
                                 library.boardViewportWidth = size.width
@@ -537,7 +410,7 @@ private struct ProjectLibraryView: View {
                             onRemove: library.removeAssets,
                             onImportPanel: library.importPanel,
                             onUndo: library.undoLastEdit,
-                            onFocus: { selectedGroupID = nil; groupSelection = [] },
+                            onFocus: { selectedGroupID = nil; selectedWholeGroupID = nil; groupSelection = [] },
                             onDropAssets: library.returnAssetsToMaterials,
                             onReorder: library.reorderMaterials,
                             onThumbnailResize: { size in
@@ -552,7 +425,7 @@ private struct ProjectLibraryView: View {
                                     .font(.system(size: 36)).foregroundStyle(.secondary)
                                 Text(assets.isEmpty ? "把照片或文件夹拖进来" : groups.isEmpty ? "没有符合条件的素材" : "这里显示未分组的照片")
                                     .font(.headline)
-                                Text(assets.isEmpty ? "也可以点击上方「导入素材」" : "右侧组内选中照片，按 Delete 移回这里")
+                                Text(assets.isEmpty ? "也可以点击上方「导入素材」" : "右侧照片可拖回这里，或按 Delete 移回素材")
                                     .foregroundStyle(.secondary)
                             }.allowsHitTesting(false)
                         }
@@ -561,6 +434,9 @@ private struct ProjectLibraryView: View {
             Divider()
             materialActionBar
             HStack {
+                Text(library.currentProject?.name ?? "项目")
+                    .lineLimit(1).truncationMode(.middle).frame(maxWidth: 200, alignment: .leading)
+                Text("·")
                 Text("未分组 \(visibleAssets.count) 张 · 项目共 \(assets.count) 张")
                 if filter.isActive { Text("· \(filter.summary)").lineLimit(1) }
                 Spacer()
@@ -577,9 +453,6 @@ private struct ProjectLibraryView: View {
         .onChange(of: search) { _, _ in refreshFiltering() }
         .onChange(of: isActive) { _, active in
             if !active { showsFilter = false }
-        }
-        .onChange(of: showsGroups) { _, visible in
-            if !visible { selectedGroupID = nil; groupSelection = [] }
         }
         .onChange(of: showsModal) { _, value in isDispatchPresented = value }
         .onChange(of: visibleAssets.map(\.id)) { _, ids in selection.formIntersection(Set(ids)) }
@@ -731,32 +604,85 @@ private struct ProjectLibraryView: View {
                 Text("照片组").font(.headline)
                 Text("\(groups.count)").foregroundStyle(.secondary).monospacedDigit()
                 Spacer()
-                Text("Delete 移回素材").font(.caption).foregroundStyle(.secondary)
+                Text("拖回素材或按 Delete").font(.caption).foregroundStyle(.secondary)
             }.padding(.horizontal, 8).padding(.vertical, 8)
+                .contentShape(Rectangle())
+                .onTapGesture { if isActive && !showsModal { clearSelection() } }
             Divider()
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 4) {
                         ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
                             ProjectPhotoGroupRow(
-                                library: library, group: group, number: index + 1,
+                                library: library, group: group,
                                 members: group.assetIDs.compactMap { catalog.byID[$0] },
                                 thumbnailSize: CGFloat(library.currentProject?.groupThumbnailSize ?? 128),
                                 selection: Binding(
                                     get: { selectedGroupID == group.id ? groupSelection : [] },
-                                    set: { selectedGroupID = group.id; groupSelection = $0 }
+                                    set: {
+                                        selectedGroupID = group.id
+                                        selectedWholeGroupID = nil
+                                        groupSelection = $0
+                                    }
                                 ),
-                                isSelected: selectedGroupID == group.id,
-                                isActive: isActive && showsGroups && !showsModal,
+                                isSelected: selectedWholeGroupID == group.id && groupSelection == Set(group.assetIDs),
+                                isActive: isActive && !showsModal,
                                 canMoveUp: index > 0, canMoveDown: index + 1 < groups.count,
                                 badges: badges,
-                                onChoose: { selectedGroupID = group.id; groupSelection = Set(group.assetIDs) },
+                                onChoose: {
+                                    selection = []
+                                    selectedGroupID = group.id
+                                    selectedWholeGroupID = group.id
+                                    groupSelection = Set(group.assetIDs)
+                                },
+                                onClearSelection: clearSelection,
                                 onFocus: {
+                                    selection = []
+                                    selectedWholeGroupID = nil
                                     if selectedGroupID != group.id { groupSelection = [] }
                                     selectedGroupID = group.id
                                 },
-                                onSend: prepareDispatch
-                            ).id(group.id)
+                                onSend: prepareDispatch,
+                                showDropLineBefore: groupDropTargetID == group.id && draggedGroupID != group.id
+                                    && groupDropInsertionIndex == index,
+                                showDropLineAfter: groupDropTargetID == group.id && draggedGroupID != group.id
+                                    && groupDropInsertionIndex == index + 1,
+                                onGroupDragBegan: {
+                                    clearGroupDrag()
+                                    draggedGroupID = group.id
+                                },
+                                onGroupDragEnded: clearGroupDrag,
+                                onGroupDragHover: { id, before in
+                                    guard id != group.id,
+                                          groups.contains(where: { $0.id == id }) else { return false }
+                                    draggedGroupID = id
+                                    groupDropTargetID = group.id
+                                    groupDropInsertionIndex = index + (before ? 0 : 1)
+                                    return true
+                                },
+                                onGroupDragExit: {
+                                    if groupDropTargetID == group.id {
+                                        groupDropTargetID = nil
+                                        groupDropInsertionIndex = nil
+                                    }
+                                },
+                                onDropGroup: { id, before in
+                                    defer { clearGroupDrag() }
+                                    return library.moveGroup(id, relativeTo: group.id, before: before)
+                                },
+                                onAssetDropTargetChange: { targeted in
+                                    if targeted { assetDropTargetGroupID = group.id }
+                                    else if assetDropTargetGroupID == group.id { assetDropTargetGroupID = nil }
+                                }
+                            )
+                            .id(group.id)
+                            .overlay {
+                                if assetDropTargetGroupID == group.id {
+                                    RoundedRectangle(cornerRadius: 5)
+                                        .strokeBorder(Color.accentColor, lineWidth: 2)
+                                        .allowsHitTesting(false)
+                                }
+                            }
                         }
                         if groups.isEmpty {
                             VStack(spacing: 8) {
@@ -768,6 +694,8 @@ private struct ProjectLibraryView: View {
                                 .frame(maxWidth: .infinity).padding(.vertical, 40)
                         }
                     }.padding(4).projectOverlayScrollbars()
+                        .projectGroupBlankSelection(isActive: isActive && !showsModal,
+                                                    onClearSelection: clearSelection)
                 }
                 .onChange(of: selectedGroupID) { _, id in
                     if let id { proxy.scrollTo(id) }
@@ -778,10 +706,17 @@ private struct ProjectLibraryView: View {
 
     private func createGroup(_ ids: Set<UUID>) {
         guard let id = library.createGroup(ids) else { return }
-        showsGroups = true
         selection.subtract(ids)
         selectedGroupID = id
+        selectedWholeGroupID = id
         groupSelection = ids
+    }
+
+    private func clearGroupDrag() {
+        draggedGroupID = nil
+        groupDropTargetID = nil
+        groupDropInsertionIndex = nil
+        assetDropTargetGroupID = nil
     }
 
     private func refreshCatalog() {
@@ -793,6 +728,7 @@ private struct ProjectLibraryView: View {
                 groupSelection.formIntersection(group.assetIDs)
             } else {
                 selectedGroupID = nil
+                selectedWholeGroupID = nil
                 groupSelection = []
             }
         }
@@ -810,6 +746,13 @@ private struct ProjectLibraryView: View {
             return group.assetIDs.filter { ids.contains($0) }.compactMap { catalog.byID[$0] }
         }
         return catalog.assets.filter { ids.contains($0.id) }
+    }
+
+    private func clearSelection() {
+        selection = []
+        selectedGroupID = nil
+        selectedWholeGroupID = nil
+        groupSelection = []
     }
 
     private func prepareDispatch(_ operation: ProjectOperation, ids: Set<UUID>) {
@@ -836,10 +779,140 @@ private struct ProjectLibraryView: View {
 }
 
 struct ProjectThumbnailRefresh<Content: View>: View {
-    @ObservedObject var updates: ProjectThumbnailUpdates
-    @ViewBuilder var content: () -> Content
+    let library: ProjectLibraryStore
+    let assets: [ProjectAsset]
+    let isActive: Bool
+    @ViewBuilder var content: ([UUID: NSImage], @escaping (ProjectThumbnailDemand) -> Void) -> Content
+    @State private var indexedAssets: [UUID: ProjectAsset] = [:]
+    @State private var demand = ProjectThumbnailDemand(visibleIDs: [], prefetchIDs: [], maximumPixelSize: 192)
+    @State private var isSettled = false
+    @State private var isMounted = false
+    @State private var upgradeTask: Task<Void, Never>?
+    @State private var thumbnailOwner = UUID()
+    @State private var images: [UUID: NSImage] = [:]
 
-    var body: some View { content() }
+    private var currentImages: [UUID: NSImage] {
+        var result: [UUID: NSImage] = [:]
+        // SwiftUI evaluates body before onChange. Never pair an old image with
+        // a newly replaced asset while updateAssets is waiting for that callback.
+        for asset in assets {
+            guard let previous = indexedAssets[asset.id],
+                  previous.fileName == asset.fileName,
+                  previous.contentRevision == asset.contentRevision,
+                  let image = images[asset.id] else { continue }
+            result[asset.id] = image
+        }
+        return result
+    }
+
+    var body: some View {
+        content(currentImages, reportVisible)
+            .onAppear { isMounted = true; updateAssets(); scheduleUpgrade() }
+            .onChange(of: assets) { _, _ in updateAssets() }
+            .onChange(of: isActive) { _, active in
+                if active { refreshImages(); scheduleUpgrade() }
+                else {
+                    upgradeTask?.cancel()
+                    isSettled = false
+                    library.releaseThumbnailDemand(owner: thumbnailOwner)
+                }
+            }
+            .onDisappear {
+                isMounted = false
+                isSettled = false
+                upgradeTask?.cancel()
+                library.releaseThumbnailDemand(owner: thumbnailOwner)
+            }
+            .onReceive(library.thumbnailUpdates.completed) { ids in
+                guard !ids.isDisjoint(with: demand.assetIDs) else { return }
+                refreshImages()
+            }
+            .transaction { $0.animation = nil }
+    }
+
+    private func updateAssets() {
+        // Inactive workspaces also discard replaced originals, even though
+        // they postpone loading new previews until the user returns.
+        let validImages = currentImages
+        if images.count != validImages.count { images = validImages }
+        indexedAssets = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) })
+        refreshImages()
+    }
+
+    private func reportVisible(_ next: ProjectThumbnailDemand) {
+        guard demand != next else { return }
+        demand = next
+        isSettled = false
+        refreshImages()
+        scheduleUpgrade()
+    }
+
+    private func scheduleUpgrade() {
+        upgradeTask?.cancel()
+        guard isActive, isMounted, !demand.visibleIDs.isEmpty else { return }
+        upgradeTask = Task { @MainActor in
+            do { try await Task.sleep(for: .milliseconds(120)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            isSettled = true
+            refreshImages()
+        }
+    }
+
+    private func refreshImages() {
+        guard isActive, isMounted else { return }
+        library.updateThumbnailDemand(owner: thumbnailOwner,
+                                      assetIDs: demand.assetIDs.intersection(indexedAssets.keys))
+        var next: [UUID: NSImage] = [:]
+        // Scrolling and thumbnail arrivals only update this small subtree. They
+        // never publish viewport state back through the entire project workspace.
+        for id in demand.visibleIDs {
+            guard let asset = indexedAssets[id] else { continue }
+            let cached = library.cachedThumbnail(for: asset, maximumPixelSize: demand.maximumPixelSize)
+            let retained = images[id]
+            let available = betterThumbnail(retained, cached)
+            let image: NSImage?
+            if let available, library.isThumbnail(available, sufficientForDisplayPixelSize: demand.maximumPixelSize) {
+                // Visible images may outlive the global LRU. Their resolution
+                // metadata prevents repeatedly decoding an already-sharp photo.
+                image = available
+            } else if isSettled {
+                image = betterThumbnail(available, library.displayThumbnail(for: asset,
+                    pixelSize: demand.maximumPixelSize, owner: thumbnailOwner))
+            } else {
+                // Keep every decoded image while scrolling. Only blank visible
+                // cells request the small tier; sharper work waits for rest.
+                image = available ?? library.thumbnail(for: asset, maximumPixelSize: 192, owner: thumbnailOwner)
+            }
+            if let image { next[id] = image }
+        }
+        for id in demand.prefetchIDs {
+            guard let asset = indexedAssets[id] else { continue }
+            let retained = images[id]
+            let cached = library.cachedThumbnail(for: asset, maximumPixelSize: 192)
+            let available = betterThumbnail(retained, cached)
+            let image = available ?? (isSettled
+                ? library.thumbnail(for: asset, maximumPixelSize: 192, priority: .veryLow, owner: thumbnailOwner)
+                : nil)
+            if let image { next[id] = image }
+        }
+        guard images.count != next.count || next.contains(where: { images[$0.key] !== $0.value }) else { return }
+        images = next
+    }
+
+    private func betterThumbnail(_ first: NSImage?, _ second: NSImage?) -> NSImage? {
+        guard let first else { return second }
+        guard let second else { return first }
+        if library.isDetailedThumbnail(first) { return first }
+        if library.isDetailedThumbnail(second) { return second }
+        let firstSufficient = library.isThumbnail(first, sufficientForDisplayPixelSize: demand.maximumPixelSize)
+        let secondSufficient = library.isThumbnail(second, sufficientForDisplayPixelSize: demand.maximumPixelSize)
+        if firstSufficient != secondSufficient { return firstSufficient ? first : second }
+        func pixels(_ image: NSImage) -> Int {
+            image.representations.map { max($0.pixelsWide, $0.pixelsHigh) }.max() ?? 0
+        }
+        return pixels(first) > pixels(second) ? first : second
+    }
 }
 
 

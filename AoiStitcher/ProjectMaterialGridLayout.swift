@@ -20,7 +20,7 @@ nonisolated struct ProjectMaterialGridLayout {
         let requestedScale = zoom.isFinite ? min(2, max(0.02, zoom)) : 1
         scale = min(requestedScale, available / base.width)
         cardSize = CGSize(width: base.width * scale, height: base.height * scale)
-        gap = 12 * scale
+        gap = 8 * scale
         columns = max(1, Int(min(CGFloat(max(1, self.count)), floor((available + gap) / (cardSize.width + gap)))))
     }
 

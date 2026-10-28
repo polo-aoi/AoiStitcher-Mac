@@ -334,6 +334,107 @@ import CoreGraphics
         library.reorderMaterials(beforeOrder.filter { $0 != removed.id })
         try check(library.currentProject?.materialOrder == beforeOrder, "Material order can be restored without moving legacy positions")
 
+        // Group drops commit relative to the target's current identity. Exercise
+        // both directions in an isolated library, including persistence and undo.
+        do {
+            let reorderRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("aoistitcher-group-order-tests-" + UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: reorderRoot) }
+            let reorderAssets = (0..<9).map { index in
+                ProjectAsset(id: UUID(), fileName: "group-order-\(index).png", name: "Photo \(index)",
+                             position: CGPoint(x: CGFloat(index) * 160 + 24, y: 24))
+            }
+            let originalGroups = (0..<4).map { index in
+                ProjectPhotoGroup(id: UUID(), assetIDs: [reorderAssets[index * 2 + 1].id,
+                                                        reorderAssets[index * 2].id])
+            }
+            let a = originalGroups[0].id, b = originalGroups[1].id
+            let c = originalGroups[2].id, d = originalGroups[3].id
+            let reorderFixture = ProjectDocument(id: UUID(), name: "组拖动回归", createdAt: Date(), modifiedAt: Date(),
+                assets: reorderAssets, exports: [], thumbnailSize: 128, groups: originalGroups,
+                materialOrder: reorderAssets.reversed().map(\.id))
+            let reorderDirectory = reorderRoot.appendingPathComponent(reorderFixture.id.uuidString)
+            try FileManager.default.createDirectory(at: reorderDirectory, withIntermediateDirectories: true)
+            try JSONEncoder().encode(reorderFixture).write(to: reorderDirectory.appendingPathComponent("project.json"))
+            let reorderStore = ProjectLibraryStore(projectsDirectory: reorderRoot)
+            reorderStore.openProject(id: reorderFixture.id)
+            try check(reorderStore.currentProject?.groups == originalGroups && !reorderStore.canUndoEdit,
+                      "A four-group fixture opens with independent member and material orders and no undo history")
+
+            let initialModifiedAt = reorderStore.currentProject?.modifiedAt
+            try check(!reorderStore.moveGroup(UUID(), relativeTo: b, before: true) &&
+                      !reorderStore.moveGroup(a, relativeTo: UUID(), before: false) &&
+                      !reorderStore.moveGroup(a, relativeTo: a, before: true),
+                      "Unknown source, unknown target and self drops are rejected")
+            try check(reorderStore.currentProject?.groups == originalGroups &&
+                      reorderStore.currentProject?.modifiedAt == initialModifiedAt && !reorderStore.canUndoEdit,
+                      "Rejected group drops do not change the document or create undo entries")
+            try check(reorderStore.moveGroup(a, relativeTo: b, before: true) &&
+                      reorderStore.moveGroup(d, relativeTo: c, before: false) &&
+                      reorderStore.currentProject?.groups == originalGroups && !reorderStore.canUndoEdit &&
+                      reorderStore.currentProject?.modifiedAt == initialModifiedAt,
+                      "Adjacent drops that preserve the current order succeed without writing or adding undo entries")
+
+            try check(reorderStore.moveGroup(d, relativeTo: a, before: true) &&
+                      reorderStore.currentProject?.groups.map(\.id) == [d, a, b, c],
+                      "Dropping the last group above the first moves it to the beginning")
+            try check(reorderStore.currentProject?.assets == reorderFixture.assets &&
+                      reorderStore.currentProject?.materialOrder == reorderFixture.materialOrder &&
+                      reorderStore.currentProject?.groups.map(\.assetIDs) == [originalGroups[3].assetIDs,
+                          originalGroups[0].assetIDs, originalGroups[1].assetIDs, originalGroups[2].assetIDs],
+                      "Group movement preserves member ordering, photo geometry and ungrouped return slots")
+            reorderStore.undoLastEdit()
+            try check(reorderStore.currentProject?.groups == originalGroups && !reorderStore.canUndoEdit,
+                      "One undo restores a last-to-first drop as a single edit")
+
+            try check(reorderStore.moveGroup(a, relativeTo: d, before: false) &&
+                      reorderStore.currentProject?.groups.map(\.id) == [b, c, d, a],
+                      "Dropping the first group below the last uses the target position after source removal")
+            reorderStore.undoLastEdit()
+            try check(reorderStore.currentProject?.groups == originalGroups && !reorderStore.canUndoEdit,
+                      "One undo restores a first-to-last drop")
+
+            try check(reorderStore.moveGroup(d, relativeTo: b, before: true) &&
+                      reorderStore.currentProject?.groups.map(\.id) == [a, d, b, c],
+                      "Dropping into a middle boundary inserts immediately above the named target")
+            try check(reorderStore.moveGroup(d, relativeTo: b, before: true) &&
+                      !reorderStore.moveGroup(d, relativeTo: d, before: false) &&
+                      !reorderStore.moveGroup(d, relativeTo: UUID(), before: true) &&
+                      reorderStore.currentProject?.groups.map(\.id) == [a, d, b, c],
+                      "No-op and stale-target drops preserve an earlier valid move")
+            reorderStore.undoLastEdit()
+            try check(reorderStore.currentProject?.groups == originalGroups && !reorderStore.canUndoEdit,
+                      "Rejected and adjacent no-op drops never hide the last real move behind extra undo steps")
+
+            try check(reorderStore.moveGroup(c, relativeTo: a, before: true) &&
+                      reorderStore.moveGroup(b, relativeTo: d, before: false) &&
+                      reorderStore.currentProject?.groups.map(\.id) == [c, a, d, b],
+                      "Consecutive drops resolve their target against the latest saved group order")
+            try check(reorderStore.flushPendingSaves(), "Group drop ordering flushes successfully")
+            let reorderReader = ProjectLibraryStore(projectsDirectory: reorderRoot)
+            reorderReader.openProject(id: reorderFixture.id)
+            try check(reorderReader.currentProject?.groups.map(\.id) == [c, a, d, b] &&
+                      reorderReader.currentProject?.assets == reorderFixture.assets &&
+                      reorderReader.currentProject?.materialOrder == reorderFixture.materialOrder,
+                      "A fresh store restores dragged group order without changing photo membership or material order")
+            reorderReader.closeProject()
+            reorderStore.undoLastEdit()
+            try check(reorderStore.currentProject?.groups.map(\.id) == [c, a, b, d] && reorderStore.canUndoEdit,
+                      "Undo after saving restores only the most recent group drop")
+            reorderStore.undoLastEdit()
+            try check(reorderStore.currentProject?.groups == originalGroups &&
+                      reorderStore.currentProject?.assets == reorderFixture.assets &&
+                      reorderStore.currentProject?.materialOrder == reorderFixture.materialOrder && !reorderStore.canUndoEdit,
+                      "Undoing all group drops restores the initial rows, members and material slots exactly")
+            try check(reorderStore.flushPendingSaves(), "Undo of persisted group drops is also saved")
+            reorderStore.closeProject()
+            reorderStore.openProject(id: reorderFixture.id)
+            try check(reorderStore.currentProject?.groups == originalGroups &&
+                      reorderStore.currentProject?.materialOrder == reorderFixture.materialOrder,
+                      "Reopening after undo restores the original group and material order")
+            reorderStore.closeProject()
+        }
+
         // Import completion merges with edits made while background copying is in progress.
         let input = FileManager.default.temporaryDirectory.appendingPathComponent("aoistitcher-import-\(UUID().uuidString).png")
         defer { try? FileManager.default.removeItem(at: input) }

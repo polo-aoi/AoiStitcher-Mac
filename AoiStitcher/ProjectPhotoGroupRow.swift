@@ -4,7 +4,6 @@ import AppKit
 struct ProjectPhotoGroupRow: View {
     @ObservedObject var library: ProjectLibraryStore
     let group: ProjectPhotoGroup
-    let number: Int
     let members: [ProjectAsset]
     let thumbnailSize: CGFloat
     @Binding var selection: Set<UUID>
@@ -14,9 +13,17 @@ struct ProjectPhotoGroupRow: View {
     let canMoveDown: Bool
     let badges: [UUID: String]
     let onChoose: () -> Void
+    let onClearSelection: () -> Void
     let onFocus: () -> Void
     let onSend: (ProjectOperation, Set<UUID>) -> Void
-    @State private var visibleIDs: Set<UUID> = []
+    let showDropLineBefore: Bool
+    let showDropLineAfter: Bool
+    let onGroupDragBegan: () -> Void
+    let onGroupDragEnded: () -> Void
+    let onGroupDragHover: (UUID, Bool) -> Bool
+    let onGroupDragExit: () -> Void
+    let onDropGroup: (UUID, Bool) -> Bool
+    let onAssetDropTargetChange: (Bool) -> Void
     @State private var focusRequest = 0
 
     private var layout: ProjectMaterialLayout { ProjectMaterialLayout(thumbnailSize: thumbnailSize) }
@@ -30,32 +37,9 @@ struct ProjectPhotoGroupRow: View {
         }
     }
 
-    private var thumbnails: [UUID: NSImage] {
-        var images: [UUID: NSImage] = [:]
-        for asset in members where visibleIDs.contains(asset.id) {
-            images[asset.id] = library.thumbnail(for: asset, maximumPixelSize: Int(ceil(layout.thumbnailSize * 2)))
-        }
-        return images
-    }
-
     var body: some View {
-        HStack(spacing: 0) {
-            Button {
-                onChoose()
-                focusRequest += 1
-            } label: {
-                VStack(spacing: 3) {
-                    Text("组 \(number)").fontWeight(.medium)
-                    Text("\(members.count) 张").foregroundStyle(.secondary)
-                }
-                .font(.caption).lineLimit(1)
-                .frame(width: 46, height: layout.cardSize.height + 8)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("第 \(number) 组，\(members.count) 张照片")
-            .help("选择整组；按 1、2、3 添加至对应拼图")
-            ProjectThumbnailRefresh(updates: library.thumbnailUpdates) {
+        ProjectThumbnailRefresh(library: library, assets: members,
+                                isActive: isActive) { thumbnails, reportVisible in
                 ProjectMaterialBoard(
                     assets: rowAssets, selection: $selection, thumbnailSize: layout.thumbnailSize,
                     viewZoom: .constant(1), fitRequest: 0,
@@ -64,37 +48,59 @@ struct ProjectPhotoGroupRow: View {
                     isActive: isActive, badges: badges,
                     onMove: reorderMembers,
                     onImport: { _, _ in }, onActivate: { _ in },
-                    onVisibleAssets: { visibleIDs = $0 },
+                    onThumbnailDemand: reportVisible,
                     onSend: onSend,
                     onRemove: library.returnAssetsToMaterials,
                     onImportPanel: library.importPanel,
                     onUndo: library.undoLastEdit,
                     isGroupRow: true, onFocus: onFocus,
                     onDropAssets: { library.addAssets($0, to: group.id) },
+                    onGroupChoose: { onChoose(); focusRequest += 1 },
+                    onGroupClearSelection: onClearSelection,
+                    isGroupSelected: isSelected,
+                    groupDragID: group.id,
+                    onGroupDragBegan: onGroupDragBegan,
+                    onGroupDragEnded: onGroupDragEnded,
+                    onGroupDragHover: onGroupDragHover,
+                    onGroupDragExit: onGroupDragExit,
+                    onDropGroup: onDropGroup,
+                    onAssetDropTargetChange: onAssetDropTargetChange,
                     focusRequest: focusRequest
                 )
-            }.frame(height: layout.cardSize.height + 8)
-            Menu {
-                Button("选中整组") { onChoose(); focusRequest += 1 }
-                Button("将选中照片移回素材") { library.returnAssetsToMaterials(selection) }
-                    .disabled(selection.isEmpty)
-                if selection.count == 1, let id = selection.first {
-                    Button("照片向前一位") { library.moveGroupAsset(id, in: group.id, by: -1) }
-                        .disabled(group.assetIDs.first == id)
-                    Button("照片向后一位") { library.moveGroupAsset(id, in: group.id, by: 1) }
-                        .disabled(group.assetIDs.last == id)
-                }
-                Divider()
-                Button("上移一组") { library.moveGroup(group.id, by: -1) }.disabled(!canMoveUp)
-                Button("下移一组") { library.moveGroup(group.id, by: 1) }.disabled(!canMoveDown)
-                Divider()
-                Button("解散分组，全部移回素材") { library.dissolveGroup(group.id) }
-            } label: { Image(systemName: "ellipsis") }
-                .menuStyle(.borderlessButton).frame(width: 22).padding(.trailing, 4)
-                .help("照片组操作")
+        }.frame(height: layout.cardSize.height + 8)
+        .contextMenu {
+            Button("选中整组") { onChoose(); focusRequest += 1 }
+            Button("将选中照片移回素材") { library.returnAssetsToMaterials(selection) }
+                .disabled(selection.isEmpty)
+            if selection.count == 1, let id = selection.first {
+                Button("照片向前一位") { library.moveGroupAsset(id, in: group.id, by: -1) }
+                    .disabled(group.assetIDs.first == id)
+                Button("照片向后一位") { library.moveGroupAsset(id, in: group.id, by: 1) }
+                    .disabled(group.assetIDs.last == id)
+            }
+            Divider()
+            Button("上移一组") { library.moveGroup(group.id, by: -1) }
+                .disabled(!canMoveUp)
+            Button("下移一组") { library.moveGroup(group.id, by: 1) }
+                .disabled(!canMoveDown)
+            Divider()
+            Button("解散分组，全部移回素材") { library.dissolveGroup(group.id) }
         }
-        .background(Color(nsColor: .controlBackgroundColor))
-        .overlay(Rectangle().strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: 1))
+        .background {
+            (isSelected ? Color.accentColor.opacity(0.04) : Color(nsColor: .controlBackgroundColor))
+        }
+        .overlay {
+            ZStack {
+                Rectangle().strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: 1)
+                if showDropLineBefore {
+                    Rectangle().fill(Color.accentColor).frame(height: 3).frame(maxHeight: .infinity, alignment: .top)
+                }
+                if showDropLineAfter {
+                    Rectangle().fill(Color.accentColor).frame(height: 3).frame(maxHeight: .infinity, alignment: .bottom)
+                }
+            }.allowsHitTesting(false)
+        }
+        .contentShape(Rectangle())
         .disabled(!isActive)
         .onAppear { if isSelected { focusRequest += 1 } }
     }

@@ -33,22 +33,34 @@ nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
     var id: UUID
     var fileName: String
     var name: String
+    /// The original source is retained for duplicate detection. These are optional so
+    /// projects written before duplicate protection remain fully readable.
+    var sourcePath: String?
+    var sourceFileSize: UInt64?
+    /// Changes only when the original is replaced, so browsing can retain a
+    /// decoded preview without confusing a replacement with the old image.
+    var contentRevision: UUID?
     var position: CGPoint
     var groupID: UUID?
     // Retain identity and originals so export history and undo remain valid after removal.
     var isRemoved: Bool = false
 
-    init(id: UUID, fileName: String, name: String, position: CGPoint, groupID: UUID? = nil, isRemoved: Bool = false) {
+    init(id: UUID, fileName: String, name: String, sourcePath: String? = nil,
+         sourceFileSize: UInt64? = nil, contentRevision: UUID? = nil,
+         position: CGPoint, groupID: UUID? = nil, isRemoved: Bool = false) {
         self.id = id
         self.fileName = fileName
         self.name = name
+        self.sourcePath = sourcePath
+        self.sourceFileSize = sourceFileSize
+        self.contentRevision = contentRevision
         self.position = position
         self.groupID = groupID
         self.isRemoved = isRemoved
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, fileName, name, position, groupID, isRemoved
+        case id, fileName, name, sourcePath, sourceFileSize, contentRevision, position, groupID, isRemoved
     }
 
     init(from decoder: Decoder) throws {
@@ -56,6 +68,9 @@ nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
         id = try values.decode(UUID.self, forKey: .id)
         fileName = try values.decode(String.self, forKey: .fileName)
         name = try values.decode(String.self, forKey: .name)
+        sourcePath = try values.decodeIfPresent(String.self, forKey: .sourcePath)
+        sourceFileSize = try values.decodeIfPresent(UInt64.self, forKey: .sourceFileSize)
+        contentRevision = try values.decodeIfPresent(UUID.self, forKey: .contentRevision)
         position = try values.decode(CGPoint.self, forKey: .position)
         groupID = try values.decodeIfPresent(UUID.self, forKey: .groupID)
         // Old ratings and color labels are deliberately ignored when reading existing projects.
@@ -67,7 +82,7 @@ nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
 nonisolated struct ProjectMaterialLayout: Sendable {
     static let thumbnailRange: ClosedRange<Double> = 48...240
     let thumbnailSize: CGFloat
-    let gap: CGFloat = 16
+    let gap: CGFloat = 8
 
     init(thumbnailSize: CGFloat) {
         self.thumbnailSize = thumbnailSize.isFinite
@@ -75,7 +90,7 @@ nonisolated struct ProjectMaterialLayout: Sendable {
             : 128
     }
 
-    var cardSize: CGSize { CGSize(width: thumbnailSize + 16, height: thumbnailSize + 40) }
+    var cardSize: CGSize { CGSize(width: thumbnailSize + 16, height: thumbnailSize + 16) }
     var columnStride: CGFloat { cardSize.width + gap }
     var rowStride: CGFloat { cardSize.height + gap }
 
@@ -266,6 +281,37 @@ nonisolated struct ProjectSummary: Identifiable, Sendable {
     var assetCount: Int
 }
 
+/// The choices shown when an import contains files already represented by the project.
+nonisolated enum ProjectDuplicateResolution: String, CaseIterable, Sendable {
+    case skip
+    case overwrite
+    case keepBoth
+
+    var title: String {
+        switch self {
+        case .skip: return "跳过重复文件"
+        case .overwrite: return "覆盖原文件"
+        case .keepBoth: return "保留两者（自动重命名）"
+        }
+    }
+}
+
+nonisolated struct ProjectDuplicateItem: Identifiable, Sendable {
+    var id: UUID { incomingID }
+    let incomingID: UUID
+    let incomingName: String
+    let incomingPath: String
+    let existingName: String
+    let reasons: [String]
+}
+
+/// Published by the store while a batch import is waiting for a duplicate decision.
+nonisolated struct ProjectDuplicateImportPrompt: Identifiable, Sendable {
+    let id: UUID
+    let duplicates: [ProjectDuplicateItem]
+    let totalFiles: Int
+}
+
 /// Captured with the editor's export snapshot, before the save panel or rendering starts.
 nonisolated struct ProjectExportContext: Sendable {
     let projectID: UUID
@@ -287,8 +333,10 @@ nonisolated private enum ProjectLibraryError: LocalizedError {
 
 nonisolated private struct ProjectImportResult: Sendable {
     var assets: [ProjectAsset]
+    var overwritten: [ProjectAsset] = []
     var failures: [String]
     var failureCount = 0
+    var skippedDuplicates = 0
 
     mutating func recordFailure(_ description: String) {
         failureCount += 1
@@ -297,6 +345,17 @@ nonisolated private struct ProjectImportResult: Sendable {
 
     var failureDescription: String {
         failures.joined(separator: "、") + (failureCount > failures.count ? "等，共 \(failureCount) 项" : "")
+    }
+}
+
+nonisolated private struct ProjectImportScan: Sendable {
+    var imageURLs: [URL]
+    var failures: [String]
+    var failureCount = 0
+
+    mutating func recordFailure(_ description: String) {
+        failureCount += 1
+        if failures.count < 8 { failures.append(description) }
     }
 }
 
@@ -309,9 +368,38 @@ nonisolated private struct ProjectImportRequest: Sendable {
     let viewZoom: CGFloat
 }
 
+nonisolated private struct PendingDuplicateImport: Sendable {
+    let request: ProjectImportRequest
+    let promptID: UUID
+    var duplicates: [ProjectDuplicateItem]
+    let totalFiles: Int
+    var decisions: [String: ProjectDuplicateResolution] = [:]
+}
+
+/// Metadata follows a live image independently of the library cache. Weak,
+/// identity-based keys retain neither previews nor their owning project stores.
+@MainActor private enum ProjectThumbnailMetadata {
+    private static let resolutions = NSMapTable<NSImage, NSNumber>(
+        keyOptions: [.weakMemory, .objectPointerPersonality], valueOptions: .strongMemory)
+
+    static func register(_ image: NSImage, resolution: ProjectThumbnailResolution) {
+        resolutions.setObject(NSNumber(value: resolution.rawValue), forKey: image)
+    }
+
+    static func resolution(of image: NSImage) -> ProjectThumbnailResolution? {
+        guard let value = resolutions.object(forKey: image) else { return nil }
+        return ProjectThumbnailResolution(rawValue: value.intValue)
+    }
+}
+
 /// Thumbnail arrivals refresh only views that display previews, not every mounted editor.
 @MainActor final class ProjectThumbnailUpdates: ObservableObject {
-    func invalidate() { objectWillChange.send() }
+    let completed = PassthroughSubject<Set<UUID>, Never>()
+
+    func invalidate(_ ids: Set<UUID> = []) {
+        completed.send(ids)
+        objectWillChange.send()
+    }
 }
 
 @MainActor final class ProjectLibraryStore: ObservableObject {
@@ -325,6 +413,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
     @Published private(set) var currentProject: ProjectDocument?
     @Published private(set) var isImporting = false
     @Published var message: String?
+    @Published var duplicateImportRequest: ProjectDuplicateImportPrompt?
     let thumbnailUpdates = ProjectThumbnailUpdates()
 
     // Updated by the material board; these are viewport measurements, not project edits.
@@ -337,27 +426,44 @@ nonisolated private struct ProjectImportRequest: Sendable {
     private let metadataWriter = ProjectMetadataWriter()
     private var saveObservers: Set<AnyCancellable> = []
     private let thumbnails = NSCache<NSString, NSImage>()
-    private let thumbnailQueue: OperationQueue = {
+    private let thumbnailQueue: OperationQueue
+    private static func makeThumbnailQueue() -> OperationQueue {
         let queue = OperationQueue()
         queue.name = "com.aoistitcher.project-thumbnails"
         queue.qualityOfService = .utility
-        queue.maxConcurrentOperationCount = 2
+        queue.maxConcurrentOperationCount = ProcessInfo.processInfo.activeProcessorCount <= 4
+            || ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 2
         return queue
-    }()
-    private var thumbnailRequests: Set<String> = []
+    }
+    private struct ThumbnailRequest {
+        let id: UUID
+        let projectID: UUID
+        let assetID: UUID
+        let operation: Operation
+        var hasUnscopedDemand: Bool
+    }
+    private struct ThumbnailDemand {
+        let projectID: UUID
+        let assetIDs: Set<UUID>
+    }
+    private var thumbnailRequests: [String: ThumbnailRequest] = [:]
+    private var thumbnailDemandOwners: [UUID: ThumbnailDemand] = [:]
     private var failedThumbnails: Set<String> = []
     private var thumbnailNotificationScheduled = false
+    private var completedThumbnailIDs: Set<UUID> = []
     private var importQueue: [ProjectImportRequest] = []
+    private var pendingDuplicateImport: PendingDuplicateImport?
 
     var canUndoEdit: Bool {
         guard let id = currentProject?.id else { return false }
         return !(editHistory[id]?.isEmpty ?? true)
     }
 
-    init(projectsDirectory: URL = ProjectLibraryStore.projectsDirectory) {
+    init(projectsDirectory: URL = ProjectLibraryStore.projectsDirectory, thumbnailQueue: OperationQueue? = nil) {
         directory = projectsDirectory
+        self.thumbnailQueue = thumbnailQueue ?? Self.makeThumbnailQueue()
         thumbnails.countLimit = 2_000
-        thumbnails.totalCostLimit = 128 * 1024 * 1024
+        thumbnails.totalCostLimit = 64 * 1024 * 1024
         refreshProjects()
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
             .merge(with: NotificationCenter.default.publisher(for: NSWindow.willCloseNotification))
@@ -496,33 +602,112 @@ nonisolated private struct ProjectImportRequest: Sendable {
         startNextImportIfNeeded()
     }
 
+    /// Completes the currently paused duplicate prompt. The UI intentionally calls this
+    /// only after the user has chosen one of the three visible actions.
+    func resolveDuplicateImport(_ resolution: ProjectDuplicateResolution, applyToAll: Bool = true) {
+        guard var pending = pendingDuplicateImport, let current = pending.duplicates.first else { return }
+        if !applyToAll {
+            pending.decisions[current.incomingPath] = resolution
+            pending.duplicates.removeFirst()
+            if !pending.duplicates.isEmpty {
+                    let promptID = pending.promptID
+                pendingDuplicateImport = pending
+                    duplicateImportRequest = ProjectDuplicateImportPrompt(id: promptID,
+                                                                       duplicates: pending.duplicates,
+                                                                       totalFiles: pending.totalFiles)
+                return
+            }
+        } else {
+            for duplicate in pending.duplicates {
+                pending.decisions[duplicate.incomingPath] = resolution
+            }
+            pending.duplicates.removeAll()
+        }
+        pendingDuplicateImport = nil
+        duplicateImportRequest = nil
+        isImporting = true
+        performImport(pending.request, duplicateResolution: applyToAll ? resolution : nil,
+                      duplicateDecisions: pending.decisions)
+    }
+
+    func cancelDuplicateImport() {
+        guard let pending = pendingDuplicateImport else { return }
+        pendingDuplicateImport = nil
+        duplicateImportRequest = nil
+        pending.request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() }
+        message = "已取消导入，原有素材未改变。"
+        startNextImportIfNeeded()
+    }
+
     private func startNextImportIfNeeded() {
-        guard !isImporting, !importQueue.isEmpty else { return }
+        guard !isImporting, pendingDuplicateImport == nil, !importQueue.isEmpty else { return }
         let request = importQueue.removeFirst()
         let projectID = request.projectID
-        let destination = assetDirectory(projectID: projectID)
         let protectedDirectories = [Self.projectsDirectory, directory]
         isImporting = true
-        // Keep the project store alive if its window closes during background copying.
+        // Scan before copying so a duplicate can be shown to the user without creating
+        // an untracked original in the project's asset directory.
         Task { [self] in
-            let result = await Task.detached(priority: .userInitiated) {
-                defer { request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() } }
-                return Self.copyImages(request.urls, to: destination, excluding: protectedDirectories)
+            let scan = await Task.detached(priority: .userInitiated) {
+                Self.scanImages(request.urls, excluding: protectedDirectories)
             }.value
             do {
                 // Load the project that initiated this import, even if the user has since opened another.
+                let document = try self.readDocument(id: projectID)
+                let duplicateItems = Self.duplicateItems(in: scan.imageURLs, document: document)
+                if !duplicateItems.isEmpty {
+                    let promptID = UUID()
+                    self.pendingDuplicateImport = PendingDuplicateImport(request: request,
+                                                                         promptID: promptID,
+                                                                         duplicates: duplicateItems,
+                                                                         totalFiles: scan.imageURLs.count)
+                    self.duplicateImportRequest = ProjectDuplicateImportPrompt(id: promptID,
+                                                                               duplicates: duplicateItems,
+                                                                               totalFiles: scan.imageURLs.count)
+                    self.isImporting = false
+                    return
+                }
+                self.performImport(request, duplicateResolution: nil, duplicateDecisions: nil)
+            } catch {
+                request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() }
+                self.message = "读取导入项目资料失败：\(error.localizedDescription)"
+                self.isImporting = false
+                self.startNextImportIfNeeded()
+            }
+        }
+    }
+
+    private func performImport(_ request: ProjectImportRequest,
+                               duplicateResolution: ProjectDuplicateResolution?,
+                               duplicateDecisions: [String: ProjectDuplicateResolution]?) {
+        let projectID = request.projectID
+        let destination = assetDirectory(projectID: projectID)
+        let protectedDirectories = [Self.projectsDirectory, directory]
+        let existingAssets = (try? readDocument(id: projectID).assets) ?? []
+        Task { [self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                defer { request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() } }
+                return Self.copyImages(request.urls, to: destination, excluding: protectedDirectories,
+                                       existingAssets: existingAssets,
+                                       duplicateResolution: duplicateResolution,
+                                       duplicateDecisions: duplicateDecisions)
+            }.value
+            do {
                 var document = try self.readDocument(id: projectID)
-                if !result.assets.isEmpty {
+                if !result.assets.isEmpty || !result.overwritten.isEmpty {
                     let cardHeight = ProjectMaterialLayout(thumbnailSize: CGFloat(document.thumbnailSize)).cardSize.height
                     let start = request.point
                         ?? CGPoint(x: 24, y: document.activeAssets.isEmpty ? 24 : (document.activeAssets.map(\.position.y).max() ?? 24) + cardHeight + 24)
-                    // A homepage drop can start before its board has been laid out. Use the live
-                    // viewport after scanning when this project is still on screen.
                     let isCurrentProject = self.currentProject?.id == projectID
                     let viewportWidth = isCurrentProject ? self.boardViewportWidth : request.viewportWidth
                     let viewZoom = isCurrentProject ? self.boardViewZoom : request.viewZoom
                     let layout = self.assetLayout(thumbnailSize: document.thumbnailSize, viewportWidth: viewportWidth,
                                                   zoom: viewZoom, startX: start.x)
+                    for updated in result.overwritten {
+                        if let index = document.assets.firstIndex(where: { $0.id == updated.id }) {
+                            document.assets[index] = updated
+                        }
+                    }
                     for (index, var asset) in result.assets.enumerated() {
                         asset.position = CGPoint(x: start.x + CGFloat(index % layout.columns) * layout.columnStride,
                                                  y: start.y + CGFloat(index / layout.columns) * layout.rowStride)
@@ -534,13 +719,17 @@ nonisolated private struct ProjectImportRequest: Sendable {
                     if self.currentProject?.id == projectID { self.currentProject = document }
                     self.updateSummary(document)
                 }
+                let importedCount = result.assets.count + result.overwritten.count
                 if result.failureCount > 0 {
-                    self.message = "已导入 \(result.assets.count) 张；\(result.failureDescription)"
-                } else if result.assets.isEmpty {
+                    self.message = "已处理 \(importedCount) 张（覆盖 \(result.overwritten.count) 张）；\(result.failureDescription)"
+                } else if importedCount == 0 && result.skippedDuplicates > 0 {
+                    self.message = "已跳过 \(result.skippedDuplicates) 个重复文件，原有素材未改变。"
+                } else if importedCount == 0 {
                     self.message = "未找到可导入的图片。请选择图片或包含图片的文件夹。"
+                } else if result.skippedDuplicates > 0 {
+                    self.message = "已处理 \(importedCount) 张（新增 \(result.assets.count) 张，覆盖 \(result.overwritten.count) 张），跳过 \(result.skippedDuplicates) 个重复文件。"
                 }
             } catch {
-                // Copied originals remain recoverable if the metadata write fails.
                 self.message = "保存导入资料失败：\(error.localizedDescription) 已复制的原图仍保留在项目目录中。"
             }
             self.isImporting = false
@@ -555,37 +744,143 @@ nonisolated private struct ProjectImportRequest: Sendable {
         return assetDirectory(projectID: projectID).appendingPathComponent(asset.fileName)
     }
 
-    func thumbnail(for asset: ProjectAsset, maximumPixelSize: Int = 256) -> NSImage? {
+    /// Return any already-decoded preview without scheduling disk work. Keep the
+    /// highest cached tier when a view shrinks, so late low-resolution completions
+    /// cannot replace a sharper image already on screen.
+    func cachedThumbnail(for asset: ProjectAsset,
+                         maximumPixelSize: Int = ProjectThumbnailDiskCache.maximumPixelSize) -> NSImage? {
         guard let projectID = currentProject?.id else { return nil }
-        let pixelSize = maximumPixelSize <= 64 ? 64 : (maximumPixelSize <= 128 ? 128 : 256)
-        let key = "\(projectID.uuidString)/\(asset.id.uuidString)/\(pixelSize)"
-        if let cached = thumbnails.object(forKey: key as NSString) { return cached }
-        guard !failedThumbnails.contains(key), thumbnailRequests.insert(key).inserted else { return nil }
+        return cachedThumbnailEntry(for: asset, projectID: projectID)?.image
+    }
+
+    func isDetailedThumbnail(_ image: NSImage) -> Bool {
+        ProjectThumbnailMetadata.resolution(of: image) == .detail1080
+    }
+
+    func isThumbnail(_ image: NSImage, sufficientForDisplayPixelSize pixelSize: Int) -> Bool {
+        guard let resolution = ProjectThumbnailMetadata.resolution(of: image) else { return false }
+        return resolution.rawValue >= ProjectThumbnailResolution.display(pixelSize: pixelSize).rawValue
+    }
+
+    private func thumbnailKey(for asset: ProjectAsset, projectID: UUID, resolution: ProjectThumbnailResolution) -> String {
+        "\(projectID.uuidString)/\(asset.id.uuidString)/\(asset.fileName)/\(asset.contentRevision?.uuidString ?? "original")/\(resolution.cacheKey)"
+    }
+
+    private func cachedThumbnailEntry(for asset: ProjectAsset, projectID: UUID)
+        -> (image: NSImage, resolution: ProjectThumbnailResolution)? {
+        for resolution in ProjectThumbnailResolution.allCases.reversed() {
+            let key = thumbnailKey(for: asset, projectID: projectID, resolution: resolution)
+            if let image = thumbnails.object(forKey: key as NSString) { return (image, resolution) }
+        }
+        return nil
+    }
+
+    /// Independent material/group views share queued images, while fast scrolling
+    /// can discard work that none of the mounted views still needs.
+    func updateThumbnailDemand(owner: UUID, assetIDs: Set<UUID>) {
+        guard let projectID = currentProject?.id else { releaseThumbnailDemand(owner: owner); return }
+        thumbnailDemandOwners[owner] = ThumbnailDemand(projectID: projectID, assetIDs: assetIDs)
+        cancelObsoleteThumbnailRequests()
+    }
+
+    func releaseThumbnailDemand(owner: UUID) {
+        thumbnailDemandOwners.removeValue(forKey: owner)
+        cancelObsoleteThumbnailRequests()
+    }
+
+    private func cancelObsoleteThumbnailRequests() {
+        var needed: [UUID: Set<UUID>] = [:]
+        for demand in thumbnailDemandOwners.values {
+            needed[demand.projectID, default: []].formUnion(demand.assetIDs)
+        }
+        for (key, request) in thumbnailRequests where !request.hasUnscopedDemand
+            && !request.operation.isExecuting && !request.operation.isFinished
+            && !(needed[request.projectID]?.contains(request.assetID) ?? false) {
+            request.operation.cancel()
+            thumbnailRequests.removeValue(forKey: key)
+        }
+    }
+
+    func thumbnail(for asset: ProjectAsset,
+                   maximumPixelSize: Int = ProjectThumbnailDiskCache.maximumPixelSize,
+                   priority: Operation.QueuePriority = .normal,
+                   owner: UUID? = nil) -> NSImage? {
+        thumbnail(for: asset, resolution: .browsing(maximumPixelSize: maximumPixelSize), priority: priority, owner: owner)
+    }
+
+    func detailedThumbnail(for asset: ProjectAsset, priority: Operation.QueuePriority = .low,
+                           owner: UUID? = nil) -> NSImage? {
+        thumbnail(for: asset, resolution: .detail1080, priority: priority, owner: owner)
+    }
+
+    func displayThumbnail(for asset: ProjectAsset, pixelSize: Int,
+                          priority: Operation.QueuePriority = .low, owner: UUID? = nil) -> NSImage? {
+        thumbnail(for: asset, resolution: .display(pixelSize: pixelSize), priority: priority, owner: owner)
+    }
+
+    private func thumbnail(for asset: ProjectAsset, resolution: ProjectThumbnailResolution,
+                           priority: Operation.QueuePriority, owner: UUID?) -> NSImage? {
+        guard let projectID = currentProject?.id else { return nil }
+        let cached = cachedThumbnailEntry(for: asset, projectID: projectID)
+        if let cached, cached.resolution.rawValue >= resolution.rawValue { return cached.image }
+        let key = thumbnailKey(for: asset, projectID: projectID, resolution: resolution)
+        let requestPriority: Operation.QueuePriority = cached != nil && priority.rawValue > Operation.QueuePriority.low.rawValue
+            ? .low : priority
+        if var pending = thumbnailRequests[key] {
+            // A prefetched photo may scroll into view before its task begins.
+            if pending.operation.queuePriority.rawValue < requestPriority.rawValue {
+                pending.operation.queuePriority = requestPriority
+            }
+            if owner == nil {
+                pending.hasUnscopedDemand = true
+                thumbnailRequests[key] = pending
+            }
+            return cached?.image
+        }
+        guard !failedThumbnails.contains(key) else { return cached?.image }
+        let requestID = UUID()
         let url = assetURL(asset)
-        thumbnailQueue.addOperation { [weak self] in
-            let image = Self.readThumbnail(url, maximum: pixelSize)
+        let cacheDirectory = assetDirectory(projectID: projectID).deletingLastPathComponent()
+            .appendingPathComponent(".thumbnails/v2", isDirectory: true)
+        let operation = BlockOperation { [weak self] in
+            let image = autoreleasepool {
+                ProjectThumbnailDiskCache.load(sourceURL: url, cacheDirectory: cacheDirectory,
+                                               assetID: asset.id, contentRevision: asset.contentRevision,
+                                               resolution: resolution)?.image
+            }
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.thumbnailRequests.remove(key)
+                // Cancel may race with a queue starting a request. An obsolete
+                // completion must not remove a newer request for the same key.
+                guard let self, self.thumbnailRequests[key]?.id == requestID else { return }
+                self.thumbnailRequests.removeValue(forKey: key)
                 guard let image else {
                     self.failedThumbnails.insert(key)
                     return
                 }
                 let preview = NSImage(cgImage: image, size: CGSize(width: image.width, height: image.height))
+                ProjectThumbnailMetadata.register(preview, resolution: resolution)
                 self.thumbnails.setObject(preview, forKey: key as NSString, cost: image.bytesPerRow * image.height)
-                self.scheduleThumbnailNotification()
+                self.scheduleThumbnailNotification(for: asset.id)
             }
         }
-        return nil
+        // Fill empty cells before spending time refining already visible images.
+        operation.queuePriority = requestPriority
+        thumbnailRequests[key] = ThumbnailRequest(id: requestID, projectID: projectID, assetID: asset.id,
+                                                  operation: operation, hasUnscopedDemand: owner == nil)
+        thumbnailQueue.addOperation(operation)
+        return cached?.image
     }
 
-    private func scheduleThumbnailNotification() {
+    private func scheduleThumbnailNotification(for assetID: UUID) {
+        completedThumbnailIDs.insert(assetID)
         guard !thumbnailNotificationScheduled else { return }
         thumbnailNotificationScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
             self.thumbnailNotificationScheduled = false
-            self.thumbnailUpdates.invalidate()
+            let completed = self.completedThumbnailIDs
+            self.completedThumbnailIDs.removeAll(keepingCapacity: true)
+            self.thumbnailUpdates.invalidate(completed)
         }
     }
 
@@ -676,6 +971,31 @@ nonisolated private struct ProjectImportRequest: Sendable {
         }
     }
 
+    /// Move a group to its final zero-based position after removing it from the list.
+    /// Drag/drop callers can therefore keep a stable insertion index while hovering.
+    func moveGroup(_ id: UUID, to targetIndex: Int) {
+        editDocument { document in
+            guard let sourceIndex = document.groups.firstIndex(where: { $0.id == id }) else { return }
+            let group = document.groups.remove(at: sourceIndex)
+            let destination = min(max(0, targetIndex), document.groups.count)
+            document.groups.insert(group, at: destination)
+        }
+    }
+
+    /// Resolve both identities against the current document at mouse-up. Hover
+    /// state is only a visual hint and must never decide the committed position.
+    @discardableResult
+    func moveGroup(_ id: UUID, relativeTo targetID: UUID, before: Bool) -> Bool {
+        guard id != targetID, var reordered = currentProject?.groups,
+              let source = reordered.firstIndex(where: { $0.id == id }),
+              reordered.contains(where: { $0.id == targetID }) else { return false }
+        let group = reordered.remove(at: source)
+        guard let target = reordered.firstIndex(where: { $0.id == targetID }) else { return false }
+        reordered.insert(group, at: target + (before ? 0 : 1))
+        editDocument { $0.groups = reordered }
+        return currentProject?.groups == reordered
+    }
+
     func moveGroupAsset(_ assetID: UUID, in groupID: UUID, by offset: Int) {
         guard let group = currentProject?.groups.first(where: { $0.id == groupID }),
               let index = group.assetIDs.firstIndex(of: assetID) else { return }
@@ -720,7 +1040,12 @@ nonisolated private struct ProjectImportRequest: Sendable {
         guard var document = documentForEditing(), let previous = editHistory[document.id]?.last else { return }
         let byID = Dictionary(uniqueKeysWithValues: previous.assets.map { ($0.id, $0) })
         for index in document.assets.indices {
-            if let asset = byID[document.assets[index].id] { document.assets[index] = asset }
+            guard let asset = byID[document.assets[index].id] else { continue }
+            // Undo covers organization edits. An original replaced by a later
+            // import keeps its current metadata and decoded-preview identity.
+            document.assets[index].position = asset.position
+            document.assets[index].groupID = asset.groupID
+            document.assets[index].isRemoved = asset.isRemoved
         }
         document.groups = previous.groups
         let previousIDs = Set(previous.materialOrder)
@@ -946,13 +1271,12 @@ nonisolated private struct ProjectImportRequest: Sendable {
               }) else { throw ProjectLibraryError.invalidMetadata }
     }
 
-    nonisolated private static func copyImages(_ urls: [URL], to directory: URL, excluding protectedDirectories: [URL]) -> ProjectImportResult {
-        var result = ProjectImportResult(assets: [], failures: [])
+    nonisolated private static func scanImages(_ urls: [URL], excluding protectedDirectories: [URL]) -> ProjectImportScan {
+        var result = ProjectImportScan(imageURLs: [], failures: [])
         let manager = FileManager.default
         let protectedPaths = protectedDirectories.map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
         let resourceKeys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
-                                                .isHiddenKey, .isPackageKey, .contentTypeKey]
-        var imageURLs: [URL] = []
+                                                .isHiddenKey, .isPackageKey, .contentTypeKey, .fileSizeKey]
         var seenFiles: Set<String> = []
         var scannedDirectories: [String: Int] = [:]
 
@@ -979,7 +1303,6 @@ nonisolated private struct ProjectImportRequest: Sendable {
                         return 0
                     }
                     if let count = scannedDirectories[canonical.path] { return count }
-                    // Reserve before descending, even though symbolic links are skipped.
                     scannedDirectories[canonical.path] = 0
                     let children = try manager.contentsOfDirectory(at: url,
                                                                     includingPropertiesForKeys: Array(resourceKeys),
@@ -1011,7 +1334,7 @@ nonisolated private struct ProjectImportRequest: Sendable {
                     if isRoot { result.recordFailure("\(url.lastPathComponent)：不是支持的图片") }
                     return 0
                 }
-                if seenFiles.insert(canonical.path).inserted { imageURLs.append(url) }
+                if seenFiles.insert(canonical.path).inserted { result.imageURLs.append(url) }
                 return 1
             } catch {
                 result.recordFailure("\(url.lastPathComponent)：无法读取")
@@ -1020,24 +1343,124 @@ nonisolated private struct ProjectImportRequest: Sendable {
         }
 
         for url in urls { _ = collectImages(at: url, isRoot: true) }
-        guard !imageURLs.isEmpty else { return result }
-        do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+        return result
+    }
+
+    nonisolated private static func canonicalPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    nonisolated private static func fileSize(of url: URL) -> UInt64? {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize, size >= 0 else { return nil }
+        return UInt64(size)
+    }
+
+    nonisolated private static func duplicateMatch(for url: URL, fileSize: UInt64?, existingAssets: [ProjectAsset])
+        -> (asset: ProjectAsset, reasons: [String])? {
+        let path = canonicalPath(url)
+        let name = url.lastPathComponent
+        for asset in existingAssets where !asset.isRemoved {
+            var reasons: [String] = []
+            if asset.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
+                reasons.append("文件名相同")
+            }
+            if let sourcePath = asset.sourcePath,
+               canonicalPath(URL(fileURLWithPath: sourcePath)) == path,
+               let sourceSize = asset.sourceFileSize, sourceSize == fileSize {
+                reasons.append("文件路径和大小相同")
+            }
+            if !reasons.isEmpty { return (asset, reasons) }
+        }
+        return nil
+    }
+
+    nonisolated private static func duplicateItems(in imageURLs: [URL], document: ProjectDocument) -> [ProjectDuplicateItem] {
+        imageURLs.compactMap { url in
+            guard let match = duplicateMatch(for: url, fileSize: fileSize(of: url),
+                                             existingAssets: document.assets) else { return nil }
+            return ProjectDuplicateItem(incomingID: UUID(), incomingName: url.lastPathComponent,
+                                        incomingPath: canonicalPath(url), existingName: match.asset.name,
+                                        reasons: match.reasons)
+        }
+    }
+
+    nonisolated private static func uniqueName(_ name: String, occupied: inout Set<String>) -> String {
+        let key = name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        guard occupied.contains(key) else { occupied.insert(key); return name }
+        let ext = URL(fileURLWithPath: name).pathExtension
+        let stem = ext.isEmpty ? name : String(name.dropLast(ext.count + 1))
+        var index = 2
+        while true {
+            let candidate = ext.isEmpty ? "\(stem) \(index)" : "\(stem) \(index).\(ext)"
+            let candidateKey = candidate.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            if occupied.insert(candidateKey).inserted { return candidate }
+            index += 1
+        }
+    }
+
+    nonisolated private static func copyImages(_ urls: [URL], to directory: URL,
+                                               excluding protectedDirectories: [URL],
+                                               existingAssets: [ProjectAsset],
+                                               duplicateResolution: ProjectDuplicateResolution?,
+                                               duplicateDecisions: [String: ProjectDuplicateResolution]?) -> ProjectImportResult {
+        let scan = scanImages(urls, excluding: protectedDirectories)
+        var result = ProjectImportResult(assets: [], failures: scan.failures, failureCount: scan.failureCount)
+        let manager = FileManager.default
+        do { try manager.createDirectory(at: directory, withIntermediateDirectories: true) }
         catch {
             result.recordFailure("无法创建项目素材目录：\(error.localizedDescription)")
             return result
         }
-        for url in imageURLs {
+        var occupiedNames = Set(existingAssets.filter { !$0.isRemoved }.map {
+            $0.name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        })
+        for url in scan.imageURLs {
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
             do {
                 guard url.isFileURL, readThumbnail(url, maximum: 64) != nil else { throw ProjectLibraryError.notAnImage }
+                let sourcePath = canonicalPath(url)
+                let sourceSize = fileSize(of: url)
+                let match = duplicateMatch(for: url, fileSize: sourceSize, existingAssets: existingAssets)
+                if let match {
+                    let policy = duplicateDecisions?[sourcePath] ?? duplicateResolution ?? .skip
+                    switch policy {
+                    case .skip:
+                        result.skippedDuplicates += 1
+                        continue
+                    case .overwrite:
+                        let destinationURL = directory.appendingPathComponent(match.asset.fileName)
+                        let temporaryURL = directory.appendingPathComponent(".\(UUID().uuidString).importing")
+                        try manager.copyItem(at: url.resolvingSymlinksInPath(), to: temporaryURL)
+                        if manager.fileExists(atPath: destinationURL.path) {
+                            _ = try manager.replaceItemAt(destinationURL, withItemAt: temporaryURL,
+                                                          backupItemName: nil, options: .usingNewMetadataOnly)
+                        } else {
+                            try manager.moveItem(at: temporaryURL, to: destinationURL)
+                        }
+                        var updated = match.asset
+                        updated.name = url.lastPathComponent
+                        updated.sourcePath = sourcePath
+                        updated.sourceFileSize = sourceSize
+                        updated.contentRevision = UUID()
+                        updated.isRemoved = false
+                        result.overwritten.append(updated)
+                        continue
+                    case .keepBoth:
+                        break
+                    }
+                }
                 let id = UUID()
                 let extensionPart = String(url.pathExtension.filter { $0.isLetter || $0.isNumber }.prefix(16))
                 let suffix = extensionPart.isEmpty ? "" : ".\(extensionPart)"
                 let fileName = id.uuidString + suffix
-                try FileManager.default.copyItem(at: url.resolvingSymlinksInPath(),
-                                                 to: directory.appendingPathComponent(fileName))
-                result.assets.append(ProjectAsset(id: id, fileName: fileName, name: url.lastPathComponent, position: .zero))
+                try manager.copyItem(at: url.resolvingSymlinksInPath(),
+                                     to: directory.appendingPathComponent(fileName))
+                let displayName = uniqueName(url.lastPathComponent, occupied: &occupiedNames)
+                result.assets.append(ProjectAsset(id: id, fileName: fileName, name: displayName,
+                                                  sourcePath: sourcePath, sourceFileSize: sourceSize,
+                                                  position: .zero))
             } catch { result.recordFailure("\(url.lastPathComponent)：无法导入") }
         }
         return result

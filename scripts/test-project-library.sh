@@ -4,17 +4,34 @@ library_project_root="$(cd "$(dirname "$0")/.." && pwd)"
 library_test_dir="$(mktemp -d /tmp/aoistitcher-library-tests.XXXXXX)"
 trap 'rm -rf "$library_test_dir"' EXIT
 
-# Compile the source graph for integration checks, then run only data regressions.
-# This runner never starts NSApplication, creates windows or touches the real library.
+# Compile the source graph, then run data, rendering, SwiftUI layout and native toolbar regressions.
+# Toolbar checks create an undisplayed window; nothing captures the screen or touches the real library.
 cat > "$library_test_dir/ProjectLibraryTestMain.swift" <<'SWIFT'
 import Foundation
 
 @main struct ProjectLibraryTestMain {
     @MainActor static func main() async throws {
+        setbuf(stdout, nil)
         let checks = try await ProjectLibraryRegressionTests.run()
         print("Project library: \(checks) checks passed")
         let gridChecks = try ProjectMaterialGridRegressionTests.run()
         print("Material grid: \(gridChecks) checks passed")
+        let groupChecks = try ProjectPhotoGroupInteractionTests.run()
+        print("Photo group interaction: \(groupChecks) checks passed")
+        let blankChecks = try await ProjectGroupBlankSelectionTests.run()
+        print("Group blank selection: \(blankChecks) checks passed")
+        let selectionChecks = try ProjectMaterialSelectionRegressionTests.run()
+        print("Material selection: \(selectionChecks) checks passed")
+        let layoutChecks = try ProjectPhotoGroupLayoutRegressionTests.run()
+        print("Photo group layout: \(layoutChecks) checks passed")
+        let thumbnailChecks = try await ProjectThumbnailCacheRegressionTests.run()
+        print("Thumbnail cache: \(thumbnailChecks) checks passed")
+        let renderingChecks = try ProjectThumbnailRenderingRegressionTests.run()
+        print("Thumbnail rendering: \(renderingChecks) checks passed")
+        let scopeChecks = try await ProjectThumbnailScopeRegressionTests.run()
+        print("Thumbnail scoped updates: \(scopeChecks) checks passed")
+        let navigationChecks = try ProjectWindowNavigationRegressionTests.run()
+        print("Window navigation: \(navigationChecks) checks passed")
     }
 }
 SWIFT
@@ -32,6 +49,14 @@ xcrun swiftc -parse-as-library -swift-version 5 -default-isolation MainActor \
     "${library_sources[@]}" \
     "$library_project_root/Tests/ProjectLibraryRegressionTests.swift" \
     "$library_project_root/Tests/ProjectMaterialGridRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectPhotoGroupInteractionTests.swift" \
+    "$library_project_root/Tests/ProjectGroupBlankSelectionTests.swift" \
+    "$library_project_root/Tests/ProjectMaterialSelectionRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectPhotoGroupLayoutRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectThumbnailCacheRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectThumbnailRenderingRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectThumbnailScopeRegressionTests.swift" \
+    "$library_project_root/Tests/ProjectWindowNavigationRegressionTests.swift" \
     "$library_test_dir/ProjectLibraryTestMain.swift" \
     -o "$library_test_dir/project-library-tests"
 "$library_test_dir/project-library-tests"
