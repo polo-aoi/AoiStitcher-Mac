@@ -158,8 +158,10 @@ struct ExportSettingsView: View {
 struct AppSettingsView: View {
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
+    @AppStorage(AppPreferences.projectRootKey) private var projectRootPath = ""
     @Environment(\.openWindow) private var openWindow
     @State private var restored = false
+    @State private var pendingProjectRoot = false
     @ObservedObject private var longStitchPreferences = LongStitchPreferences.shared
 
     var body: some View {
@@ -189,6 +191,8 @@ struct AppSettingsView: View {
                 }.pickerStyle(.segmented).labelsHidden()
             }
             Divider()
+            projectStorageSection
+            Divider()
             workspaceOrderSettings
             Divider()
             EditorSection("导出") { ExportSettingsFields() }
@@ -217,6 +221,44 @@ struct AppSettingsView: View {
 
     private var workspaceOrder: [AppWorkspace] {
         AppPreferences.workspaceOrder(from: storedWorkspaceOrder)
+    }
+
+    private var resolvedProjectRoot: URL {
+        AppPreferences.projectRootURL()
+    }
+
+    private var projectStorageSection: some View {
+        EditorSection("项目存储位置") {
+            Text(resolvedProjectRoot.path)
+                .font(.callout).foregroundStyle(.secondary)
+                .lineLimit(2).truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("所有项目的素材副本和资料都存放在这里，方便备份和迁移。更改后重启应用生效。")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.allowsMultipleSelection = false
+                    panel.directoryURL = resolvedProjectRoot
+                    panel.prompt = "选择"
+                    panel.message = "选择项目存储位置（将在此目录下创建「\(AppPreferences.defaultProjectRootName)」子目录）"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        let root = url.appendingPathComponent(AppPreferences.defaultProjectRootName, isDirectory: true)
+                        projectRootPath = root.path
+                        pendingProjectRoot = true
+                    }
+                } label: {
+                    Label("更改位置…", systemImage: "folder")
+                }
+                if pendingProjectRoot {
+                    Text("重启后生效").font(.caption).foregroundStyle(.orange)
+                }
+                Spacer()
+            }
+        }
     }
 
     private var workspaceOrderSettings: some View {

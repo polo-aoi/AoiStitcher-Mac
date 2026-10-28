@@ -58,7 +58,24 @@ enum AppPreferences {
     static let canvasInteractionKeys = [canvasWheelBehaviorKey, canvasGestureBehaviorKey,
         canvasZoomSensitivityKey, canvasReverseZoomKey, canvasPanModeKey, canvasPanKeyKey]
     static let exportKeys = ["exportWidth", "exportPNG"]
+    // The project root is intentionally NOT included in preferenceKeys: restoring
+    // defaults must never relocate the user's existing projects.
+    static nonisolated let projectRootKey = "projectRootDirectory.v1"
+    static nonisolated let defaultProjectRootName = "AoiStitcher 项目"
     static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey]
+
+    /// The user-facing directory that holds every project folder. Defaults to
+    /// `~/Pictures/AoiStitcher 项目/` so copies and project data stay visible and
+    /// backup-friendly instead of buried in Application Support.
+    static nonisolated func projectRootURL(in defaults: UserDefaults = .standard) -> URL {
+        if let stored = defaults.string(forKey: projectRootKey),
+           !stored.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return URL(fileURLWithPath: stored, isDirectory: true)
+        }
+        let pictures = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent("Pictures", isDirectory: true)
+        return pictures.appendingPathComponent(defaultProjectRootName, isDirectory: true)
+    }
 
     static func workspaceOrder(from storedOrder: String) -> [AppWorkspace] {
         let identifiers = (try? JSONDecoder().decode([String].self, from: Data(storedOrder.utf8))) ?? []

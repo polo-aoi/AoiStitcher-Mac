@@ -71,6 +71,9 @@ private struct ProjectHomeView: View {
     @State private var showingNewProject = false
     @State private var projectName = ""
     @State private var isDropTargeted = false
+    @State private var renamingProject: ProjectSummary?
+    @State private var renamingText = ""
+    @State private var deletingProject: ProjectSummary?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 26) {
@@ -122,23 +125,17 @@ private struct ProjectHomeView: View {
             } else {
                 Text("最近项目").font(.headline)
                 ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 250), spacing: 16)], spacing: 16) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 16)], spacing: 16) {
                         ForEach(library.projects) { project in
-                            Button { library.openProject(id: project.id) } label: {
-                                VStack(alignment: .leading, spacing: 14) {
-                                    Image(systemName: "folder").font(.system(size: 30))
-                                        .foregroundStyle(Color.accentColor)
-                                    Text(project.name).font(.title3.weight(.semibold)).lineLimit(1)
-                                    HStack {
-                                        Text("\(project.assetCount) 张素材")
-                                        Spacer()
-                                        Text(project.modifiedAt, style: .date)
-                                    }.font(.caption).foregroundStyle(.secondary)
-                                }
-                                .padding(20).frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-                                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
-                            }.buttonStyle(.plain)
+                            ProjectCoverCard(
+                                library: library,
+                                project: project,
+                                onOpen: { library.openProject(id: project.id) },
+                                onRename: { renamingProject = project; renamingText = project.name },
+                                onReveal: { library.revealProjectInFinder(id: project.id) },
+                                onDelete: { deletingProject = project },
+                                onRepair: { repairProject(project) }
+                            )
                         }
                     }.padding(2).projectOverlayScrollbars()
                 }
@@ -156,7 +153,7 @@ private struct ProjectHomeView: View {
                 Text("新建项目").font(.title2.weight(.semibold))
                 TextField("项目名称", text: $projectName).textFieldStyle(.roundedBorder)
                     .onSubmit(createProject)
-                Text("照片会复制到项目素材库。也可以把文件夹拖到这里，直接用文件夹名称创建。")
+                Text("项目只记录照片的原始位置，不复制原图；移动原文件后可用「修复项目」重新连接。也可以把文件夹拖到这里，直接用文件夹名称创建。")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack {
                     Spacer()
@@ -168,6 +165,49 @@ private struct ProjectHomeView: View {
             }.padding(24).frame(width: 410)
                 .contentShape(Rectangle())
                 .dropDestination(for: URL.self) { urls, _ in createProjectFromDrop(urls) }
+        }
+        .sheet(item: $renamingProject) { project in
+            VStack(alignment: .leading, spacing: 18) {
+                Text("重命名项目").font(.title2.weight(.semibold))
+                TextField("项目名称", text: $renamingText).textFieldStyle(.roundedBorder)
+                    .onSubmit(confirmRename)
+                HStack {
+                    Spacer()
+                    Button("取消") { renamingProject = nil }.keyboardShortcut(.cancelAction)
+                    Button("重命名", action: confirmRename)
+                        .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        .disabled(renamingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }.padding(24).frame(width: 380)
+        }
+        .confirmationDialog("删除项目「\(deletingProject?.name ?? "")」？",
+                            isPresented: Binding(get: { deletingProject != nil },
+                                                 set: { if !$0 { deletingProject = nil } }),
+                            titleVisibility: .visible) {
+            Button("删除", role: .destructive) {
+                if let project = deletingProject { library.deleteProject(id: project.id) }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("项目内的照片副本和资料将一并移到废纸篓，不影响电脑上的原文件。此操作不可撤销。")
+        }
+    }
+
+    private func confirmRename() {
+        guard let project = renamingProject else { return }
+        library.renameProject(id: project.id, to: renamingText)
+        renamingProject = nil
+    }
+
+    private func repairProject(_ project: ProjectSummary) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "开始修复"
+        panel.message = "选择缺失照片现在所在的位置（会按文件名在子文件夹里自动匹配）。"
+        if panel.runModal() == .OK, let folder = panel.url {
+            library.repairProject(id: project.id, locatingIn: folder)
         }
     }
 
@@ -193,6 +233,122 @@ private struct ProjectHomeView: View {
         guard !name.isEmpty else { return }
         showingNewProject = false
         library.createProject(name: name)
+    }
+}
+
+private struct ProjectCoverImage: View {
+    let library: ProjectLibraryStore
+    let projectID: UUID
+    let asset: ProjectSummaryCoverAsset
+    @State private var image: NSImage?
+
+    var body: some View {
+        // The plain Color fixes the layout at the container's size; scaledToFill
+        // only paints inside the overlay, so tall photos can never stretch the
+        // collage or bleed into neighboring cards.
+        Color.gray.opacity(0.12)
+            .overlay {
+                if let image {
+                    Image(nsImage: image).resizable().scaledToFill()
+                }
+            }
+            .clipped()
+            .task(id: "\(projectID.uuidString)/\(asset.id.uuidString)") {
+                if image == nil {
+                    image = await library.requestCoverThumbnail(projectID: projectID, asset: asset)
+                }
+            }
+    }
+}
+
+private struct ProjectCoverCard: View {
+    let library: ProjectLibraryStore
+    let project: ProjectSummary
+    let onOpen: () -> Void
+    let onRename: () -> Void
+    let onReveal: () -> Void
+    let onDelete: () -> Void
+    let onRepair: () -> Void
+
+    var body: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 0) {
+                coverArea
+                infoArea
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button("打开") { onOpen() }
+            Button("重命名…") { onRename() }
+            Button("修复项目…") { onRepair() }
+                .disabled(project.missingCount == 0)
+            Button("在访达中显示") { onReveal() }
+            Divider()
+            Button("删除项目…", role: .destructive) { onDelete() }
+        }
+    }
+
+    private var coverArea: some View {
+        ZStack {
+            if project.coverAssets.isEmpty {
+                ZStack {
+                    Rectangle().fill(Color.gray.opacity(0.12))
+                    VStack(spacing: 6) {
+                        Image(systemName: "photo.on.rectangle.angled").font(.system(size: 28, weight: .light))
+                        Text("还没有照片").font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            } else {
+                HStack(spacing: 2) {
+                    ProjectCoverImage(library: library, projectID: project.id, asset: project.coverAssets[0])
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if project.coverAssets.count >= 2 {
+                        VStack(spacing: 2) {
+                            ProjectCoverImage(library: library, projectID: project.id, asset: project.coverAssets[1])
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            if project.coverAssets.count >= 3 {
+                                ProjectCoverImage(library: library, projectID: project.id, asset: project.coverAssets[2])
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
+                        }
+                        .frame(width: 110)
+                    }
+                }
+            }
+        }
+        .frame(height: 190)
+        .clipped()
+        // The badge lives above the clipped collage so a portrait photo can
+        // never cover or displace it.
+        .overlay(alignment: .bottomLeading) {
+            Text("共 \(project.assetCount) 张")
+                .font(.caption2)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(.black.opacity(0.6), in: Capsule())
+                .foregroundStyle(.white)
+                .padding(8)
+        }
+    }
+
+    private var infoArea: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(project.name).font(.title3.weight(.semibold)).lineLimit(1)
+            HStack(spacing: 8) {
+                Text(project.modifiedAt, format: .dateTime.year().month().day().hour().minute()
+                    .locale(Locale(identifier: "zh_CN")))
+                    .font(.caption).foregroundStyle(.secondary)
+                if project.missingCount > 0 {
+                    Label("\(project.missingCount) 张缺图", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2).foregroundStyle(.orange)
+                }
+            }
+        }
+        .padding(12)
     }
 }
 

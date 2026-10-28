@@ -5,3 +5,9 @@ xcuserdata/
 # Local build products
 DerivedData/
 build/
+
+# WorkBuddy internal data (memory/tooling, not source)
+.workbuddy/
+
+# macOS
+.DS_Store

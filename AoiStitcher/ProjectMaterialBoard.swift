@@ -200,6 +200,12 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
     // the selected set available while Quick Look moves the active item.
     private var previewAssetIDs: [UUID] = []
     private var previewIndex = 0
+    // Quick Look handles arrow keys and its ‹ › buttons internally; the panel's
+    // currentPreviewItemIndex is the only reliable signal for panel-driven
+    // navigation, observed here so the grid selection can follow it.
+    private var isSynchronizingPreview = false
+    private var observedPreviewPanel: QLPreviewPanel?
+    private static var previewIndexObservationContext = 0
     private var pendingSelection: Set<UUID>?
     private var lastPublishedSelection: Set<UUID> = []
     private var lastExternalSelection: Set<UUID> = []
@@ -1221,19 +1227,31 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
         }
         guard let panel = QLPreviewPanel.shared() else { return }
         presentPreview(acquireControl: {
+            // Quick Look resolves the controller from the key window's
+            // responder chain only when the panel is about to become key.
+            // A never-opened hidden panel therefore has no currentController
+            // yet, so the panel must be shown inside the handoff to trigger
+            // the begin callback before the first frame is exposed.
             panel.updateController()
-            guard let controller = panel.currentController as? ProjectMaterialDocumentView,
-                  controller === self else { return false }
             // Closing clears our datasource, but Quick Look can retain this
-            // controller while hidden and omit a second begin callback.
-            panel.dataSource = self
-            panel.delegate = self
+            // controller while hidden and omit a second begin callback. Take
+            // the datasource back before exposing the panel again.
+            if panel.dataSource !== self,
+               let controller = panel.currentController as? ProjectMaterialDocumentView,
+               controller === self {
+                panel.dataSource = self
+                panel.delegate = self
+            }
+            panel.makeKeyAndOrderFront(self)
+            guard panel.dataSource === self else {
+                panel.orderOut(self)
+                return false
+            }
             return true
         }, synchronize: {
             self.synchronizePreviewPanel(panel)
-        }, show: {
-            panel.makeKeyAndOrderFront(self)
-        })
+            self.startObservingPreviewIndex(panel)
+        }, show: {})
     }
 
     /// Keep the first visible frame behind the same preparation barrier for
@@ -1258,6 +1276,10 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
 
     private func synchronizePreviewPanel(_ panel: QLPreviewPanel) {
         guard panel.dataSource === self, !previewItems.isEmpty else { return }
+        // Transient index changes during our own reload must not be mistaken
+        // for panel-driven navigation.
+        isSynchronizingPreview = true
+        defer { isSynchronizingPreview = false }
         panel.reloadData()
         panel.currentPreviewItemIndex = previewIndex
     }
@@ -1265,7 +1287,12 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
     var preparedPreviewIndex: Int { previewIndex }
 
     private func closePreview(_ panel: QLPreviewPanel, restoreFocus: Bool = true) {
+        stopObservingPreviewIndex()
         panel.orderOut(self)
+        // Panel-native navigation (arrows, ‹ › buttons) never passes through
+        // previewPanel(_:handle:); fold the panel's final index back into the
+        // selection so closing lands on the photo that was actually viewed.
+        if restoreFocus { syncSelectionToPanelIndex(panel) }
         if panel.dataSource === self { panel.dataSource = nil }
         if panel.delegate === self { panel.delegate = nil }
         previewItems = []
@@ -1283,9 +1310,11 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
         panel.dataSource = self
         panel.delegate = self
         synchronizePreviewPanel(panel)
+        startObservingPreviewIndex(panel)
     }
 
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        stopObservingPreviewIndex()
         if panel.dataSource === self { panel.dataSource = nil }
         if panel.delegate === self { panel.delegate = nil }
     }
@@ -1358,6 +1387,48 @@ final class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPane
         setDisplayedIndex(next)
         updateSelection([previewAssetIDs[next]])
         revealAsset(previewAssetIDs[next])
+    }
+
+    /// Finder keeps the underlying selection on the item Quick Look is showing.
+    /// Since the panel consumes arrow keys and ‹ › clicks internally, observe
+    /// currentPreviewItemIndex instead of waiting for delegate events.
+    private func startObservingPreviewIndex(_ panel: QLPreviewPanel) {
+        guard observedPreviewPanel !== panel, panel.dataSource === self else { return }
+        stopObservingPreviewIndex()
+        panel.addObserver(self, forKeyPath: "currentPreviewItemIndex",
+                          options: [], context: &Self.previewIndexObservationContext)
+        observedPreviewPanel = panel
+    }
+
+    private func stopObservingPreviewIndex() {
+        guard let panel = observedPreviewPanel else { return }
+        observedPreviewPanel = nil
+        panel.removeObserver(self, forKeyPath: "currentPreviewItemIndex",
+                             context: &Self.previewIndexObservationContext)
+    }
+
+    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
+                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
+        guard context == &Self.previewIndexObservationContext else {
+            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+            return
+        }
+        guard !isSynchronizingPreview, let panel = observedPreviewPanel,
+              object as? QLPreviewPanel === panel else { return }
+        syncSelectionToPanelIndex(panel)
+    }
+
+    private func syncSelectionToPanelIndex(_ panel: QLPreviewPanel) {
+        guard panel.dataSource === self else { return }
+        syncSelectionToPreviewIndex(panel.currentPreviewItemIndex)
+    }
+
+    /// The bounds check also rejects stale values such as NSNotFound.
+    func syncSelectionToPreviewIndex(_ index: Int) {
+        guard previewAssetIDs.indices.contains(index), index != previewIndex else { return }
+        previewIndex = index
+        updateSelection([previewAssetIDs[index]])
+        revealAsset(previewAssetIDs[index])
     }
 
     private func navigateSelectionWithArrow(_ key: UInt16) {

@@ -167,6 +167,17 @@ import QuickLookUI
         }, show: { steps.append("show") })
         try check(!rejected && steps.isEmpty,
                   "A failed controller handoff never exposes stale Quick Look content")
+
+        board.syncSelectionToPreviewIndex(0)
+        try check(selection == [first.id] && board.preparedPreviewIndex == 0,
+                  "Panel-driven navigation folds the visible photo into the selection")
+        board.syncSelectionToPreviewIndex(0)
+        try check(selection == [first.id] && board.preparedPreviewIndex == 0,
+                  "A repeated identical panel index leaves the selection untouched")
+        board.syncSelectionToPreviewIndex(Int.max)
+        board.syncSelectionToPreviewIndex(-1)
+        try check(selection == [first.id] && board.preparedPreviewIndex == 0,
+                  "Stale panel indices such as NSNotFound never disturb the selection")
         try check(moves == 0, "Quick Look navigation never edits photo order or positions")
         return checks
     }

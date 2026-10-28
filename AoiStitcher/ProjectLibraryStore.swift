@@ -44,10 +44,15 @@ nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
     var groupID: UUID?
     // Retain identity and originals so export history and undo remain valid after removal.
     var isRemoved: Bool = false
+    /// Reference assets read the untouched original at `sourcePath` directly;
+    /// legacy copy assets keep reading the duplicate stored in the project's
+    /// Originals folder. Defaults to false so old projects decode unchanged.
+    var isReference: Bool = false
 
     init(id: UUID, fileName: String, name: String, sourcePath: String? = nil,
          sourceFileSize: UInt64? = nil, contentRevision: UUID? = nil,
-         position: CGPoint, groupID: UUID? = nil, isRemoved: Bool = false) {
+         position: CGPoint, groupID: UUID? = nil, isRemoved: Bool = false,
+         isReference: Bool = false) {
         self.id = id
         self.fileName = fileName
         self.name = name
@@ -57,10 +62,11 @@ nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
         self.position = position
         self.groupID = groupID
         self.isRemoved = isRemoved
+        self.isReference = isReference
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, fileName, name, sourcePath, sourceFileSize, contentRevision, position, groupID, isRemoved
+        case id, fileName, name, sourcePath, sourceFileSize, contentRevision, position, groupID, isRemoved, isReference
     }
 
     init(from decoder: Decoder) throws {
@@ -75,6 +81,7 @@ nonisolated struct ProjectAsset: Identifiable, Codable, Equatable, Sendable {
         groupID = try values.decodeIfPresent(UUID.self, forKey: .groupID)
         // Old ratings and color labels are deliberately ignored when reading existing projects.
         isRemoved = try values.decodeIfPresent(Bool.self, forKey: .isRemoved) ?? false
+        isReference = try values.decodeIfPresent(Bool.self, forKey: .isReference) ?? false
     }
 }
 
@@ -274,11 +281,23 @@ nonisolated private final class ProjectMetadataWriter: @unchecked Sendable {
     }
 }
 
+nonisolated struct ProjectSummaryCoverAsset: Sendable {
+    let id: UUID
+    let fileName: String
+    let contentRevision: UUID?
+    let sourcePath: String?
+    let isReference: Bool
+}
+
 nonisolated struct ProjectSummary: Identifiable, Sendable {
     var id: UUID
     var name: String
     var modifiedAt: Date
     var assetCount: Int
+    /// First few active assets, in material order, used for the home cover.
+    var coverAssets: [ProjectSummaryCoverAsset]
+    /// Active photos whose source file can no longer be found on disk.
+    var missingCount: Int
 }
 
 /// The choices shown when an import contains files already represented by the project.
@@ -403,11 +422,20 @@ nonisolated private struct PendingDuplicateImport: Sendable {
 }
 
 @MainActor final class ProjectLibraryStore: ObservableObject {
-    nonisolated static let projectsDirectory: URL = {
+    /// The pre-root-config location inside Application Support. Kept only as the
+    /// one-time migration source for projects created before the configurable root.
+    nonisolated static let legacyProjectsDirectory: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         return base.appendingPathComponent("aoipic/Projects", isDirectory: true)
     }()
+
+    /// The active project root, read from user preferences so copies and project
+    /// data live in a visible, backup-friendly location (default
+    /// `~/Pictures/AoiStitcher 项目/`).
+    nonisolated static func configuredProjectsDirectory(in defaults: UserDefaults = .standard) -> URL {
+        AppPreferences.projectRootURL(in: defaults)
+    }
 
     @Published private(set) var projects: [ProjectSummary] = []
     @Published private(set) var currentProject: ProjectDocument?
@@ -459,12 +487,18 @@ nonisolated private struct PendingDuplicateImport: Sendable {
         return !(editHistory[id]?.isEmpty ?? true)
     }
 
-    init(projectsDirectory: URL = ProjectLibraryStore.projectsDirectory, thumbnailQueue: OperationQueue? = nil) {
+    init(projectsDirectory: URL = ProjectLibraryStore.configuredProjectsDirectory(), thumbnailQueue: OperationQueue? = nil) {
         directory = projectsDirectory
         self.thumbnailQueue = thumbnailQueue ?? Self.makeThumbnailQueue()
         thumbnails.countLimit = 2_000
         thumbnails.totalCostLimit = 64 * 1024 * 1024
         refreshProjects()
+        // Only migrate from the legacy Application Support location when running
+        // against the configured production root. Tests pass a disposable
+        // directory and must never touch the user's real library.
+        if projectsDirectory == Self.configuredProjectsDirectory() {
+            migrateLegacyProjectsIfNeeded()
+        }
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
             .merge(with: NotificationCenter.default.publisher(for: NSWindow.willCloseNotification))
             .sink { [weak self] _ in _ = self?.flushPendingSaves() }
@@ -497,6 +531,47 @@ nonisolated private struct PendingDuplicateImport: Sendable {
             if failures > 0 { message = "有 \(failures) 个项目资料无法读取，原文件已保留在项目目录中。" }
         } catch {
             message = "读取项目列表失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// One-time relocation of projects from the old Application Support location
+    /// into the configured visible root. Each project folder keeps its UUID name
+    /// so the catalog logic and existing assets are untouched. Idempotent: a
+    /// project already present in the new root is left alone.
+    private func migrateLegacyProjectsIfNeeded() {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: Self.legacyProjectsDirectory.path) else { return }
+        guard let entries = try? fileManager.contentsOfDirectory(at: Self.legacyProjectsDirectory,
+                                                                  includingPropertiesForKeys: [.isDirectoryKey],
+                                                                  options: [.skipsHiddenFiles]) else { return }
+        var moved = 0
+        for entry in entries {
+            guard UUID(uuidString: entry.lastPathComponent) != nil,
+                  (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            // Only move folders that actually contain a project document.
+            let metadata = entry.appendingPathComponent("project.json")
+            guard fileManager.fileExists(atPath: metadata.path) else { continue }
+            let destination = directory.appendingPathComponent(entry.lastPathComponent, isDirectory: true)
+            if fileManager.fileExists(atPath: destination.path) { continue }
+            do {
+                try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+                try fileManager.moveItem(at: entry, to: destination)
+                moved += 1
+            } catch {
+                message = "迁移项目「\(entry.lastPathComponent)」失败：\(error.localizedDescription) 原项目仍保留在 \(Self.legacyProjectsDirectory.path)。"
+            }
+        }
+        if moved > 0 {
+            refreshProjects()
+            message = "已将 \(moved) 个项目迁移到新的存储位置：\(directory.path)"
+        }
+        // Remove the now-empty legacy directory so future launches skip the scan.
+        if moved > 0,
+           let remaining = try? fileManager.contentsOfDirectory(at: Self.legacyProjectsDirectory,
+                                                                 includingPropertiesForKeys: nil,
+                                                                 options: [.skipsHiddenFiles]),
+           remaining.isEmpty {
+            try? fileManager.removeItem(at: Self.legacyProjectsDirectory)
         }
     }
 
@@ -565,6 +640,149 @@ nonisolated private struct PendingDuplicateImport: Sendable {
         currentProject = nil
     }
 
+    /// Reveals the project folder in Finder so the user can manage copies and
+    /// project data in the configured root.
+    func revealProjectInFinder(id: UUID) {
+        let url = projectDirectory(id: id)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    /// Renames a project without touching its folder (folders are UUID-named for
+    /// stability). Updates the document, persists it, and refreshes the summary.
+    func renameProject(id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            var document = try readDocument(id: id)
+            guard document.name != trimmed else { return }
+            document.name = trimmed
+            document.modifiedAt = Date()
+            try saveDocument(document)
+            if currentProject?.id == id { currentProject = document }
+            updateSummary(document)
+        } catch {
+            message = "重命名项目失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// Moves a project folder to the Trash after flushing any pending edits.
+    /// The original imported photos (for copy-mode projects) are removed with
+    /// the folder; referenced originals on disk are never touched.
+    func deleteProject(id: UUID) {
+        if currentProject?.id == id {
+            guard flushPendingSaves() else {
+                message = "项目仍有未保存的修改，无法删除。请稍后再试。"
+                return
+            }
+            currentProject = nil
+        }
+        let url = projectDirectory(id: id)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            documents.removeValue(forKey: id)
+            projects.removeAll { $0.id == id }
+            return
+        }
+        var resultingURL: NSURL?
+        do {
+            try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        } catch {
+            message = "删除项目失败：\(error.localizedDescription) 可手动删除 \(url.path)。"
+            return
+        }
+        let projectName = projects.first(where: { $0.id == id })?.name ?? ""
+        documents.removeValue(forKey: id)
+        projects.removeAll { $0.id == id }
+        message = "项目「\(projectName)」已移到废纸篓。"
+    }
+
+    /// Re-links reference assets whose source file is missing by searching the
+    /// chosen folder (including subfolders) for files with the same name.
+    /// Returns the number of photos re-linked.
+    @discardableResult
+    func repairProject(id: UUID, locatingIn folder: URL) -> Int {
+        var document: ProjectDocument
+        do { document = try readDocument(id: id) } catch {
+            message = "读取项目失败，无法修复：\(error.localizedDescription)"
+            return 0
+        }
+        let manager = FileManager.default
+        var nameIndex: [String: URL] = [:]
+        if let enumerator = manager.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey],
+                                               options: [.skipsHiddenFiles]) {
+            for case let url as URL in enumerator {
+                guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
+                let key = url.lastPathComponent.lowercased()
+                if nameIndex[key] == nil { nameIndex[key] = url }
+            }
+        }
+        var repaired = 0
+        for index in document.assets.indices {
+            let asset = document.assets[index]
+            guard asset.isReference, let sourcePath = asset.sourcePath,
+                  !manager.fileExists(atPath: sourcePath) else { continue }
+            let originalName = (sourcePath as NSString).lastPathComponent
+            if let found = nameIndex[originalName.lowercased()] {
+                document.assets[index].sourcePath = found.path
+                document.assets[index].sourceFileSize = Self.fileSize(of: found)
+                document.assets[index].contentRevision = UUID()
+                repaired += 1
+            }
+        }
+        guard repaired > 0 else {
+            message = "在所选文件夹里没有找到缺失的照片，请确认它们现在所在的位置。"
+            return 0
+        }
+        document.modifiedAt = Date()
+        do {
+            try saveDocument(document)
+            if currentProject?.id == id { currentProject = document }
+            updateSummary(document)
+            message = "已重新连接 \(repaired) 张照片的源文件。"
+        } catch {
+            message = "保存修复结果失败：\(error.localizedDescription)"
+            return 0
+        }
+        return repaired
+    }
+
+    /// Synchronous cover thumbnail lookup for the home grid. Returns a cached
+    /// preview only; misses are filled by `requestCoverThumbnail`.
+    func cachedCoverThumbnail(projectID: UUID, asset: ProjectSummaryCoverAsset) -> NSImage? {
+        thumbnails.object(forKey: coverCacheKey(projectID: projectID, assetID: asset.id) as NSString)
+    }
+
+    /// Loads a cover thumbnail off the main thread, independent of the currently
+    /// open project. Reuses the disk cache so an unopened project still shows its
+    /// first photos without a full open cycle.
+    func requestCoverThumbnail(projectID: UUID, asset: ProjectSummaryCoverAsset) async -> NSImage? {
+        if let cached = cachedCoverThumbnail(projectID: projectID, asset: asset) { return cached }
+        let projectDir = directory.appendingPathComponent(projectID.uuidString, isDirectory: true)
+        let sourceURL: URL
+        if asset.isReference, let sourcePath = asset.sourcePath {
+            sourceURL = URL(fileURLWithPath: sourcePath)
+        } else {
+            sourceURL = projectDir.appendingPathComponent("Originals", isDirectory: true)
+                .appendingPathComponent(asset.fileName)
+        }
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else { return nil }
+        let cacheDirectory = projectDir
+        let contentRevision = asset.contentRevision
+        let result = await Task.detached(priority: .utility) {
+            ProjectThumbnailDiskCache.load(sourceURL: sourceURL, cacheDirectory: cacheDirectory,
+                                           assetID: asset.id, contentRevision: contentRevision,
+                                           maximumPixelSize: 256)
+        }.value
+        guard let cgImage = result?.image else { return nil }
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        thumbnails.setObject(image, forKey: coverCacheKey(projectID: projectID, assetID: asset.id) as NSString)
+        return image
+    }
+
+    private func coverCacheKey(projectID: UUID, assetID: UUID) -> String {
+        "cover/\(projectID.uuidString)/\(assetID.uuidString)"
+    }
+
     @discardableResult
     func flushPendingSaves() -> Bool {
         for id in metadataWriter.failedProjectIDs() {
@@ -586,7 +804,7 @@ nonisolated private struct PendingDuplicateImport: Sendable {
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
         panel.prompt = "导入素材"
-        panel.message = "选择图片或文件夹（包含子文件夹）。原图会复制到当前项目，之后移动原文件也不会影响项目素材。"
+        panel.message = "选择图片或文件夹（包含子文件夹）。项目只记录照片位置，不复制原图；移动原文件后可用「修复项目」重新连接。"
         if panel.runModal() == .OK { importURLs(panel.urls) }
     }
 
@@ -643,7 +861,7 @@ nonisolated private struct PendingDuplicateImport: Sendable {
         guard !isImporting, pendingDuplicateImport == nil, !importQueue.isEmpty else { return }
         let request = importQueue.removeFirst()
         let projectID = request.projectID
-        let protectedDirectories = [Self.projectsDirectory, directory]
+        let protectedDirectories = [directory, Self.legacyProjectsDirectory]
         isImporting = true
         // Scan before copying so a duplicate can be shown to the user without creating
         // an untracked original in the project's asset directory.
@@ -682,15 +900,15 @@ nonisolated private struct PendingDuplicateImport: Sendable {
                                duplicateDecisions: [String: ProjectDuplicateResolution]?) {
         let projectID = request.projectID
         let destination = assetDirectory(projectID: projectID)
-        let protectedDirectories = [Self.projectsDirectory, directory]
+        let protectedDirectories = [directory, Self.legacyProjectsDirectory]
         let existingAssets = (try? readDocument(id: projectID).assets) ?? []
         Task { [self] in
             let result = await Task.detached(priority: .userInitiated) {
                 defer { request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() } }
-                return Self.copyImages(request.urls, to: destination, excluding: protectedDirectories,
-                                       existingAssets: existingAssets,
-                                       duplicateResolution: duplicateResolution,
-                                       duplicateDecisions: duplicateDecisions)
+                return Self.referenceImages(request.urls, to: destination, excluding: protectedDirectories,
+                                            existingAssets: existingAssets,
+                                            duplicateResolution: duplicateResolution,
+                                            duplicateDecisions: duplicateDecisions)
             }.value
             do {
                 var document = try self.readDocument(id: projectID)
@@ -730,7 +948,7 @@ nonisolated private struct PendingDuplicateImport: Sendable {
                     self.message = "已处理 \(importedCount) 张（新增 \(result.assets.count) 张，覆盖 \(result.overwritten.count) 张），跳过 \(result.skippedDuplicates) 个重复文件。"
                 }
             } catch {
-                self.message = "保存导入资料失败：\(error.localizedDescription) 已复制的原图仍保留在项目目录中。"
+                self.message = "保存导入资料失败：\(error.localizedDescription)"
             }
             self.isImporting = false
             self.startNextImportIfNeeded()
@@ -738,6 +956,11 @@ nonisolated private struct PendingDuplicateImport: Sendable {
     }
 
     func assetURL(_ asset: ProjectAsset) -> URL {
+        // Reference assets read the untouched original directly; legacy copy
+        // assets keep reading the duplicate stored inside the project folder.
+        if asset.isReference, let sourcePath = asset.sourcePath {
+            return URL(fileURLWithPath: sourcePath)
+        }
         guard let projectID = currentProject?.id else {
             return directory.appendingPathComponent(asset.fileName)
         }
@@ -1194,7 +1417,21 @@ nonisolated private struct PendingDuplicateImport: Sendable {
     }
 
     private func summary(_ document: ProjectDocument) -> ProjectSummary {
-        ProjectSummary(id: document.id, name: document.name, modifiedAt: document.modifiedAt, assetCount: document.activeAssets.count)
+        let active = document.orderedActiveAssets
+        let cover = Array(active.prefix(3)).map {
+            ProjectSummaryCoverAsset(id: $0.id, fileName: $0.fileName, contentRevision: $0.contentRevision,
+                                     sourcePath: $0.sourcePath, isReference: $0.isReference)
+        }
+        let manager = FileManager.default
+        let missing = active.filter { asset in
+            if asset.isReference, let sourcePath = asset.sourcePath {
+                return !manager.fileExists(atPath: sourcePath)
+            }
+            return !manager.fileExists(atPath: assetDirectory(projectID: document.id)
+                .appendingPathComponent(asset.fileName).path)
+        }.count
+        return ProjectSummary(id: document.id, name: document.name, modifiedAt: document.modifiedAt,
+                              assetCount: active.count, coverAssets: cover, missingCount: missing)
     }
 
     private func updateSummary(_ document: ProjectDocument) {
@@ -1399,11 +1636,14 @@ nonisolated private struct PendingDuplicateImport: Sendable {
         }
     }
 
-    nonisolated private static func copyImages(_ urls: [URL], to directory: URL,
-                                               excluding protectedDirectories: [URL],
-                                               existingAssets: [ProjectAsset],
-                                               duplicateResolution: ProjectDuplicateResolution?,
-                                               duplicateDecisions: [String: ProjectDuplicateResolution]?) -> ProjectImportResult {
+    /// Reference-only import: photos stay where they are and the project records
+    /// their location. New assets never copy bytes; the only writes left are the
+    /// legacy "overwrite" replacement for old copy-mode duplicates.
+    nonisolated private static func referenceImages(_ urls: [URL], to directory: URL,
+                                                    excluding protectedDirectories: [URL],
+                                                    existingAssets: [ProjectAsset],
+                                                    duplicateResolution: ProjectDuplicateResolution?,
+                                                    duplicateDecisions: [String: ProjectDuplicateResolution]?) -> ProjectImportResult {
         let scan = scanImages(urls, excluding: protectedDirectories)
         var result = ProjectImportResult(assets: [], failures: scan.failures, failureCount: scan.failureCount)
         let manager = FileManager.default
@@ -1430,21 +1670,32 @@ nonisolated private struct PendingDuplicateImport: Sendable {
                         result.skippedDuplicates += 1
                         continue
                     case .overwrite:
-                        let destinationURL = directory.appendingPathComponent(match.asset.fileName)
-                        let temporaryURL = directory.appendingPathComponent(".\(UUID().uuidString).importing")
-                        try manager.copyItem(at: url.resolvingSymlinksInPath(), to: temporaryURL)
-                        if manager.fileExists(atPath: destinationURL.path) {
-                            _ = try manager.replaceItemAt(destinationURL, withItemAt: temporaryURL,
-                                                          backupItemName: nil, options: .usingNewMetadataOnly)
-                        } else {
-                            try manager.moveItem(at: temporaryURL, to: destinationURL)
-                        }
                         var updated = match.asset
-                        updated.name = url.lastPathComponent
-                        updated.sourcePath = sourcePath
-                        updated.sourceFileSize = sourceSize
-                        updated.contentRevision = UUID()
-                        updated.isRemoved = false
+                        if match.asset.isReference {
+                            // A reference has no stored copy to replace; overwriting
+                            // simply re-points it at the incoming file.
+                            updated.sourcePath = sourcePath
+                            updated.sourceFileSize = sourceSize
+                            updated.contentRevision = UUID()
+                            updated.isRemoved = false
+                        } else {
+                            // Legacy copy asset: swap the stored duplicate file so
+                            // older projects keep working without their originals.
+                            let destinationURL = directory.appendingPathComponent(match.asset.fileName)
+                            let temporaryURL = directory.appendingPathComponent(".\(UUID().uuidString).importing")
+                            try manager.copyItem(at: url.resolvingSymlinksInPath(), to: temporaryURL)
+                            if manager.fileExists(atPath: destinationURL.path) {
+                                _ = try manager.replaceItemAt(destinationURL, withItemAt: temporaryURL,
+                                                              backupItemName: nil, options: .usingNewMetadataOnly)
+                            } else {
+                                try manager.moveItem(at: temporaryURL, to: destinationURL)
+                            }
+                            updated.name = url.lastPathComponent
+                            updated.sourcePath = sourcePath
+                            updated.sourceFileSize = sourceSize
+                            updated.contentRevision = UUID()
+                            updated.isRemoved = false
+                        }
                         result.overwritten.append(updated)
                         continue
                     case .keepBoth:
@@ -1454,13 +1705,13 @@ nonisolated private struct PendingDuplicateImport: Sendable {
                 let id = UUID()
                 let extensionPart = String(url.pathExtension.filter { $0.isLetter || $0.isNumber }.prefix(16))
                 let suffix = extensionPart.isEmpty ? "" : ".\(extensionPart)"
+                // The UUID-based name is only a stable identity and cache key;
+                // reference assets never create a file under this name.
                 let fileName = id.uuidString + suffix
-                try manager.copyItem(at: url.resolvingSymlinksInPath(),
-                                     to: directory.appendingPathComponent(fileName))
                 let displayName = uniqueName(url.lastPathComponent, occupied: &occupiedNames)
                 result.assets.append(ProjectAsset(id: id, fileName: fileName, name: displayName,
                                                   sourcePath: sourcePath, sourceFileSize: sourceSize,
-                                                  position: .zero))
+                                                  position: .zero, isReference: true))
             } catch { result.recordFailure("\(url.lastPathComponent)：无法导入") }
         }
         return result
