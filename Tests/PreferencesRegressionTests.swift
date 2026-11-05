@@ -43,7 +43,7 @@ enum PreferencesRegressionTests {
         AppPreferences.restoreGuidanceDefaults(in: defaults)
         check(defaults.object(forKey: AppPreferences.skipGroupingPromptKey) == nil &&
               defaults.object(forKey: AppPreferences.materialSelectionHintDismissedKey) == nil,
-              "Guidance reset re-enables both dismissible onboarding hints")
+              "Guidance reset restores grouping prompts and clears the retired selection-hint opt-out")
         check(defaults.integer(forKey: "colorSchemeStyle") == 2 && defaults.string(forKey: "lastExportDir") == "/tmp",
               "Guidance reset preserves appearance and remembered export location")
         AppPreferences.restoreDefaults(in: defaults)

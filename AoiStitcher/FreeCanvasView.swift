@@ -130,7 +130,9 @@ struct FreeCanvasView: View {
                     layoutControls
                     Divider()
                     layersControls
-                }.padding(16)
+                }
+                .padding(16)
+                .projectOverlayScrollbars()
             }
             Divider()
             exportControls

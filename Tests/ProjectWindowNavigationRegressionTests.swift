@@ -198,17 +198,12 @@ import QuartzCore
         defer { defaults.removePersistentDomain(forName: domain) }
         try check(!defaults.bool(forKey: AppPreferences.skipGroupingPromptKey),
                   "New users see grouping guidance by default")
-        try check(!defaults.bool(forKey: AppPreferences.materialSelectionHintDismissedKey),
-                  "Selection guidance is available until the user dismisses it")
         defaults.set(true, forKey: AppPreferences.skipGroupingPromptKey)
-        defaults.set(true, forKey: AppPreferences.materialSelectionHintDismissedKey)
         try check(UserDefaults(suiteName: domain)!.bool(forKey: AppPreferences.skipGroupingPromptKey),
                   "The opt-out preference survives reopening preferences")
         AppPreferences.restoreDefaults(in: defaults)
         try check(!defaults.bool(forKey: AppPreferences.skipGroupingPromptKey),
                   "Restoring application defaults can bring grouping guidance back")
-        try check(!defaults.bool(forKey: AppPreferences.materialSelectionHintDismissedKey),
-                  "Restoring application defaults can bring selection guidance back")
 
         navigation.detach()
         try check(window.toolbar === originalToolbar && window.titleVisibility == .visible &&

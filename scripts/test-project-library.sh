@@ -40,6 +40,8 @@ import Foundation
         print("Thumbnail scoped updates: \(scopeChecks) checks passed")
         let preferenceChecks = try PreferencesRegressionTests.run()
         print("Preferences: \(preferenceChecks) checks passed")
+        let sidebarChecks = try await SidebarOverlayScrollRegressionTests.run()
+        print("Sidebar overlay scrolling: \(sidebarChecks) checks passed")
         let navigationChecks = try ProjectWindowNavigationRegressionTests.run()
         print("Window navigation: \(navigationChecks) checks passed")
     }
@@ -73,6 +75,7 @@ xcrun swiftc -parse-as-library -swift-version 5 -default-isolation MainActor \
     "$library_project_root/Tests/ProjectThumbnailRenderingRegressionTests.swift" \
     "$library_project_root/Tests/ProjectThumbnailScopeRegressionTests.swift" \
     "$library_project_root/Tests/PreferencesRegressionTests.swift" \
+    "$library_project_root/Tests/SidebarOverlayScrollRegressionTests.swift" \
     "$library_project_root/Tests/ProjectWindowNavigationRegressionTests.swift" \
     "$library_test_dir/ProjectLibraryTestMain.swift" \
     -o "$library_test_dir/project-library-tests"

@@ -670,7 +670,6 @@ private struct ProjectLibraryView: View {
     @EnvironmentObject private var materialNavigation: ProjectMaterialNavigation
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
     @AppStorage(AppPreferences.skipGroupingPromptKey) private var skipGroupingPrompt = false
-    @AppStorage(AppPreferences.materialSelectionHintDismissedKey) private var didDismissMaterialSelectionHint = false
     @AppStorage("projectLibrary.groupSidebarWidth") private var groupSidebarWidth = 340.0
     @State private var selection: Set<UUID> = []
     @State private var selectedGroupID: UUID?
@@ -777,7 +776,6 @@ private struct ProjectLibraryView: View {
         .onChange(of: materialNavigation.request?.id) { _, _ in
             guard let request = materialNavigation.request else { return }
             materialNavigation.consumeRequest(id: request.id)
-            didDismissMaterialSelectionHint = true
             prepareDispatch(request.operation, ids: activeSelection)
         }
         .onChange(of: library.currentProject?.modifiedAt) { _, _ in refreshCatalog() }
@@ -802,48 +800,9 @@ private struct ProjectLibraryView: View {
     }
 
     private var libraryToolbar: some View {
-        HStack(spacing: 10) {
-            Button(action: library.importPanel) { Label("导入素材", systemImage: "plus") }
-                .buttonStyle(.borderedProminent).disabled(library.isImporting)
-            selectionSummary
-            if library.isImporting { ProgressView().controlSize(.small) }
-            Spacer(minLength: 0)
+        ProjectMaterialToolbar(selectedCount: selectedCount, isImporting: library.isImporting,
+                               onImport: library.importPanel) {
             thumbnailControls
-        }.padding(.horizontal, 10).padding(.vertical, 8)
-    }
-
-    @ViewBuilder private var selectionSummary: some View {
-        if selectedCount > 0 {
-            HStack(spacing: 8) {
-                HStack(spacing: 5) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(Color.accentColor)
-                        .accessibilityHidden(true)
-                    Text("\(selectedCount) 张已选").monospacedDigit()
-                }
-                .font(.callout)
-
-                if !didDismissMaterialSelectionHint {
-                    Label("点击顶部工具开始拼图", systemImage: "arrow.up")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .fixedSize()
-                    Button {
-                        didDismissMaterialSelectionHint = true
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 18, height: 18)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("关闭选图提示；可在设置 > 通用 > 使用引导中重新开启")
-                    .accessibilityLabel("关闭选图提示，可在软件设置的通用、使用引导中重新开启")
-                }
-            }
-            .accessibilityElement(children: .combine)
         }
     }
 

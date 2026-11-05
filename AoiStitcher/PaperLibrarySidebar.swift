@@ -94,6 +94,7 @@ struct PaperLibrarySidebar: View {
                         }
                     }
                     .padding(.vertical, 2)
+                    .projectOverlayScrollbars()
                 }
                 .frame(height: min(252, max(66, CGFloat(rows.count) * 29 + 4)))
                 .scrollIndicators(.automatic)

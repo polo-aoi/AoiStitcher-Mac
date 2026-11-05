@@ -11,7 +11,7 @@ struct CanvasLayersList: NSViewRepresentable {
         table.store = store
         table.onCrop = onCrop
         table.onReplace = onReplace
-        let scroll = NSScrollView()
+        let scroll = ProjectOverlayScrollView()
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true

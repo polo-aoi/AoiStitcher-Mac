@@ -50,6 +50,7 @@ enum AppPreferences {
     static let gridPanKeyKey = "gridCollage.panKey"
     static let workspaceOrderKey = "workspaceOrder.v1"
     static let skipGroupingPromptKey = "projectLibrary.skipGroupingPrompt"
+    // Retired: selection guidance is always visible. Kept only for reset cleanup.
     static let materialSelectionHintDismissedKey = "projectLibrary.materialSelectionHintDismissed"
     static let canvasWheelBehaviorKey = "freeCanvas.wheelBehavior"
     static let canvasGestureBehaviorKey = "freeCanvas.gestureBehavior"
