@@ -38,6 +38,14 @@ enum PreferencesRegressionTests {
               "Export reset preserves standard collage shortcuts")
         check(defaults.string(forKey: AppPreferences.workspaceOrderKey) == legacyWorkspaceOrder,
               "Export reset preserves the customized workspace order")
+        defaults.set(true, forKey: AppPreferences.skipGroupingPromptKey)
+        defaults.set(true, forKey: AppPreferences.materialSelectionHintDismissedKey)
+        AppPreferences.restoreGuidanceDefaults(in: defaults)
+        check(defaults.object(forKey: AppPreferences.skipGroupingPromptKey) == nil &&
+              defaults.object(forKey: AppPreferences.materialSelectionHintDismissedKey) == nil,
+              "Guidance reset re-enables both dismissible onboarding hints")
+        check(defaults.integer(forKey: "colorSchemeStyle") == 2 && defaults.string(forKey: "lastExportDir") == "/tmp",
+              "Guidance reset preserves appearance and remembered export location")
         AppPreferences.restoreDefaults(in: defaults)
         check(defaults.integer(forKey: "colorSchemeStyle") == 1 && defaults.object(forKey: "lastExportDir") == nil, "Software reset restores theme and remembered folders")
         check(defaults.string(forKey: "unrelated-value") == "untouched", "Software reset affects only owned preferences")

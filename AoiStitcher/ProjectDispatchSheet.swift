@@ -65,9 +65,11 @@ struct ProjectDispatchSheet: View {
                 .toggleStyle(.checkbox)
             Text("这些照片会归为一组，原始照片仍留在原位置。")
                 .font(.caption).foregroundStyle(.secondary)
-            Toggle("不再提示分组，以后直接继续", isOn: $suppressGroupingPrompt)
+            Toggle("以后不再询问是否分组", isOn: $suppressGroupingPrompt)
                 .toggleStyle(.checkbox)
                 .font(.callout)
+            Text("可在「设置 > 通用 > 使用引导」中重新开启。")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
     }

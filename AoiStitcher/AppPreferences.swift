@@ -65,6 +65,7 @@ enum AppPreferences {
     static nonisolated let projectRootKey = "projectRootDirectory.v1"
     static nonisolated let defaultProjectRootName = "AoiStitcher 项目"
     static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey, skipGroupingPromptKey, materialSelectionHintDismissedKey]
+    static let guidancePreferenceKeys = [skipGroupingPromptKey, materialSelectionHintDismissedKey]
 
     /// The user-facing directory that holds every project folder. Defaults to
     /// `~/Pictures/AoiStitcher 项目/` for project metadata and preview caches.
@@ -111,9 +112,12 @@ enum AppPreferences {
         defaults.removeObject(forKey: gridPanModeKey)
         defaults.removeObject(forKey: gridPanKeyKey)
         defaults.removeObject(forKey: workspaceOrderKey)
-        defaults.removeObject(forKey: skipGroupingPromptKey)
-        defaults.removeObject(forKey: materialSelectionHintDismissedKey)
+        restoreGuidanceDefaults(in: defaults)
         for key in preferenceKeys where key.hasPrefix("last") { defaults.removeObject(forKey: key) }
+    }
+
+    static func restoreGuidanceDefaults(in defaults: UserDefaults = .standard) {
+        for key in guidancePreferenceKeys { defaults.removeObject(forKey: key) }
     }
 
     static func restoreCanvasInteractionDefaults(in defaults: UserDefaults = .standard) {

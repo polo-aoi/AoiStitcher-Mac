@@ -159,8 +159,11 @@ struct AppSettingsView: View {
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
     @AppStorage(AppPreferences.projectRootKey) private var projectRootPath = ""
+    @AppStorage(AppPreferences.skipGroupingPromptKey) private var skipGroupingPrompt = false
+    @AppStorage(AppPreferences.materialSelectionHintDismissedKey) private var didDismissMaterialSelectionHint = false
     @Environment(\.openWindow) private var openWindow
     @State private var restored = false
+    @State private var guidanceRestored = false
     @State private var pendingProjectRoot = false
     @ObservedObject private var longStitchPreferences = LongStitchPreferences.shared
 
@@ -190,6 +193,8 @@ struct AppSettingsView: View {
                     Label("深色", systemImage: "moon").tag(2)
                 }.pickerStyle(.segmented).labelsHidden()
             }
+            Divider()
+            guidanceSettings
             Divider()
             projectStorageSection
             Divider()
@@ -221,6 +226,41 @@ struct AppSettingsView: View {
 
     private var workspaceOrder: [AppWorkspace] {
         AppPreferences.workspaceOrder(from: storedWorkspaceOrder)
+    }
+
+    private var guidanceSettings: some View {
+        EditorSection("使用引导") {
+            Text("选择照片后和发送照片前的提示都可以单独控制。关闭的提示可随时在这里重新开启。")
+                .font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("选中照片时显示顶部操作提示", isOn: Binding(
+                get: { !didDismissMaterialSelectionHint },
+                set: {
+                    didDismissMaterialSelectionHint = !$0
+                    guidanceRestored = false
+                }
+            ))
+            Toggle("发送未分组照片时询问是否创建照片组", isOn: Binding(
+                get: { !skipGroupingPrompt },
+                set: {
+                    skipGroupingPrompt = !$0
+                    guidanceRestored = false
+                }
+            ))
+            HStack {
+                Button {
+                    AppPreferences.restoreGuidanceDefaults()
+                    guidanceRestored = true
+                } label: {
+                    Label("重新显示所有引导", systemImage: "arrow.counterclockwise")
+                }
+                .disabled(!skipGroupingPrompt && !didDismissMaterialSelectionHint)
+                Spacer()
+                if guidanceRestored {
+                    Text("引导已重新开启").font(.callout).foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 
     private var resolvedProjectRoot: URL {

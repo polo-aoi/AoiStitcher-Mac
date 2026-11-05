@@ -824,7 +824,7 @@ private struct ProjectLibraryView: View {
                 .font(.callout)
 
                 if !didDismissMaterialSelectionHint {
-                    Label("点顶部拼图方式继续", systemImage: "arrow.up")
+                    Label("点击顶部工具开始拼图", systemImage: "arrow.up")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -839,8 +839,8 @@ private struct ProjectLibraryView: View {
                             .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .help("关闭选图提示")
-                    .accessibilityLabel("关闭选图提示")
+                    .help("关闭选图提示；可在设置 > 通用 > 使用引导中重新开启")
+                    .accessibilityLabel("关闭选图提示，可在软件设置的通用、使用引导中重新开启")
                 }
             }
             .accessibilityElement(children: .combine)
