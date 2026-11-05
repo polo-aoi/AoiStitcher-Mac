@@ -267,7 +267,7 @@ struct GridCollageView: View {
             }
             Divider()
             canvas
-            if store.isLoading || isExporting || resultMessage != nil || store.pendingStatus != nil || store.status != nil {
+            if store.photoCount > 0 && showsResultBar {
                 Divider()
                 resultBar
             }
@@ -277,86 +277,82 @@ struct GridCollageView: View {
     private var canvas: some View {
         ZStack {
             Color(NSColor.controlBackgroundColor)
-            GeometryReader { proxy in
-                let viewport = CGRect(origin: .zero, size: proxy.size).insetBy(dx: 34, dy: 30)
-                let fitted = GridCollageLayoutEngine.fittedRect(
-                    aspectRatio: store.state.aspectRatio.value,
-                    in: viewport
-                )
-                ZStack(alignment: .topLeading) {
-                    Color.clear
-                        .frame(width: proxy.size.width, height: proxy.size.height)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            guard canInteract else { return }
-                            store.selectSlot(nil)
-                        }
-                    GridCollageCanvas(store: store,
-                                      isActive: canInteract,
-                                      dragPreview: dragPreview)
-                        .frame(width: fitted.width, height: fitted.height)
-                        .position(x: fitted.midX, y: fitted.midY)
-
-                    if canInteract, dragPreview == nil,
-                       let slot = store.selectedSlot, slot.hasImage,
-                       let rect = GridCollageLayoutEngine.layout(
-                        state: store.state,
-                        in: CGRect(origin: .zero, size: fitted.size)
-                       ).slotRects[slot.id] {
-                        selectedImageToolbar(slot)
-                            .fixedSize()
-                            .background {
-                                GeometryReader { geometry in
-                                    Color.clear.preference(
-                                        key: SelectedImageToolbarSizePreferenceKey.self,
-                                        value: geometry.size
-                                    )
-                                }
+            if store.photoCount == 0 {
+                EditorEmptyState()
+                    .overlay(alignment: .bottom) {
+                        if showsResultBar {
+                            VStack(spacing: 0) {
+                                Divider()
+                                resultBar
                             }
-                            .position(SelectedImageToolbarPlacement.position(
-                                for: rect.offsetBy(dx: fitted.minX, dy: fitted.minY),
-                                in: proxy.size,
-                                toolbarSize: selectedToolbarSize
-                            ))
+                        }
                     }
-                }
-                .frame(width: proxy.size.width, height: proxy.size.height)
-                .clipped()
-                .overlay {
-                    GridCollageInteractionReader(store: store, isActive: canInteract,
-                                                 canvasFrame: fitted, toolbarSize: selectedToolbarSize,
-                                                 panMode: panMode, panKey: panKey,
-                                                 dragPreview: $dragPreview)
-                }
-                .onPreferenceChange(SelectedImageToolbarSizePreferenceKey.self) { size in
-                    guard size.width > 0, size.height > 0 else { return }
-                    selectedToolbarSize = size
-                }
+            } else {
+                populatedCanvas
             }
         }
-        // Only the visible, idle editor registers a Finder destination.
+        // Keep the empty editor ready for Finder imports without exposing
+        // selectable placeholder cells before its first photo is added.
         .onDrop(of: canInteract ? [UTType.fileURL.identifier] : [],
                 isTargeted: nil, perform: receiveFileDrop)
         .allowsHitTesting(canInteract)
-        .overlay {
-            if store.photoCount == 0 {
-                VStack(spacing: 10) {
-                    Image(systemName: "rectangle.split.3x1")
-                        .font(.system(size: 34, weight: .regular))
-                        .foregroundStyle(.secondary)
-                    Text("添加照片，开始拼图")
-                        .font(.title3.weight(.semibold))
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("拖入多张照片，或使用左上角的添加按钮。")
-                        .font(.callout).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var populatedCanvas: some View {
+        GeometryReader { proxy in
+            let viewport = CGRect(origin: .zero, size: proxy.size).insetBy(dx: 34, dy: 30)
+            let fitted = GridCollageLayoutEngine.fittedRect(
+                aspectRatio: store.state.aspectRatio.value,
+                in: viewport
+            )
+            ZStack(alignment: .topLeading) {
+                Color.clear
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        guard canInteract else { return }
+                        store.selectSlot(nil)
+                    }
+                GridCollageCanvas(store: store,
+                                  isActive: canInteract,
+                                  dragPreview: dragPreview)
+                    .frame(width: fitted.width, height: fitted.height)
+                    .position(x: fitted.midX, y: fitted.midY)
+
+                if canInteract, dragPreview == nil,
+                   let slot = store.selectedSlot, slot.hasImage,
+                   let rect = GridCollageLayoutEngine.layout(
+                    state: store.state,
+                    in: CGRect(origin: .zero, size: fitted.size)
+                   ).slotRects[slot.id] {
+                    selectedImageToolbar(slot)
+                        .fixedSize()
+                        .background {
+                            GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: SelectedImageToolbarSizePreferenceKey.self,
+                                    value: geometry.size
+                                )
+                            }
+                        }
+                        .position(SelectedImageToolbarPlacement.position(
+                            for: rect.offsetBy(dx: fitted.minX, dy: fitted.minY),
+                            in: proxy.size,
+                            toolbarSize: selectedToolbarSize
+                        ))
                 }
-                .multilineTextAlignment(.center)
-                .padding(22)
-                .frame(maxWidth: 380)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-                .padding(.horizontal, 16)
-                .allowsHitTesting(false)
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .clipped()
+            .overlay {
+                GridCollageInteractionReader(store: store, isActive: canInteract,
+                                             canvasFrame: fitted, toolbarSize: selectedToolbarSize,
+                                             panMode: panMode, panKey: panKey,
+                                             dragPreview: $dragPreview)
+            }
+            .onPreferenceChange(SelectedImageToolbarSizePreferenceKey.self) { size in
+                guard size.width > 0, size.height > 0 else { return }
+                selectedToolbarSize = size
             }
         }
     }
@@ -456,6 +452,10 @@ struct GridCollageView: View {
             Text("拖动分割线可调整格子大小。")
                 .font(.caption).foregroundStyle(.secondary)
         }
+    }
+
+    private var showsResultBar: Bool {
+        store.isLoading || isExporting || resultMessage != nil || store.pendingStatus != nil || store.status != nil
     }
 
     private var resultBar: some View {

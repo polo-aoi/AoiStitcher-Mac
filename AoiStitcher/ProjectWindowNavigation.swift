@@ -10,6 +10,7 @@ struct ProjectWindowNavigation: NSViewRepresentable {
     var homeEnabled: Bool
     var navigationEnabled = true
     var showsProjectMaterials = true
+    var materialSelectionCount = 0
     var onHome: () -> Void
     var onSelectWorkspace: (String) -> Void
     var onSettings: () -> Void = {}
@@ -29,6 +30,7 @@ struct ProjectWindowNavigation: NSViewRepresentable {
         context.coordinator.update(selectedWorkspace: selectedWorkspace, workspaces: workspaces,
                                    homeEnabled: homeEnabled, navigationEnabled: navigationEnabled,
                                    showsProjectMaterials: showsProjectMaterials,
+                                   materialSelectionCount: materialSelectionCount,
                                    onHome: onHome, onSelectWorkspace: onSelectWorkspace,
                                    onSettings: onSettings)
         if let window = view.window { context.coordinator.attach(to: window) }
@@ -143,6 +145,7 @@ struct ProjectWindowNavigation: NSViewRepresentable {
     func update(selectedWorkspace: String?, workspaces: [AppWorkspace],
                 homeEnabled: Bool, navigationEnabled: Bool,
                 showsProjectMaterials: Bool = true,
+                materialSelectionCount: Int = 0,
                 onHome: @escaping () -> Void, onSelectWorkspace: @escaping (String) -> Void,
                 onSettings: @escaping () -> Void = {}) {
         self.selectedWorkspace = selectedWorkspace
@@ -175,6 +178,16 @@ struct ProjectWindowNavigation: NSViewRepresentable {
             }
         }
         workspaceControl.selectedSegment = selectedWorkspace.flatMap { ids.firstIndex(of: $0) } ?? -1
+        let offersDispatch = selectedWorkspace == "library" && materialSelectionCount > 0 && navigationEnabled
+        for index in ids.indices {
+            let title = workspaceControl.label(forSegment: index) ?? ""
+            workspaceControl.setToolTip(offersDispatch && ids[index] != "library"
+                ? "将选中的 \(materialSelectionCount) 张照片带入\(title)"
+                : title, forSegment: index)
+        }
+        workspaceControl.setAccessibilityHelp(offersDispatch
+            ? "已选 \(materialSelectionCount) 张照片，选择一种拼图方式开始。"
+            : "切换项目素材或拼图方式。")
         updateItems()
     }
 
@@ -221,6 +234,9 @@ struct ProjectWindowNavigation: NSViewRepresentable {
     @objc private func chooseWorkspace() {
         let index = workspaceControl.selectedSegment
         guard workspaceControl.isEnabled, workspaceIDs.indices.contains(index) else { return }
+        // The owner may need to confirm grouping or replacement first. Keep the
+        // actual page selected until it accepts this navigation request.
+        workspaceControl.selectedSegment = selectedWorkspace.flatMap { workspaceIDs.firstIndex(of: $0) } ?? -1
         onSelectWorkspace?(workspaceIDs[index])
     }
 

@@ -24,21 +24,13 @@ struct FreeCanvasView: View {
     @AppStorage(AppPreferences.canvasPanKeyKey) private var panKey: LongStitchPanKey = .space
     @State private var layoutMargin: CGFloat = 40
     @State private var layoutGap: CGFloat = 24
-    @State private var layoutSplit: CGFloat = 0.5
+    @State private var isAdjustingGap = false
+    @State private var hasStartedGapChange = false
     @State private var showingExportSettings = false
     @State private var exportedFile: String?
     @State private var showingMissingBackgroundAlert = false
     @State private var cropSession: CanvasCropSession?
-    @State private var inspectedID: UUID?
-    @State private var showingPaperLibrary = false
     @StateObject private var paperLibrary = PaperLibraryStore()
-    private let swatches: [NSColor] = [
-        .white, NSColor(deviceWhite: 0.92, alpha: 1),
-        NSColor(deviceRed: 0.95, green: 0.91, blue: 0.82, alpha: 1),
-        NSColor(deviceRed: 0.55, green: 0.12, blue: 0.14, alpha: 1),
-        NSColor(deviceRed: 0.19, green: 0.28, blue: 0.23, alpha: 1),
-        NSColor(deviceWhite: 0.08, alpha: 1)
-    ]
 
     var body: some View {
         HStack(spacing: 0) {
@@ -51,7 +43,7 @@ struct FreeCanvasView: View {
                 Divider()
                 ZStack {
                     CanvasWorkspace(store: store, isActive: isActive, settings: interactionSettings,
-                                    onCrop: startCrop, onInspect: openInspector)
+                                    onCrop: startCrop, onReplace: chooseReplacement)
                     if store.document.layers.isEmpty {
                         EditorEmptyState()
                     }
@@ -63,10 +55,12 @@ struct FreeCanvasView: View {
                         }.padding(16).allowsHitTesting(false)
                     }
                 }.clipped()
-                Text(interactionSettings.hint)
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14).padding(.vertical, 7)
+                if !store.document.layers.isEmpty {
+                    Text(interactionSettings.hint)
+                        .font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                }
             }
         }
         .preferredColorScheme(theme == 2 ? .dark : .light)
@@ -81,22 +75,22 @@ struct FreeCanvasView: View {
         .onChange(of: store.isExporting) { _, exporting in
             if !exporting { receiveProjectImages() }
         }
-        .onChange(of: store.selectedID) { _, id in
-            if id != inspectedID { inspectedID = nil }
+        .onChange(of: store.document.arrangement, initial: true) { _, arrangement in
+            if let arrangement {
+                layoutMargin = arrangement.margin
+                layoutGap = arrangement.gap
+            } else {
+                finishGapAdjustment()
+            }
         }
-        .onChange(of: store.document.layers.map(\.id)) { _, ids in
-            if let inspectedID, !ids.contains(inspectedID) { self.inspectedID = nil }
+        .onChange(of: isActive) { _, active in
+            if !active { finishGapAdjustment() }
         }
-        .onChange(of: isActive) { _, active in if !active { inspectedID = nil } }
+        .onDisappear { finishGapAdjustment() }
         .sheet(item: $cropSession) { session in
             CropEditorView(item: session.item) { updated in
                 store.updateCrop(updated, layerID: session.id); cropSession = nil
             } onCancel: { cropSession = nil }
-        }
-        .sheet(isPresented: $showingPaperLibrary) {
-            PaperLibraryView(library: paperLibrary) { url in
-                store.importURLs([url], as: .paper)
-            }
         }
         .alert("AoiStitcher", isPresented: Binding(get: { store.message != nil }, set: { if !$0 { store.message = nil } })) {
             Button("确定") { store.message = nil }
@@ -122,18 +116,9 @@ struct FreeCanvasView: View {
     private var sidebar: some View {
         VStack(spacing: 0) {
             EditorSidebarHeader {
-                    Button { store.importImages() } label: {
-                        Label("添加照片", systemImage: "photo.badge.plus").frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent).disabled(store.isLoading)
-                    Menu {
-                        ForEach(CanvasPaperStyle.allCases) { style in
-                            Button(style.rawValue) { store.addPaper(style) }
-                        }
-                        Divider()
-                        Button("导入底图…") { store.importImages(as: .paper) }
-                        Button("打开纸张库…") { showingPaperLibrary = true }
-                    } label: { Label("添加纸张", systemImage: "doc.badge.plus") }
-                    .menuStyle(.borderlessButton).fixedSize().disabled(store.isLoading)
+                Button { store.importImages() } label: {
+                    Label("添加照片", systemImage: "photo.badge.plus").frame(maxWidth: .infinity)
+                }.buttonStyle(.borderedProminent).disabled(store.isLoading || store.isExporting)
             }
             Divider()
             ScrollView {
@@ -153,20 +138,14 @@ struct FreeCanvasView: View {
     }
 
     private var paperLibraryControls: some View {
-        EditorSection("纸张库") {
-            VStack(alignment: .leading, spacing: 8) {
-                Button {
-                    showingPaperLibrary = true
-                } label: {
-                    Label("打开纸张库", systemImage: "books.vertical")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.bordered)
-                Text("导入、保存、排序纸张；拖入画布后成为底图。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
+        PaperLibrarySidebar(library: paperLibrary, isActive: isActive,
+                            isApplying: store.isLoading || store.isExporting,
+                            onUse: { usePaper($0) },
+                            onAddLayer: { usePaper($0, addingLayer: true) },
+                            onImageReplaced: { item, image, preview in
+                                store.refreshPaperLibraryImage(id: item.id, name: item.displayName,
+                                                               image: image, preview: preview)
+                            })
     }
 
     private var workspaceToolbar: some View {
@@ -203,8 +182,6 @@ struct FreeCanvasView: View {
                     CanvasNumberField(title: "宽", value: canvasDimension(width: true))
                     CanvasNumberField(title: "高", value: canvasDimension(width: false))
                 }
-                ColorPicker("底色", selection: backgroundBinding, supportsOpacity: false)
-                colorSwatches { color in store.mutate { $0.background = CanvasColor(color) } }
             }
         }
     }
@@ -213,110 +190,45 @@ struct FreeCanvasView: View {
         EditorSection("快捷排版") {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Button { arrange(horizontal: true) } label: { Label("左右排", systemImage: "rectangle.split.2x1").frame(maxWidth: .infinity) }
-                    Button { arrange(horizontal: false) } label: { Label("上下排", systemImage: "rectangle.split.1x2").frame(maxWidth: .infinity) }
-                }.disabled(store.photoCount == 0 || store.photoCount > 2)
+                    arrangementButton("左右排", icon: "rectangle.split.2x1", horizontal: true)
+                    arrangementButton("上下排", icon: "rectangle.split.1x2", horizontal: false)
+                }
+                .disabled(!canArrange || store.isLoading || store.isExporting)
                 HStack {
-                    CanvasNumberField(title: "留白", value: $layoutMargin)
-                    CanvasNumberField(title: "间距", value: $layoutGap)
+                    CanvasNumberField(title: "留白", value: arrangementMarginBinding)
+                    CanvasNumberField(title: "间距", value: arrangementGapBinding)
                 }
-                if store.photoCount == 2 {
-                    HStack { Text("两图区域比例").font(.caption); Spacer(); Text("\(Int(layoutSplit * 100)) : \(100 - Int(layoutSplit * 100))").font(.caption.monospacedDigit()) }
-                    Slider(value: $layoutSplit, in: 0.15...0.85)
-                } else if store.photoCount > 2 {
-                    Text("快捷排版适用于一至两张照片；多张照片可直接拖动、缩放和旋转。")
-                        .font(.caption).foregroundStyle(.secondary)
+                .disabled(store.isLoading || store.isExporting)
+                Slider(value: arrangementGapBinding, in: 0...max(1, store.maximumArrangementGap)) { editing in
+                    isAdjustingGap = editing
+                    if !editing { finishGapAdjustment() }
                 }
-            }
-        }
-    }
-
-    private func selectedControls(_ layer: CanvasLayer) -> some View {
-        EditorSection(layer.kind == .photo ? "照片参数" : "纸张参数") {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text(layer.name).lineLimit(1).truncationMode(.middle).font(.callout.weight(.medium))
-                    Spacer()
-                    Button { store.toggleLock(layer.id) } label: { Image(systemName: layer.locked ? "lock.fill" : "lock.open") }
-                        .buttonStyle(.borderless).help(layer.locked ? "解锁素材" : "锁定素材").accessibilityLabel(layer.locked ? "解锁素材" : "锁定素材")
-                }
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        CanvasNumberField(title: "X", value: layerValue(\.center.x, fallback: layer.center.x))
-                        CanvasNumberField(title: "Y", value: layerValue(\.center.y, fallback: layer.center.y))
-                    }
-                    HStack {
-                        CanvasNumberField(title: "宽", value: layerDimension(width: true))
-                        CanvasNumberField(title: "高", value: layerDimension(width: false))
-                    }
-                    HStack {
-                        Text("旋转").font(.callout)
-                        Spacer()
-                        TextField("角度", value: layerValue(\.rotation, fallback: layer.rotation).asDouble,
-                                  format: .number.precision(.fractionLength(0...1)))
-                            .textFieldStyle(.roundedBorder).frame(width: 74)
-                        Text("°").foregroundStyle(.secondary)
-                    }
-                    Slider(value: layerValue(\.rotation, fallback: layer.rotation), in: -180...180,
-                           onEditingChanged: continuousEdit)
-                    HStack { Text("不透明度").font(.callout); Spacer(); Text("\(Int(layer.opacity * 100))%").font(.callout.monospacedDigit()) }
-                    Slider(value: layerValue(\.opacity, fallback: layer.opacity), in: 0...1, onEditingChanged: continuousEdit)
-                    if layer.kind == .paper && layer.image == nil {
-                        ColorPicker("纸张颜色", selection: paperColorBinding, supportsOpacity: false)
-                        colorSwatches { color in store.editSelected { $0.color = CanvasColor(color) } }
-                    }
-                    HStack {
-                        Button("居中") { store.centerSelected() }
-                        Button("适合画布") { store.fitSelected(fill: false) }
-                        Button("铺满") { store.fitSelected(fill: true) }
-                    }.controlSize(.small)
-                    HStack {
-                        Button("置于顶层") { store.reorderSelected(toTop: true) }
-                        Button("置于底层") { store.reorderSelected(toTop: false) }
-                    }.controlSize(.small)
-                    if layer.kind == .photo {
-                        Button { startCrop(layer) } label: { Label("裁剪与水印…", systemImage: "crop") }
-                    }
-                    HStack {
-                        Button { store.duplicateSelected() } label: { Label("复制", systemImage: "plus.square.on.square") }
-                        Spacer()
-                        Button(role: .destructive) { store.deleteSelected() } label: { Label("删除", systemImage: "trash") }
-                    }
-                }.disabled(layer.locked)
-                if layer.locked { Text("素材已锁定，解锁后可调整。").font(.caption).foregroundStyle(.secondary) }
+                .disabled(store.document.arrangement == nil || arrangedPhotoCount < 2
+                          || store.isLoading || store.isExporting)
+                .accessibilityLabel("照片间距")
+                Text(store.document.arrangement == nil
+                     ? "选择排版方向后，可实时调整照片间距。"
+                     : "横排等高，竖排等宽；照片整体适应画布。")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }
 
     private var layersControls: some View {
-        EditorSection("素材") {
+        EditorSection("画布图层") {
             VStack(alignment: .leading, spacing: 4) {
                 if store.document.layers.isEmpty {
                     Text("照片和纸张会显示在这里。").font(.caption).foregroundStyle(.secondary).padding(.vertical, 8)
                 }
                 if !store.document.layers.isEmpty {
-                    CanvasLayersList(store: store, onInspect: openInspector)
+                    CanvasLayersList(store: store, onCrop: startCrop, onReplace: chooseReplacement)
                         .frame(height: min(264, CGFloat(store.document.layers.count) * 44 + 4))
                 }
-            }
-        }
-        .popover(isPresented: Binding(get: { inspectedID != nil }, set: { if !$0 { closeInspector() } }),
-                 attachmentAnchor: .rect(.bounds), arrowEdge: .leading) {
-            VStack(spacing: 0) {
-                HStack {
-                    Text("素材设置").font(.headline)
-                    Spacer()
-                    Button("完成", action: closeInspector).keyboardShortcut(.cancelAction)
-                }.padding(16)
-                Divider()
-                ScrollView {
-                    if let layer = store.selectedLayer, layer.id == inspectedID {
-                        selectedControls(layer).padding(16)
-                    }
+                if let layer = store.selectedLayer, layer.kind == .paper, layer.image == nil {
+                    ColorPicker("纸张颜色", selection: paperColorBinding, supportsOpacity: false)
+                        .disabled(layer.locked || store.isLoading || store.isExporting)
                 }
             }
-            .frame(width: 320, height: 580)
-            .preferredColorScheme(theme == 2 ? .dark : .light)
         }
     }
 
@@ -331,22 +243,65 @@ struct FreeCanvasView: View {
         return "\(Int(size.width)) × \(Int(size.height))"
     }
 
-    private func colorSwatches(action: @escaping (NSColor) -> Void) -> some View {
-        HStack(spacing: 10) {
-            ForEach(swatches.indices, id: \.self) { index in
-                Button { action(swatches[index]) } label: {
-                    Circle().fill(Color(swatches[index])).frame(width: 23, height: 23)
-                        .overlay(Circle().stroke(Color.primary.opacity(0.25), lineWidth: 1))
-                }.buttonStyle(.plain).accessibilityLabel(["白色", "浅灰色", "米色", "深红色", "墨绿色", "黑色"][index])
-            }
-        }
+    private var arrangedPhotoCount: Int {
+        store.document.layers.filter { $0.kind == .photo && !$0.locked }.count
     }
 
-    private var backgroundBinding: Binding<Color> {
-        Binding(get: { Color(store.document.background.nsColor) }, set: { color in store.mutate { $0.background = CanvasColor(NSColor(color)) } })
+    private var canArrange: Bool { arrangedPhotoCount > 0 }
+
+    private func arrangementButton(_ title: String, icon: String, horizontal: Bool) -> some View {
+        let selected = store.document.arrangement?.direction == (horizontal ? .horizontal : .vertical)
+        return Button { arrange(horizontal: horizontal) } label: {
+            Label(title, systemImage: icon).frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(selected ? Color.accentColor : nil)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var arrangementMarginBinding: Binding<CGFloat> {
+        Binding(get: { store.document.arrangement?.margin ?? layoutMargin }, set: { value in
+            guard value.isFinite else { return }
+            layoutMargin = max(0, value)
+            store.updateArrangement(margin: layoutMargin)
+        })
+    }
+
+    private var arrangementGapBinding: Binding<CGFloat> {
+        Binding(get: { store.document.arrangement?.gap ?? layoutGap }, set: { value in
+            guard value.isFinite else { return }
+            let gap = max(0, value)
+            guard gap != (store.document.arrangement?.gap ?? layoutGap) else { return }
+            if isAdjustingGap, !hasStartedGapChange, store.document.arrangement != nil {
+                store.beginContinuousChange()
+                hasStartedGapChange = true
+            }
+            layoutGap = gap
+            store.updateArrangement(gap: gap)
+        })
+    }
+
+    private func finishGapAdjustment() {
+        if hasStartedGapChange { store.endContinuousChange() }
+        hasStartedGapChange = false
+        isAdjustingGap = false
+    }
+
+    private func usePaper(_ item: PaperLibraryItem, addingLayer: Bool = false) {
+        finishGapAdjustment()
+        if let color = item.color {
+            store.usePaperColor(CanvasColor(color.nsColor), name: item.displayName,
+                                libraryID: item.id, addingLayer: addingLayer)
+        } else {
+            store.usePaperImage(at: paperLibrary.url(for: item), name: item.displayName,
+                                libraryID: item.id, addingLayer: addingLayer)
+        }
     }
     private var paperColorBinding: Binding<Color> {
-        Binding(get: { Color(store.selectedLayer?.color.nsColor ?? .white) }, set: { color in store.editSelected { $0.color = CanvasColor(NSColor(color)) } })
+        Binding(get: { Color(store.selectedLayer?.color.nsColor ?? .white) }, set: { color in
+            guard let id = store.selectedLayer?.id else { return }
+            store.editLayer(id) { $0.color = CanvasColor(NSColor(color)) }
+        })
     }
     private var canvasRatioBinding: Binding<CanvasAspectRatio> {
         Binding(get: { CanvasAspectRatio.matching(store.document.size) }, set: { preset in
@@ -361,50 +316,25 @@ struct FreeCanvasView: View {
                                       height: width ? store.document.size.height : value))
         })
     }
-    private func layerValue(_ keyPath: WritableKeyPath<CanvasLayer, CGFloat>, fallback: CGFloat) -> Binding<CGFloat> {
-        Binding(get: { store.selectedLayer?[keyPath: keyPath] ?? fallback }, set: { value in
-            guard value.isFinite else { return }
-            store.editSelected { layer in
-                if keyPath == \.opacity { layer.opacity = min(1, max(0, value)) }
-                else if keyPath == \.rotation { layer.rotation = ((value + 180).truncatingRemainder(dividingBy: 360) + 360).truncatingRemainder(dividingBy: 360) - 180 }
-                else { layer[keyPath: keyPath] = min(32000, max(-32000, value)) }
-            }
-        })
-    }
-    private func layerDimension(width: Bool) -> Binding<CGFloat> {
-        Binding(get: { width ? (store.selectedLayer?.size.width ?? 1) : (store.selectedLayer?.size.height ?? 1) }, set: { value in
-            guard value.isFinite, value > 0 else { return }
-            store.editSelected {
-                let old = $0.size, bounded = min(32000, max(12, value))
-                if width {
-                    $0.size.width = bounded
-                    if $0.preservesAspect { $0.size.height = bounded * old.height / old.width }
-                } else {
-                    $0.size.height = bounded
-                    if $0.preservesAspect { $0.size.width = bounded * old.width / old.height }
-                }
-            }
-        })
-    }
-    private func continuousEdit(_ editing: Bool) {
-        if editing { store.beginContinuousChange() } else { store.endContinuousChange() }
-    }
     private func arrange(horizontal: Bool) {
-        guard store.photoCount <= 2 else { return }
-        store.arrange(horizontal: horizontal, margin: layoutMargin, gap: layoutGap, split: layoutSplit)
+        finishGapAdjustment()
+        store.arrange(horizontal: horizontal, margin: layoutMargin, gap: layoutGap)
     }
     private func startCrop(_ layer: CanvasLayer) {
-        guard !layer.locked, let item = layer.photo else { return }
-        closeInspector()
+        guard !layer.locked, !store.isLoading, !store.isExporting, let item = layer.photo else { return }
+        store.selectedID = layer.id
         cropSession = CanvasCropSession(id: layer.id, item: item)
     }
-    private func openInspector(_ layer: CanvasLayer) {
-        store.selectedID = layer.id
-        inspectedID = layer.id
-    }
-    private func closeInspector() {
-        store.endContinuousChange()
-        inspectedID = nil
+    private func chooseReplacement(_ layer: CanvasLayer) {
+        guard !layer.locked, !store.isLoading, !store.isExporting else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "选择替换此照片的图片"
+        panel.directoryURL = layer.photo?.url.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.replacePhoto(with: url, layerID: layer.id)
     }
     private func exportCanvas() {
         let snapshot = CanvasRenderSnapshot(store.document)
@@ -460,7 +390,6 @@ struct FreeCanvasView: View {
     }
 
     private func clearCanvas() {
-        closeInspector()
         store.clear()
         store.fitRequest += 1
     }

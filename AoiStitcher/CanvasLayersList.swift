@@ -3,12 +3,14 @@ import AppKit
 
 struct CanvasLayersList: NSViewRepresentable {
     @ObservedObject var store: CanvasStore
-    var onInspect: (CanvasLayer) -> Void
+    var onCrop: (CanvasLayer) -> Void
+    var onReplace: (CanvasLayer) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
         let table = CanvasLayersTableView()
         table.store = store
-        table.onInspect = onInspect
+        table.onCrop = onCrop
+        table.onReplace = onReplace
         let scroll = NSScrollView()
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
@@ -20,7 +22,8 @@ struct CanvasLayersList: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let table = scroll.documentView as? CanvasLayersTableView else { return }
-        table.onInspect = onInspect
+        table.onCrop = onCrop
+        table.onReplace = onReplace
         table.refresh()
     }
 }
@@ -28,7 +31,8 @@ struct CanvasLayersList: NSViewRepresentable {
 final class CanvasLayersTableView: NSTableView, NSTableViewDataSource, NSTableViewDelegate {
     static let layerPasteboardType = NSPasteboard.PasteboardType("com.aoistitcher.canvas-layer")
     var store: CanvasStore!
-    var onInspect: ((CanvasLayer) -> Void)?
+    var onCrop: ((CanvasLayer) -> Void)?
+    var onReplace: ((CanvasLayer) -> Void)?
     private var layers: [CanvasLayer] = []
     private var synchronizingSelection = false
 
@@ -52,7 +56,7 @@ final class CanvasLayersTableView: NSTableView, NSTableViewDataSource, NSTableVi
         setDraggingSourceOperationMask(.move, forLocal: true)
         setDraggingSourceOperationMask([], forLocal: false)
         setAccessibilityLabel("素材图层，从上到下排列")
-        toolTip = "单击选中，右击设置，拖动调整图层顺序。⌘I 设置素材，⌥↑／⌥↓ 调整顺序。"
+        toolTip = "单击选中，右击照片可裁剪／水印、替换或删除；拖动调整图层顺序。⌘I 打开照片操作，⌥↑／⌥↓ 调整顺序。"
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -89,25 +93,33 @@ final class CanvasLayersTableView: NSTableView, NSTableViewDataSource, NSTableVi
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        inspectRow(at: convert(event.locationInWindow, from: nil))
+        showMenuForRow(at: convert(event.locationInWindow, from: nil))
     }
 
     override func mouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.control) {
-            inspectRow(at: convert(event.locationInWindow, from: nil))
+            showMenuForRow(at: convert(event.locationInWindow, from: nil))
         } else {
             window?.makeFirstResponder(self)
             super.mouseDown(with: event)
         }
     }
 
-    private func inspectRow(at point: NSPoint) {
+    private func showMenuForRow(at point: NSPoint) {
         let index = row(at: point)
         guard layers.indices.contains(index) else { return }
         window?.makeFirstResponder(self)
         selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-        store.selectedID = layers[index].id
-        onInspect?(layers[index])
+        let layer = layers[index]
+        store.selectedID = layer.id
+        presentMenu(for: layer, at: point)
+    }
+
+    private func presentMenu(for layer: CanvasLayer, at point: NSPoint) {
+        let menu = CanvasLayerMenu(layer: layer, store: store,
+                                  onCrop: { [weak self] selectedLayer in self?.onCrop?(selectedLayer) },
+                                  onReplace: { [weak self] selectedLayer in self?.onReplace?(selectedLayer) })
+        menu.popUp(positioning: nil, at: point, in: self)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -125,7 +137,8 @@ final class CanvasLayersTableView: NSTableView, NSTableViewDataSource, NSTableVi
             refresh()
         } else if modifiers == .command && character == "i",
            layers.indices.contains(selectedRow) {
-            onInspect?(layers[selectedRow])
+            let rowRect = rect(ofRow: selectedRow)
+            presentMenu(for: layers[selectedRow], at: NSPoint(x: rowRect.minX + 36, y: rowRect.midY))
         } else if modifiers == .option && (event.keyCode == 125 || event.keyCode == 126),
                   layers.indices.contains(selectedRow) {
             let destination = event.keyCode == 126 ? selectedRow - 1 : selectedRow + 2

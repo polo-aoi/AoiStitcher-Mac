@@ -49,6 +49,8 @@ enum AppPreferences {
     static let gridPanModeKey = "gridCollage.panMode"
     static let gridPanKeyKey = "gridCollage.panKey"
     static let workspaceOrderKey = "workspaceOrder.v1"
+    static let skipGroupingPromptKey = "projectLibrary.skipGroupingPrompt"
+    static let materialSelectionHintDismissedKey = "projectLibrary.materialSelectionHintDismissed"
     static let canvasWheelBehaviorKey = "freeCanvas.wheelBehavior"
     static let canvasGestureBehaviorKey = "freeCanvas.gestureBehavior"
     static let canvasZoomSensitivityKey = "freeCanvas.zoomSensitivity"
@@ -62,7 +64,7 @@ enum AppPreferences {
     // defaults must never relocate the user's existing projects.
     static nonisolated let projectRootKey = "projectRootDirectory.v1"
     static nonisolated let defaultProjectRootName = "AoiStitcher 项目"
-    static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey]
+    static let preferenceKeys = exportKeys + canvasInteractionKeys + ["colorSchemeStyle", "lastExportDir", "lastGlobalWatermarkDir", "lastLocalWatermarkDir", gridPanModeKey, gridPanKeyKey, workspaceOrderKey, skipGroupingPromptKey, materialSelectionHintDismissedKey]
 
     /// The user-facing directory that holds every project folder. Defaults to
     /// `~/Pictures/AoiStitcher 项目/` for project metadata and preview caches.
@@ -109,6 +111,8 @@ enum AppPreferences {
         defaults.removeObject(forKey: gridPanModeKey)
         defaults.removeObject(forKey: gridPanKeyKey)
         defaults.removeObject(forKey: workspaceOrderKey)
+        defaults.removeObject(forKey: skipGroupingPromptKey)
+        defaults.removeObject(forKey: materialSelectionHintDismissedKey)
         for key in preferenceKeys where key.hasPrefix("last") { defaults.removeObject(forKey: key) }
     }
 

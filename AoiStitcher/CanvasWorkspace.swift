@@ -6,11 +6,11 @@ struct CanvasWorkspace: NSViewRepresentable {
     var isActive: Bool
     var settings: CanvasInteractionSettings
     var onCrop: (CanvasLayer) -> Void
-    var onInspect: (CanvasLayer) -> Void
+    var onReplace: (CanvasLayer) -> Void
 
     func makeNSView(context: Context) -> CanvasWorkspaceView {
         let view = CanvasWorkspaceView()
-        view.store = store; view.onCrop = onCrop; view.onInspect = onInspect
+        view.store = store; view.onCrop = onCrop; view.onReplace = onReplace
         view.isActive = isActive; view.settings = settings
         return view
     }
@@ -19,8 +19,9 @@ struct CanvasWorkspace: NSViewRepresentable {
         view.isActive = isActive
         view.settings = settings
         view.onCrop = onCrop
-        view.onInspect = onInspect
+        view.onReplace = onReplace
         view.synchronizeDocument()
+        view.refreshSelectionToolbar()
         if view.lastFitRequest != store.fitRequest {
             view.lastFitRequest = store.fitRequest
             view.resetViewport()
@@ -36,7 +37,7 @@ final class CanvasWorkspaceView: NSView {
     var store: CanvasStore!
     var snapshot: CanvasRenderSnapshot?
     var onCrop: ((CanvasLayer) -> Void)?
-    var onInspect: ((CanvasLayer) -> Void)?
+    var onReplace: ((CanvasLayer) -> Void)?
     var isActive = true {
         didSet {
             guard oldValue != isActive else { return }
@@ -47,6 +48,7 @@ final class CanvasWorkspaceView: NSView {
                 finishInteraction(clearKeyboard: true)
             }
             needsDisplay = true
+            updateSelectionToolbar()
         }
     }
     var settings = CanvasInteractionSettings() {
@@ -74,6 +76,8 @@ final class CanvasWorkspaceView: NSView {
     private var observers: [NSObjectProtocol] = []
     private enum Interaction { case move, resize(Int), rotate, pan }
     private var interaction: Interaction?
+    private var selectionToolbar: NSHostingView<CanvasSelectionToolbar>?
+    private var selectionToolbarSize = CGSize.zero
     private let cornerSigns = [CGPoint(x: -1, y: -1), CGPoint(x: 1, y: -1),
                                CGPoint(x: 1, y: 1), CGPoint(x: -1, y: 1)]
     override var isFlipped: Bool { true }
@@ -100,16 +104,36 @@ final class CanvasWorkspaceView: NSView {
             return self.handleKeyboardEvent(event)
         }
         for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
-                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
+                               (NSWindow.didBecomeKeyNotification, window as AnyObject),
+                               (NSApplication.didResignActiveNotification, NSApp as AnyObject),
+                               (NSApplication.didBecomeActiveNotification, NSApp as AnyObject),
+                               (NSWindow.willBeginSheetNotification, window as AnyObject),
+                               (NSWindow.didEndSheetNotification, window as AnyObject)] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
                 self?.finishInteraction(clearKeyboard: true)
+                if name == NSWindow.willBeginSheetNotification {
+                    self?.selectionToolbar?.isHidden = true
+                } else {
+                    self?.updateSelectionToolbar()
+                }
             })
         }
+        updateSelectionToolbar()
     }
 
     override func viewDidHide() {
         super.viewDidHide()
         finishInteraction(clearKeyboard: true)
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        updateSelectionToolbar()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        updateSelectionToolbar()
     }
 
     func disconnect() {
@@ -118,6 +142,9 @@ final class CanvasWorkspaceView: NSView {
         observers.removeAll()
         zoomPublication?.cancel(); zoomPublication = nil
         finishInteraction(clearKeyboard: true)
+        selectionToolbar?.removeFromSuperview()
+        selectionToolbar = nil
+        selectionToolbarSize = .zero
     }
 
     func synchronizeDocument() {
@@ -125,6 +152,7 @@ final class CanvasWorkspaceView: NSView {
         if lastSelectionID != store.selectedID {
             lastSelectionID = store.selectedID
             needsDisplay = true
+            updateSelectionToolbar()
         }
         guard snapshotRevision != store.documentRevision || snapshot == nil else { return }
         if let interactionRevision, interactionRevision != store.documentRevision {
@@ -134,6 +162,7 @@ final class CanvasWorkspaceView: NSView {
         snapshot = CanvasRenderSnapshot(store.document, preview: true)
         snapshotRevision = store.documentRevision
         needsDisplay = true
+        updateSelectionToolbar()
     }
 
     private var acceptsInteraction: Bool {
@@ -216,11 +245,13 @@ final class CanvasWorkspaceView: NSView {
         zoom = 1; pan = .zero
         store?.displayedZoom = 1
         needsDisplay = true
+        updateSelectionToolbar()
     }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill(); bounds.fill()
-        guard let snapshot, let context = NSGraphicsContext.current?.cgContext else { return }
+        guard let snapshot, !snapshot.layers.isEmpty,
+              let context = NSGraphicsContext.current?.cgContext else { return }
         context.saveGState()
         context.clip(to: bounds)
         context.translateBy(x: origin.x, y: origin.y); context.scaleBy(x: scale, y: scale)
@@ -290,6 +321,7 @@ final class CanvasWorkspaceView: NSView {
         }
         let hit = layer(at: dragStart)
         store.selectedID = hit?.id
+        updateSelectionToolbar()
         if event.clickCount == 2, let hit, hit.kind == .photo, !hit.locked {
             onCrop?(hit)
         } else if let hit, !hit.locked {
@@ -331,6 +363,7 @@ final class CanvasWorkspaceView: NSView {
         pan = CGPoint(x: panStart.x + point.x - start.x, y: panStart.y + point.y - start.y)
         NSCursor.closedHand.set()
         needsDisplay = true
+        updateSelectionToolbar()
     }
 
     override func rightMouseUp(with event: NSEvent) {
@@ -342,7 +375,13 @@ final class CanvasWorkspaceView: NSView {
         if acceptsInteraction, isClick, bounds.contains(point),
            let hit = store.document.layers.first(where: { $0.id == clickedID }) {
             store.selectedID = hit.id
-            onInspect?(hit)
+            updateSelectionToolbar()
+            let menu = CanvasLayerMenu(layer: hit, store: store,
+                                       onCrop: { [weak self] in self?.onCrop?($0) },
+                                       onReplace: { [weak self] in self?.onReplace?($0) })
+            selectionToolbar?.isHidden = true
+            menu.popUp(positioning: nil, at: point, in: self)
+            updateSelectionToolbar()
         }
     }
 
@@ -353,7 +392,7 @@ final class CanvasWorkspaceView: NSView {
         if case .pan = interaction {
             let point = eventPoint(event)
             pan = CGPoint(x: panStart.x + point.x - dragStart.x, y: panStart.y + point.y - dragStart.y)
-            needsDisplay = true; return
+            needsDisplay = true; updateSelectionToolbar(); return
         }
         guard let layer = initialLayer, interactionRevision == store.documentRevision else {
             finishInteraction(clearKeyboard: true, commit: false)
@@ -390,6 +429,7 @@ final class CanvasWorkspaceView: NSView {
         }
         invalidatePreview(updated)
         invalidateGuides()
+        updateSelectionToolbar()
     }
 
     private func invalidatePreview(_ layer: CanvasLayer) {
@@ -451,6 +491,7 @@ final class CanvasWorkspaceView: NSView {
         if hadPreview { snapshotRevision = nil }
         synchronizeDocument()
         NSCursor.arrow.set(); needsDisplay = true
+        updateSelectionToolbar()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -505,10 +546,12 @@ final class CanvasWorkspaceView: NSView {
             self.store?.displayedZoom = self.zoom
             self.zoomPublication = nil
             self.needsDisplay = true
+            self.updateSelectionToolbar()
         }
         zoomPublication = update
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: update)
         needsDisplay = true
+        updateSelectionToolbar()
     }
     override func magnify(with event: NSEvent) {
         guard acceptsInteraction, bounds.contains(eventPoint(event)), interaction == nil, rightClickStart == nil else { return }
@@ -530,6 +573,7 @@ final class CanvasWorkspaceView: NSView {
             let factor: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
             pan.x += event.scrollingDeltaX * factor; pan.y += event.scrollingDeltaY * factor
             needsDisplay = true
+            updateSelectionToolbar()
         }
     }
 
@@ -554,5 +598,167 @@ final class CanvasWorkspaceView: NSView {
 
     private var canImportDroppedImages: Bool {
         isActive && !store.isLoading && !store.isExporting && window?.attachedSheet == nil
+    }
+
+    func refreshSelectionToolbar() { updateSelectionToolbar() }
+
+    private func updateSelectionToolbar() {
+        guard let store, acceptsInteraction, !store.isLoading, !store.isExporting,
+              let layer = previewLayer ?? store.selectedLayer,
+              layer.kind == .photo, !layer.locked else {
+            selectionToolbar?.isHidden = true
+            return
+        }
+        if selectionToolbar == nil {
+            let toolbar = CanvasSelectionToolbar(
+                crop: { [weak self] in self?.performPhotoAction(replace: false) },
+                replace: { [weak self] in self?.performPhotoAction(replace: true) },
+                delete: { [weak self] in self?.deleteSelectedPhoto() }
+            )
+            let hostingView = NSHostingView(rootView: toolbar)
+            hostingView.sizingOptions = [.intrinsicContentSize]
+            addSubview(hostingView, positioned: .above, relativeTo: nil)
+            selectionToolbar = hostingView
+            selectionToolbarSize = hostingView.fittingSize
+        }
+        guard let selectionToolbar else { return }
+        let toolbarSize = selectionToolbarSize
+        let imageRect = selectionBounds(of: layer)
+        let position = SelectedImageToolbarPlacement.position(for: imageRect, in: bounds.size,
+                                                               toolbarSize: toolbarSize)
+        var frame = CGRect(x: position.x - toolbarSize.width / 2,
+                           y: position.y - toolbarSize.height / 2,
+                           width: toolbarSize.width, height: toolbarSize.height)
+        let handleTargets = selectionHandlePoints(of: layer).map {
+            CGRect(x: $0.x - 10, y: $0.y - 10, width: 20, height: 20)
+        }
+        func collisionArea(_ frame: CGRect) -> CGFloat {
+            handleTargets.reduce(0) { area, target in
+                let overlap = frame.intersection(target)
+                return area + (overlap.isNull ? 0 : overlap.width * overlap.height)
+            }
+        }
+        if collisionArea(frame) > 0 {
+            for x in [imageRect.maxX + 8, imageRect.minX - 8 - toolbarSize.width] {
+                var candidate = frame
+                candidate.origin.x = bounds.width >= toolbarSize.width + 16
+                    ? min(max(8, x), bounds.width - toolbarSize.width - 8)
+                    : (bounds.width - toolbarSize.width) / 2
+                if collisionArea(candidate) < collisionArea(frame) { frame = candidate }
+            }
+        }
+        selectionToolbar.frame = frame
+        selectionToolbar.isHidden = false
+    }
+
+    private func selectionHandlePoints(of layer: CanvasLayer) -> [CGPoint] {
+        let localPoints = cornerSigns.map {
+            CGPoint(x: $0.x * layer.size.width / 2, y: $0.y * layer.size.height / 2)
+        } + [CGPoint(x: 0, y: -layer.size.height / 2 - 26 / scale)]
+        return localPoints.map {
+            CanvasGeometry.worldPoint($0, center: layer.center, rotation: layer.rotation)
+        }.map { CGPoint(x: origin.x + $0.x * scale, y: origin.y + $0.y * scale) }
+    }
+
+    private func selectionBounds(of layer: CanvasLayer) -> CGRect {
+        let points = selectionHandlePoints(of: layer)
+        let corners = points.prefix(4)
+        let minX = corners.map(\.x).min() ?? 0
+        let minY = corners.map(\.y).min() ?? 0
+        let maxX = corners.map(\.x).max() ?? 0
+        let maxY = corners.map(\.y).max() ?? 0
+        let imageRect = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+            .insetBy(dx: -10, dy: -10)
+        // Leave room for the rotation handle above the photo, even when the
+        // photo is rotated. The toolbar must not cover its drag target.
+        let rotationPoint = points[4]
+        let rotationRect = CGRect(x: rotationPoint.x - 10,
+                                  y: rotationPoint.y - 10,
+                                  width: 20, height: 20)
+        return imageRect.union(rotationRect)
+    }
+
+    private var editableSelectedPhoto: CanvasLayer? {
+        guard acceptsInteraction, !store.isLoading, !store.isExporting,
+              let layer = store.selectedLayer, layer.kind == .photo, !layer.locked else { return nil }
+        return layer
+    }
+
+    private func performPhotoAction(replace: Bool) {
+        guard let layer = editableSelectedPhoto else { return }
+        if replace { onReplace?(layer) } else { onCrop?(layer) }
+    }
+
+    private func deleteSelectedPhoto() {
+        guard editableSelectedPhoto != nil else { return }
+        store.deleteSelected()
+        updateSelectionToolbar()
+    }
+}
+
+private struct CanvasSelectionToolbar: View {
+    var crop: () -> Void
+    var replace: () -> Void
+    var delete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Button(action: crop) { Image(systemName: "crop") }
+                .accessibilityLabel("裁剪与水印").help("编辑这张照片的裁剪和水印")
+            Button(action: replace) { Image(systemName: "photo.badge.arrow.down") }
+                .accessibilityLabel("替换照片").help("替换这张照片")
+            Button(role: .destructive, action: delete) { Image(systemName: "trash") }
+                .accessibilityLabel("删除照片").help("删除这张照片")
+        }
+        .modifier(SelectedImageToolbarChrome())
+        .fixedSize()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("所选照片快捷操作")
+    }
+}
+
+@MainActor final class CanvasLayerMenu: NSMenu {
+    private weak var store: CanvasStore?
+    private let layerID: UUID
+    private let onCrop: (CanvasLayer) -> Void
+    private let onReplace: (CanvasLayer) -> Void
+
+    init(layer: CanvasLayer, store: CanvasStore,
+         onCrop: @escaping (CanvasLayer) -> Void, onReplace: @escaping (CanvasLayer) -> Void) {
+        self.store = store; layerID = layer.id; self.onCrop = onCrop; self.onReplace = onReplace
+        super.init(title: "")
+        autoenablesItems = false
+        if layer.kind == .photo {
+            addItem(withTitle: "裁剪与水印…", action: #selector(cropPhoto), keyEquivalent: "")
+            addItem(withTitle: "替换照片…", action: #selector(replacePhoto), keyEquivalent: "")
+        }
+        addItem(withTitle: "删除", action: #selector(deleteLayer), keyEquivalent: "")
+        items.forEach { item in item.target = self; item.isEnabled = canMutate }
+    }
+
+    required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private var currentLayer: CanvasLayer? { store?.document.layers.first { $0.id == layerID } }
+    private var canMutate: Bool {
+        guard let store, let layer = currentLayer else { return false }
+        return !layer.locked && !store.isLoading && !store.isExporting
+    }
+
+    @objc private func cropPhoto() {
+        guard canMutate, let layer = currentLayer, layer.kind == .photo else { return }
+        store?.selectedID = layer.id
+        onCrop(layer)
+    }
+
+    @objc private func replacePhoto() {
+        guard canMutate, let layer = currentLayer, layer.kind == .photo else { return }
+        store?.selectedID = layer.id
+        onReplace(layer)
+    }
+
+    @objc private func deleteLayer() {
+        guard canMutate, let store, let layer = currentLayer else { return }
+        store.selectedID = layer.id
+        store.deleteSelected()
     }
 }

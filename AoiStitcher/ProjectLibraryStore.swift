@@ -462,6 +462,7 @@ nonisolated private struct PendingDuplicateImport: Sendable {
     var boardViewportWidth: CGFloat = 800
     var boardViewZoom: CGFloat = 1
 
+    let isTemporarySession: Bool
     private let directory: URL
     private var editHistory: [UUID: [ProjectEditSnapshot]] = [:]
     private var documents: [UUID: ProjectDocument] = [:]
@@ -501,16 +502,28 @@ nonisolated private struct PendingDuplicateImport: Sendable {
         return !(editHistory[id]?.isEmpty ?? true)
     }
 
-    init(projectsDirectory: URL = ProjectLibraryStore.configuredProjectsDirectory(), thumbnailQueue: OperationQueue? = nil) {
-        directory = projectsDirectory
+    init(projectsDirectory: URL = ProjectLibraryStore.configuredProjectsDirectory(), thumbnailQueue: OperationQueue? = nil,
+         temporarySession: Bool = false) {
+        isTemporarySession = temporarySession
+        directory = temporarySession
+            ? FileManager.default.temporaryDirectory.appendingPathComponent("aoistitcher-materials-\(UUID().uuidString)", isDirectory: true)
+            : projectsDirectory
         self.thumbnailQueue = thumbnailQueue ?? Self.makeThumbnailQueue()
         thumbnails.countLimit = 2_000
         thumbnails.totalCostLimit = 64 * 1024 * 1024
-        refreshProjects()
+        if temporarySession {
+            let now = Date()
+            let document = ProjectDocument(id: UUID(), name: "本次拼图素材", createdAt: now, modifiedAt: now,
+                                           assets: [], exports: [], thumbnailSize: 128)
+            documents[document.id] = document
+            currentProject = document
+        } else {
+            refreshProjects()
+        }
         // Only migrate from the legacy Application Support location when running
         // against the configured production root. Tests pass a disposable
         // directory and must never touch the user's real library.
-        if projectsDirectory == Self.configuredProjectsDirectory() {
+        if !temporarySession, projectsDirectory == Self.configuredProjectsDirectory() {
             migrateLegacyProjectsIfNeeded()
         }
         NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
@@ -522,12 +535,19 @@ nonisolated private struct PendingDuplicateImport: Sendable {
     deinit {
         _ = metadataWriter.flush()
         thumbnailQueue.cancelAllOperations()
+        if isTemporarySession {
+            let cacheDirectory = directory
+            thumbnailQueue.addBarrierBlock {
+                try? FileManager.default.removeItem(at: cacheDirectory)
+            }
+        }
         for request in importQueue {
             request.securityScopes.forEach { $0.stopAccessingSecurityScopedResource() }
         }
     }
 
     func refreshProjects() {
+        guard !isTemporarySession else { return }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let entries = try FileManager.default.contentsOfDirectory(at: directory,
@@ -871,7 +891,9 @@ nonisolated private struct PendingDuplicateImport: Sendable {
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = true
         panel.prompt = "导入素材"
-        panel.message = "选择图片或文件夹（包含子文件夹）。项目只记录照片位置，不复制原图；移动原文件后可用「修复项目」重新连接。"
+        panel.message = isTemporarySession
+            ? "选择图片或文件夹（包含子文件夹）。照片保留原位置，本次素材与分组仅在当前拼图会话中保留。"
+            : "选择图片或文件夹（包含子文件夹）。项目只记录照片位置，不复制原图；移动原文件后可用「修复项目」重新连接。"
         if panel.runModal() == .OK { importURLs(panel.urls) }
     }
 
@@ -1508,6 +1530,7 @@ nonisolated private struct PendingDuplicateImport: Sendable {
     }
 
     private func updateSummary(_ document: ProjectDocument) {
+        guard !isTemporarySession else { return }
         projects.removeAll { $0.id == document.id }
         projects.append(summary(document))
         projects.sort(by: Self.newestProjectFirst)
@@ -1548,6 +1571,7 @@ nonisolated private struct PendingDuplicateImport: Sendable {
     private func saveDocument(_ document: ProjectDocument) throws {
         try Self.validate(document, expectedID: document.id)
         documents[document.id] = document
+        guard !isTemporarySession else { return }
         let url = metadataURL(id: document.id)
         metadataWriter.enqueue(document, at: url) { [weak self] error in
             guard let error else { return }

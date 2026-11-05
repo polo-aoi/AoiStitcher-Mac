@@ -128,16 +128,22 @@ nonisolated enum CropGeometry {
     private var redoStack: [CropState] = []
     private var gestureStart: CropState?
     private var gestureChanged = false
+    private let initialPreset: CropRatioPreset
     private(set) var watermarkPreviews: [UUID: CGImage] = [:]
 
-    init(item: StitchItem) {
+    init(item: StitchItem, initialPreset: CropRatioPreset = .original) {
         self.item = item
-        imageSize = item.image.size
+        self.initialPreset = initialPreset
+        let imageSize = item.image.size
+        self.imageSize = imageSize
         originalImage = item.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
         previewImage = originalImage.map { CanvasImageLoader.thumbnail($0, maximum: 1800) }
         let center = CGPoint(x: imageSize.width / 2, y: imageSize.height / 2)
-        state = CropState(rect: CGRect(origin: .zero, size: imageSize), imageCenter: center,
-                          preset: .original, aspectRatio: imageSize.width / imageSize.height, watermarks: item.watermarks)
+        let ratio = initialPreset == .original ? imageSize.width / imageSize.height : initialPreset.ratioValue
+        let width = ratio.map { min(imageSize.width, imageSize.height * $0) } ?? imageSize.width
+        let height = ratio.map { width / $0 } ?? imageSize.height
+        state = CropState(rect: CGRect(x: center.x - width / 2, y: center.y - height / 2, width: width, height: height),
+                          imageCenter: center, preset: initialPreset, aspectRatio: ratio, watermarks: item.watermarks)
         if let info = item.cropInfo, info.scale > 0, info.scale.isFinite {
             let turns = Int((info.rotation / 90).rounded())
             state.rect = CGRect(x: info.uiCropRect.minX / info.scale, y: info.uiCropRect.minY / info.scale,
@@ -278,10 +284,14 @@ nonisolated enum CropGeometry {
     }
     func reset() {
         change {
-            $0.rect = CGRect(origin: .zero, size: imageSize)
+            let ratio = initialPreset == .original ? imageSize.width / imageSize.height : initialPreset.ratioValue
+            let width = ratio.map { min(imageSize.width, imageSize.height * $0) } ?? imageSize.width
+            let height = ratio.map { width / $0 } ?? imageSize.height
+            $0.rect = CGRect(x: (imageSize.width - width) / 2, y: (imageSize.height - height) / 2,
+                             width: width, height: height)
             $0.imageCenter = CGPoint(x: imageSize.width / 2, y: imageSize.height / 2)
             $0.imageScale = 1; $0.quarterTurns = 0; $0.straighten = 0
-            $0.preset = .original; $0.aspectRatio = imageSize.width / imageSize.height
+            $0.preset = initialPreset; $0.aspectRatio = ratio
         }
         fitRequest += 1
     }
@@ -374,14 +384,20 @@ nonisolated enum CropRenderer {
         }
         context.restoreGState()
     }
-    static func makeImage(_ snapshot: CropRenderSnapshot) throws -> CGImage {
+    static func makeImage(_ snapshot: CropRenderSnapshot, background: CGColor? = CGColor.white) throws -> CGImage {
         let factor = CGFloat(snapshot.image.width) / snapshot.imageSize.width / snapshot.scale
         let width = max(1, Int((snapshot.rect.width * factor).rounded()))
         let height = max(1, Int((snapshot.rect.height * factor).rounded()))
         guard width <= 16384, height <= 16384, Double(width) * Double(height) <= 64_000_000 else { throw CanvasExportError.tooLarge }
         guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                       space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw CanvasExportError.renderFailed }
-        context.setFillColor(CGColor.white); context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        if let background {
+            context.setFillColor(background)
+            context.fill(bounds)
+        } else {
+            context.clear(bounds)
+        }
         context.translateBy(x: 0, y: CGFloat(height)); context.scaleBy(x: CGFloat(width) / snapshot.rect.width, y: -CGFloat(height) / snapshot.rect.height)
         context.translateBy(x: -snapshot.rect.minX, y: -snapshot.rect.minY)
         draw(snapshot, in: context)

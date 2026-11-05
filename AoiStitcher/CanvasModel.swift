@@ -22,6 +22,13 @@ nonisolated struct CanvasColor: Equatable {
 }
 
 nonisolated enum CanvasLayerKind: String { case photo, paper }
+nonisolated enum CanvasArrangementDirection: Equatable { case horizontal, vertical }
+nonisolated struct CanvasArrangement: Equatable {
+    var direction: CanvasArrangementDirection
+    var margin: CGFloat
+    var gap: CGFloat
+}
+
 nonisolated enum CanvasAspectRatio: String, CaseIterable, Identifiable {
     case square = "1:1", landscapePhoto = "3:2", portraitPhoto = "2:3"
     case landscape = "4:3", portrait = "3:4", widescreen = "16:9", tall = "9:16"
@@ -88,6 +95,7 @@ struct CanvasLayer: Identifiable {
     var opacity: CGFloat = 1
     var locked = false
     var color: CanvasColor = .white
+    var paperLibraryID: UUID? = nil
     var preservesAspect: Bool { kind == .photo || image != nil }
 }
 
@@ -99,17 +107,20 @@ struct CanvasDocument {
     var backgroundIsExplicit = false
     // Array order is the paint order, bottom to top.
     var layers: [CanvasLayer] = []
+    var arrangement: CanvasArrangement?
 
     // Keep the pre-backgroundIsExplicit memberwise call shape available to
     // project files and older callers.
     init(size: CGSize = CGSize(width: 800, height: 600),
          background: CanvasColor = .white,
          layers: [CanvasLayer] = [],
-         backgroundIsExplicit: Bool = false) {
+         backgroundIsExplicit: Bool = false,
+         arrangement: CanvasArrangement? = nil) {
         self.size = size
         self.background = background
         self.layers = layers
         self.backgroundIsExplicit = backgroundIsExplicit
+        self.arrangement = arrangement
     }
 
     var aspectRatio: CGFloat { size.width / max(1, size.height) }
@@ -254,17 +265,28 @@ nonisolated enum CanvasImageLoader {
         }
     }
 
-    func mutate(_ action: (inout CanvasDocument) -> Void) {
+    func mutate(preservingArrangement: Bool = false, _ action: (inout CanvasDocument) -> Void) {
         if !continuousChange { rememberChange() }
         var updated = document
         action(&updated)
         if updated.background != document.background { updated.backgroundIsExplicit = true }
         updated.layers = CanvasLayerOrdering.normalized(updated.layers)
+        if !preservingArrangement, updated.arrangement != nil {
+            let previousPhotos = document.layers.filter { $0.kind == .photo }
+            let updatedPhotos = updated.layers.filter { $0.kind == .photo }
+            let geometryChanged = document.size != updated.size || previousPhotos.count != updatedPhotos.count
+                || zip(previousPhotos, updatedPhotos).contains { previous, next in
+                    previous.id != next.id || previous.center != next.center || previous.size != next.size
+                        || previous.rotation != next.rotation || previous.locked != next.locked
+                        || previous.image !== next.image
+                }
+            if geometryChanged { updated.arrangement = nil }
+        }
         document = updated
     }
 
     /// A native drag keeps its intermediate geometry outside the document.
-    /// Commit once, and never overwrite an import, undo or inspector edit that
+    /// Commit once, and never overwrite an import, undo or another edit that
     /// arrived while that drag was in progress.
     @discardableResult
     func commitTransform(_ layer: CanvasLayer, expectedRevision: UInt64) -> Bool {
@@ -386,6 +408,120 @@ nonisolated enum CanvasImageLoader {
         return true
     }
 
+    private enum PaperDestination {
+        case replace(UUID)
+        case append
+    }
+
+    private func paperDestination(addingLayer: Bool) -> PaperDestination? {
+        if !addingLayer,
+           let target = (selectedLayer?.kind == .paper ? selectedLayer : nil)
+                ?? document.layers.first(where: { $0.kind == .paper }) {
+            guard !target.locked else {
+                message = "请先解锁当前纸张，再更换背景。"
+                return nil
+            }
+            return .replace(target.id)
+        }
+        guard paperCount < Self.maximumPaperLayers else {
+            message = "底图最多添加 \(Self.maximumPaperLayers) 层。"
+            return nil
+        }
+        return .append
+    }
+
+    func usePaperImage(at url: URL, name: String, libraryID: UUID? = nil, addingLayer: Bool = false) {
+        guard !isLoading, !isExporting, let destination = paperDestination(addingLayer: addingLayer) else { return }
+        let revision = documentRevision
+        isLoading = true
+        let accessed = url.startAccessingSecurityScopedResource()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let loaded = CanvasImageLoader.load(url)
+            if accessed { url.stopAccessingSecurityScopedResource() }
+            DispatchQueue.main.async {
+                defer { self.isLoading = false }
+                guard self.documentRevision == revision else { return }
+                guard let loaded else {
+                    self.message = "无法读取这张纸张，当前背景保持不变。"
+                    return
+                }
+                self.installPaper(name: name, image: loaded.image, preview: loaded.preview,
+                                  color: .white, libraryID: libraryID, destination: destination)
+            }
+        }
+    }
+
+    @discardableResult
+    func usePaperColor(_ color: CanvasColor, name: String, libraryID: UUID? = nil, addingLayer: Bool = false) -> Bool {
+        guard !isLoading, !isExporting, let destination = paperDestination(addingLayer: addingLayer) else { return false }
+        installPaper(name: name, image: nil, preview: nil, color: color,
+                     libraryID: libraryID, destination: destination)
+        return true
+    }
+
+    private func installPaper(name: String, image: CGImage?, preview: CGImage?,
+                              color: CanvasColor, libraryID: UUID?, destination: PaperDestination) {
+        var layer = CanvasLayer(name: name, kind: .paper, image: image, previewImage: preview,
+                                center: CGPoint(x: document.size.width / 2, y: document.size.height / 2),
+                                size: document.size, color: color, paperLibraryID: libraryID)
+        if let image {
+            layer.size = fittedSize(aspect: CGFloat(image.width) / CGFloat(image.height),
+                                    in: document.size, fill: true)
+        }
+        switch destination {
+        case .replace(let id):
+            guard let index = document.layers.firstIndex(where: { $0.id == id }),
+                  document.layers[index].kind == .paper, !document.layers[index].locked else { return }
+            layer.id = id
+            mutate { $0.layers[index] = layer }
+        case .append:
+            guard paperCount < Self.maximumPaperLayers else { return }
+            mutate { doc in
+                let firstPhoto = doc.layers.firstIndex(where: { $0.kind == .photo }) ?? doc.layers.count
+                doc.layers.insert(layer, at: firstPhoto)
+            }
+        }
+        selectedID = layer.id
+    }
+
+    /// A library replacement permanently updates its linked image resources.
+    /// Refresh history as well, so undo can restore placement without restoring cropped pixels.
+    func refreshPaperLibraryImage(id: UUID, name: String, image: CGImage, preview: CGImage) {
+        let aspect = CGFloat(image.width) / CGFloat(image.height)
+        func refreshed(_ snapshot: CanvasDocument) -> CanvasDocument {
+            var doc = snapshot
+            let canvasCenter = CGPoint(x: doc.size.width / 2, y: doc.size.height / 2)
+            func near(_ first: CGFloat, _ second: CGFloat) -> Bool {
+                abs(first - second) <= max(1, abs(second)) * 0.000001
+            }
+            for index in doc.layers.indices where doc.layers[index].kind == .paper
+                && doc.layers[index].paperLibraryID == id {
+                var layer = doc.layers[index]
+                let previousAspect = layer.image.map { CGFloat($0.width) / CGFloat($0.height) }
+                    ?? layer.size.width / max(1, layer.size.height)
+                let previousFill = fittedSize(aspect: previousAspect, in: doc.size, fill: true)
+                let wasDefaultBackground = near(layer.center.x, canvasCenter.x)
+                    && near(layer.center.y, canvasCenter.y)
+                    && near(layer.rotation.truncatingRemainder(dividingBy: 360), 0)
+                    && near(layer.size.width, previousFill.width)
+                    && near(layer.size.height, previousFill.height)
+                layer.name = name
+                layer.image = image
+                layer.previewImage = preview
+                layer.size = wasDefaultBackground
+                    ? fittedSize(aspect: aspect, in: doc.size, fill: true)
+                    : CGSize(width: layer.size.width, height: layer.size.width / aspect)
+                doc.layers[index] = layer
+            }
+            return doc
+        }
+        undoStack = undoStack.map(refreshed)
+        redoStack = redoStack.map(refreshed)
+        if document.layers.contains(where: { $0.kind == .paper && $0.paperLibraryID == id }) {
+            document = refreshed(document)
+        }
+    }
+
     func importImages(as kind: CanvasLayerKind = .photo) {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image]; panel.allowsMultipleSelection = true
@@ -469,29 +605,60 @@ nonisolated enum CanvasImageLoader {
         if wasEmpty { fitRequest += 1 }
     }
 
-    func arrange(horizontal: Bool, margin: CGFloat, gap: CGFloat, split: CGFloat) {
+    var maximumArrangementGap: CGFloat {
+        guard let arrangement = document.arrangement else { return 0 }
+        let count = document.layers.filter { $0.kind == .photo && !$0.locked }.count
+        let dimension = arrangement.direction == .horizontal ? document.size.width : document.size.height
+        return maximumGap(count: count, dimension: dimension, margin: arrangement.margin)
+    }
+
+    func updateArrangement(margin: CGFloat? = nil, gap: CGFloat? = nil) {
+        guard let arrangement = document.arrangement else { return }
+        guard margin.map({ $0 != arrangement.margin }) == true || gap.map({ $0 != arrangement.gap }) == true else { return }
+        arrange(horizontal: arrangement.direction == .horizontal,
+                margin: margin ?? arrangement.margin, gap: gap ?? arrangement.gap)
+    }
+
+    private func maximumGap(count: Int, dimension: CGFloat, margin: CGFloat) -> CGFloat {
+        guard count > 1 else { return 0 }
+        // Reserve positive space for the photos even at the slider's endpoint.
+        return max(0, (dimension - 2 * margin - 1) / CGFloat(count - 1))
+    }
+
+    func arrange(horizontal: Bool, margin: CGFloat, gap: CGFloat, split: CGFloat = 0.5) {
         let indices = document.layers.indices.filter { document.layers[$0].kind == .photo && !document.layers[$0].locked }
-        guard !indices.isEmpty else { return }
-        mutate { doc in
+        guard !indices.isEmpty, margin.isFinite, gap.isFinite else { return }
+        mutate(preservingArrangement: true) { doc in
             let dimension = horizontal ? doc.size.width : doc.size.height
             let otherDimension = horizontal ? doc.size.height : doc.size.width
             let safeMargin = min(max(0, margin), min(dimension, otherDimension) * 0.4)
             let available = dimension - safeMargin * 2
-            let safeGap = min(max(0, gap), available / CGFloat(max(1, indices.count * 2)))
+            let safeGap = min(max(0, gap), maximumGap(count: indices.count, dimension: dimension, margin: safeMargin))
+            let ratios = indices.map { index -> CGFloat in
+                let layer = doc.layers[index]
+                let aspect: CGFloat
+                if let image = layer.image {
+                    aspect = CGFloat(image.width) / CGFloat(image.height)
+                } else {
+                    aspect = layer.size.width / max(0.000001, layer.size.height)
+                }
+                return horizontal ? max(0.000001, aspect) : 1 / max(0.000001, aspect)
+            }
             let content = available - CGFloat(indices.count - 1) * safeGap
-            var position = safeMargin
+            let commonSide = min(otherDimension - 2 * safeMargin, content / ratios.reduce(0, +))
+            let totalLength = commonSide * ratios.reduce(0, +) + CGFloat(indices.count - 1) * safeGap
+            var position = (dimension - totalLength) / 2
             for (order, index) in indices.enumerated() {
-                let weight = indices.count == 2 ? (order == 0 ? min(0.85, max(0.15, split)) : 1 - min(0.85, max(0.15, split))) : 1 / CGFloat(indices.count)
-                let length = content * weight
-                let box = horizontal ? CGSize(width: length, height: otherDimension - safeMargin * 2)
-                                     : CGSize(width: otherDimension - safeMargin * 2, height: length)
-                let aspect = doc.layers[index].size.width / max(1, doc.layers[index].size.height)
-                doc.layers[index].size = fittedSize(aspect: aspect, in: box)
+                let length = commonSide * ratios[order]
+                doc.layers[index].size = horizontal ? CGSize(width: length, height: commonSide)
+                                                    : CGSize(width: commonSide, height: length)
                 doc.layers[index].center = horizontal ? CGPoint(x: position + length / 2, y: otherDimension / 2)
                                                        : CGPoint(x: otherDimension / 2, y: position + length / 2)
                 doc.layers[index].rotation = 0
                 position += length + safeGap
             }
+            doc.arrangement = CanvasArrangement(direction: horizontal ? .horizontal : .vertical,
+                                                margin: safeMargin, gap: safeGap)
         }
     }
 
@@ -574,6 +741,39 @@ nonisolated enum CanvasImageLoader {
         editLayer(layerID) {
             $0.photo = item; $0.image = image; $0.previewImage = CanvasImageLoader.thumbnail(image)
             $0.size.height = $0.size.width * CGFloat(image.height) / CGFloat(image.width)
+        }
+    }
+
+    func replacePhoto(with url: URL, layerID: UUID) {
+        guard !isLoading, !isExporting,
+              let layer = document.layers.first(where: { $0.id == layerID }),
+              layer.kind == .photo, !layer.locked else { return }
+        let revision = documentRevision
+        isLoading = true
+        let accessed = url.startAccessingSecurityScopedResource()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let loaded = CanvasImageLoader.load(url)
+            if accessed { url.stopAccessingSecurityScopedResource() }
+            DispatchQueue.main.async {
+                defer { self.isLoading = false }
+                guard self.documentRevision == revision,
+                      let current = self.document.layers.first(where: { $0.id == layerID }),
+                      current.kind == .photo, !current.locked else { return }
+                guard let loaded else {
+                    self.message = "无法读取替换照片，原照片保持不变。"
+                    return
+                }
+                let image = NSImage(cgImage: loaded.image,
+                                    size: CGSize(width: loaded.image.width, height: loaded.image.height))
+                let item = StitchItem(url: loaded.url, image: image)
+                self.editLayer(layerID) {
+                    $0.name = loaded.url.lastPathComponent
+                    $0.photo = item
+                    $0.image = loaded.image
+                    $0.previewImage = loaded.preview
+                    $0.size.height = $0.size.width * CGFloat(loaded.image.height) / CGFloat(loaded.image.width)
+                }
+            }
         }
     }
 

@@ -16,6 +16,31 @@ enum CropRegressionTests {
         check(full.width == 240 && full.height == 160, "Crop output uses source pixels, not AppKit points or screen DPI")
         check(pixel(full, x: 30, y: 30) == [255,0,0] && pixel(full, x: 210, y: 130) == [0,0,255], "Crop output keeps source orientation")
 
+        let transparentContext = CGContext(data: nil, width: 40, height: 40, bitsPerComponent: 8, bytesPerRow: 0,
+                                           space: CGColorSpaceCreateDeviceRGB(),
+                                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        transparentContext.clear(CGRect(x: 0, y: 0, width: 40, height: 40))
+        let transparentItem = StitchItem(url: URL(fileURLWithPath: "/tmp/transparent-paper.png"),
+                                        image: NSImage(cgImage: transparentContext.makeImage()!, size: CGSize(width: 40, height: 40)))
+        let transparentStore = CropStore(item: transparentItem, initialPreset: .free)
+        check(transparentStore.state.preset == .free && transparentStore.state.aspectRatio == nil
+              && transparentStore.undoCount == 0, "Paper cropping starts freely without adding a spurious undo step")
+        transparentStore.resizeCrop(from: transparentStore.state, handle: .bottomRight,
+                                    delta: CGPoint(x: -20, y: -10), minimum: 1, keepAspect: false)
+        let paperSnapshot = CropRenderSnapshot(transparentStore)!
+        let transparentCrop = try CropRenderer.makeImage(paperSnapshot, background: nil)
+        let paperBytes = CFDataGetBytePtr(transparentCrop.dataProvider!.data!)!
+        check(transparentCrop.width == 20 && transparentCrop.height == 30 && paperBytes[3] == 0,
+              "Paper crops contain only the selected pixels and preserve transparency")
+        let opaqueCrop = try CropRenderer.makeImage(paperSnapshot)
+        let opaqueBytes = CFDataGetBytePtr(opaqueCrop.dataProvider!.data!)!
+        check(opaqueBytes[3] == 255 && pixel(opaqueCrop, x: 0, y: 0) == [255,255,255],
+              "Existing photo crops retain their default white background")
+        transparentStore.reset()
+        check(transparentStore.state.preset == .free && transparentStore.state.aspectRatio == nil
+              && transparentStore.state.rect.size == CGSize(width: 40, height: 40),
+              "Resetting a paper crop restores the whole image with an unlocked aspect ratio")
+
         store.applyPreset(.free)
         let initial = store.state
         store.beginChange()

@@ -129,11 +129,13 @@ import ImageIO
         checks += try CropRegressionTests.run()
         checks += try PreferencesRegressionTests.run()
         checks += try await ProjectLibraryRegressionTests.run()
-        print("PASS: \(checks) canvas, crop, and project checks (layouts, history, layers, keyboard, rotation, crop geometry, native gestures, source quality, PNG/JPEG)")
+        checks += try await PaperLibraryRegressionTests.run()
+        print("PASS: \(checks) canvas, crop, project, and paper library checks (layouts, history, layers, keyboard, rotation, crop geometry, native gestures, source quality, PNG/JPEG)")
     }
 
     @MainActor private static func testWorkspace(_ image: CGImage) -> Int {
         // Call our own view's event handlers in a hidden test window. No system input is posted.
+        var checks = 0
         _ = NSApplication.shared
         let store = CanvasStore()
         let layer = CanvasLayer(name: "Drag fixture", kind: .photo, image: image,
@@ -159,13 +161,15 @@ import ImageIO
         }
         func require(_ condition: Bool, _ description: String) {
             if !condition { fatalError("FAIL: " + description) }
+            checks += 1
         }
         let history = store.undoCount
-        var inspected: UUID?
-        view.onInspect = { inspected = $0.id }
+        var cropped: UUID?, replaced: UUID?
+        view.onCrop = { cropped = $0.id }
+        view.onReplace = { replaced = $0.id }
         drag(from: CGPoint(x: 400, y: 300), to: CGPoint(x: 450, y: 320))
         require(store.selectedLayer!.center == CGPoint(x: 450, y: 320), "Mouse drag moves in canvas coordinates")
-        require(inspected == nil, "Left-clicking and dragging do not open parameters")
+        require(cropped == nil && replaced == nil, "Left-clicking and dragging select without opening photo editing")
         require(store.undoCount == history + 1, "Mouse drag records exactly one undo step")
         store.editSelected { $0.rotation = 30 }
         let initial = store.selectedLayer!
@@ -189,16 +193,24 @@ import ImageIO
         drag(from: lockedCenter, to: CGPoint(x: lockedCenter.x + 20, y: lockedCenter.y + 20))
         require(store.selectedLayer!.center == lockedCenter, "Locked material ignores mouse dragging")
         view.rightMouseDown(with: event(.rightMouseDown, at: lockedCenter))
-        require(inspected == nil, "Right mouse-down waits to distinguish a click from viewport panning")
-        view.rightMouseUp(with: event(.rightMouseUp, at: lockedCenter))
-        require(inspected == layer.id, "Right-click opens the hit material's parameters, including locked materials")
-        inspected = nil
+        require(cropped == nil && replaced == nil, "Right mouse-down waits to distinguish a click from viewport panning")
+        let rightDragEnd = CGPoint(x: lockedCenter.x + 20, y: lockedCenter.y + 20)
+        view.rightMouseDragged(with: event(.rightMouseDragged, at: rightDragEnd))
+        view.rightMouseUp(with: event(.rightMouseUp, at: rightDragEnd))
+        require(store.selectedID == layer.id && cropped == nil && replaced == nil,
+                "Right dragging preserves selection without invoking photo editing")
+        // Inspect the native menu directly; displaying it would block this harness.
+        let lockedMenu = CanvasLayerMenu(layer: store.selectedLayer!, store: store,
+                                        onCrop: { cropped = $0.id }, onReplace: { replaced = $0.id })
+        require(lockedMenu.items.count == 3 && lockedMenu.items.allSatisfy { !$0.isEnabled },
+                "A locked photo's native menu disables crop, replace and delete")
         view.rightMouseDown(with: event(.rightMouseDown, at: CGPoint(x: 10, y: 10)))
         view.rightMouseUp(with: event(.rightMouseUp, at: CGPoint(x: 10, y: 10)))
-        require(inspected == nil, "Right-clicking empty canvas does not open parameters")
+        require(store.selectedID == layer.id && cropped == nil && replaced == nil,
+                "Right-clicking empty canvas preserves selection without invoking photo editing")
         view.disconnect()
         window.close()
-        return 10
+        return checks
     }
 
     @MainActor private static func testLayerOrdering(_ image: CGImage) -> Int {
@@ -270,23 +282,25 @@ import ImageIO
         window.contentView = table
         table.store = store
         table.refresh()
-        var inspected: UUID?
-        table.onInspect = { inspected = $0.id }
+        var cropped: UUID?, replaced: UUID?
+        table.onCrop = { cropped = $0.id }
+        table.onReplace = { replaced = $0.id }
         check(table.numberOfRows == 3, "All material rows are present")
         table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-        check(store.selectedID == layers[1].id && inspected == nil, "Selecting a material row only selects, without opening parameters")
-        func click(_ type: NSEvent.EventType, row: Int, modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
-            let rect = table.rect(ofRow: row)
-            return NSEvent.mouseEvent(with: type, location: table.convert(CGPoint(x: rect.midX, y: rect.midY), to: nil),
-                                      modifierFlags: modifiers, timestamp: 0, windowNumber: window.windowNumber,
-                                      context: nil, eventNumber: 1, clickCount: 1, pressure: 1)!
-        }
-        table.rightMouseDown(with: click(.rightMouseDown, row: 0))
-        check(store.selectedID == layers[2].id && inspected == layers[2].id,
-              "Right-clicking a different row selects it and opens only its parameters")
-        inspected = nil
-        table.mouseDown(with: click(.leftMouseDown, row: 2, modifiers: .control))
-        check(inspected == layers[0].id, "Control-click is equivalent to right-click in the list")
+        check(store.selectedID == layers[1].id && cropped == nil && replaced == nil,
+              "Selecting a material row only selects, without opening photo editing")
+        // Exercise the same native menu without entering AppKit's popup tracking loop.
+        let menu = CanvasLayerMenu(layer: layers[2], store: store,
+                                   onCrop: { table.onCrop?($0) }, onReplace: { table.onReplace?($0) })
+        check(menu.items.map(\.title) == ["裁剪与水印…", "替换照片…", "删除"]
+              && menu.items.allSatisfy(\.isEnabled), "An unlocked photo exposes the three native menu actions")
+        menu.performActionForItem(at: 0)
+        check(store.selectedID == layers[2].id && cropped == layers[2].id && replaced == nil,
+              "The crop menu action selects and edits its own material")
+        store.selectedID = layers[0].id
+        menu.performActionForItem(at: 1)
+        check(store.selectedID == layers[2].id && replaced == layers[2].id,
+              "The replace menu action targets its material even when selection has changed")
         store.toggleLock(layers[0].id)
         table.refresh()
         check(table.tableView(table, pasteboardWriterForRow: 2) == nil, "Locked rows do not start a layer drag")

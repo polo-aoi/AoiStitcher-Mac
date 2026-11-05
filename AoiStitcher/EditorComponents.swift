@@ -130,10 +130,21 @@ struct EditorActionBar: View {
 
 struct EditorEmptyState: View {
     var body: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 16) {
             Image(systemName: "photo.on.rectangle.angled")
                 .font(.system(size: 36)).foregroundStyle(.secondary)
-            Text("暂无照片").font(.title3.weight(.semibold))
-        }.allowsHitTesting(false)
+            VStack(spacing: 8) {
+                Text("添加照片，开始拼图")
+                    .font(.title3.weight(.semibold))
+                Text("从本地导入照片、将照片拖入此处，\n或从「项目素材」添加。")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .multilineTextAlignment(.center)
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .allowsHitTesting(false)
     }
 }

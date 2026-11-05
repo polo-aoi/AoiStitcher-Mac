@@ -88,7 +88,7 @@ private struct FreeCanvasSettingsView: View {
                 Divider()
                 EditorSection("拖动画布") {
                     DragPanSettingsFields(title: "平移方式", mode: $panMode, key: $panKey)
-                    Text("左键拖动照片调整位置；右键单击照片打开素材设置。")
+                    Text("左键拖动照片调整位置；选中后显示快捷工具条，右键打开裁剪、替换和删除菜单。")
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }

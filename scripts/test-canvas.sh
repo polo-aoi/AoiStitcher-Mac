@@ -14,5 +14,6 @@ xcrun swiftc -parse-as-library -swift-version 5 -default-isolation MainActor \
     "$canvas_project_root/Tests/CropRegressionTests.swift" \
     "$canvas_project_root/Tests/PreferencesRegressionTests.swift" \
     "$canvas_project_root/Tests/ProjectLibraryRegressionTests.swift" \
+    "$canvas_project_root/Tests/PaperLibraryRegressionTests.swift" \
     -o "$canvas_test_dir/canvas-tests"
 "$canvas_test_dir/canvas-tests"

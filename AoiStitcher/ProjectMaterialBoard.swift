@@ -206,12 +206,9 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
     // the selected set available while Quick Look moves the active item.
     private var previewAssetIDs: [UUID] = []
     private var previewIndex = 0
-    // Quick Look handles arrow keys and its ‹ › buttons internally; the panel's
-    // currentPreviewItemIndex is the only reliable signal for panel-driven
-    // navigation, observed here so the grid selection can follow it.
-    private var isSynchronizingPreview = false
-    private var observedPreviewPanel: QLPreviewPanel?
-    private static var previewIndexObservationContext = 0
+    // Quick Look displays one item; the board owns navigation through the grid.
+    private var previewKeyMonitor: Any?
+    private weak var monitoredPreviewPanel: QLPreviewPanel?
     private var pendingSelection: Set<UUID>?
     private var lastPublishedSelection: Set<UUID> = []
     private var lastExternalSelection: Set<UUID> = []
@@ -300,6 +297,10 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    deinit {
+        if let previewKeyMonitor { NSEvent.removeMonitor(previewKeyMonitor) }
+    }
+
     func requestFocus(_ request: Int) {
         guard request != lastFocusRequest else { return }
         lastFocusRequest = request
@@ -340,6 +341,7 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
             if QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared(), panel.dataSource === self {
                 closePreview(panel, restoreFocus: false)
             }
+            stopPreviewKeyMonitoring()
             clearMouseInteraction()
             if window?.firstResponder === self { window?.makeFirstResponder(nil) }
         }
@@ -734,11 +736,14 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
         let candidates = spatialBuckets[Bucket(x: Int(floor(point.x / 256)), y: Int(floor(point.y / 256)))] ?? []
         return candidates.compactMap { id -> (Int, ProjectAsset)? in
             guard let index = assetIndices[id], let card = geometry[id] else { return nil }
-            let imageRect = thumbnailRect(in: card)
-            let photoRect = thumbnails[id].map { fittedImageRect($0, in: imageRect) } ?? imageRect
-            guard photoRect.contains(point) else { return nil }
+            guard photoRect(for: id, in: card).contains(point) else { return nil }
             return (index, assets[index])
         }.max(by: { $0.0 < $1.0 })?.1
+    }
+
+    private func photoRect(for id: UUID, in card: CGRect) -> CGRect {
+        let imageRect = thumbnailRect(in: card)
+        return thumbnails[id].map { fittedImageRect($0, in: imageRect) } ?? imageRect
     }
 
     private func fittedImageRect(_ image: NSImage, in rect: CGRect) -> CGRect {
@@ -776,12 +781,18 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
         let rect = cardRect(asset, at: position)
         graphics.cgContext.clip(to: rect)
         if selectedIDs.contains(asset.id) {
-            let card = NSBezierPath(roundedRect: rect.insetBy(dx: min(1, rect.width / 8), dy: min(1, rect.height / 8)),
-                                    xRadius: min(8, rect.width / 8), yRadius: min(8, rect.height / 8))
+            let outline = photoRect(for: asset.id, in: rect)
+                .insetBy(dx: -3 * displayScale, dy: -3 * displayScale)
+            let lineWidth = min(1, outline.width / 2, outline.height / 2)
+            let strokeInset = lineWidth / 2
+            let radius = max(0, min(4 * displayScale, outline.width / 2, outline.height / 2) - strokeInset)
+            // Keep the whole stroke inside the card's existing 3-point padding.
+            let card = NSBezierPath(roundedRect: outline.insetBy(dx: strokeInset, dy: strokeInset),
+                                    xRadius: radius, yRadius: radius)
             NSColor.controlAccentColor.withAlphaComponent(0.06).setFill()
             card.fill()
             NSColor.controlAccentColor.setStroke()
-            card.lineWidth = 1
+            card.lineWidth = lineWidth
             card.stroke()
         }
         let imageRect = thumbnailRect(in: rect)
@@ -957,7 +968,12 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
                               width: abs(point.x - start.x), height: abs(point.y - start.y))
             marqueeRect = rect
             marqueeLayer.path = CGPath(rect: rect, transform: nil)
-            let covered = assetIDs(intersecting: rect)
+            // Card bounds find nearby candidates; only visible photo content
+            // participates in selection, just as it does for a single click.
+            let covered = assetIDs(intersecting: rect).filter { id in
+                guard let card = geometry[id] else { return false }
+                return !photoRect(for: id, in: card).intersection(rect).isEmpty
+            }
             updateSelection(marqueeBaseSelection.union(covered))
             return
         }
@@ -1253,7 +1269,7 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
 
     private var visiblePreviewPanel: QLPreviewPanel? {
         guard QLPreviewPanel.sharedPreviewPanelExists(), let panel = QLPreviewPanel.shared(),
-              panel.isVisible, panel.dataSource === self else { return nil }
+              panel.isVisible || panel.isInFullScreenMode, panel.dataSource === self else { return nil }
         return panel
     }
 
@@ -1288,7 +1304,7 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
             return true
         }, synchronize: {
             self.synchronizePreviewPanel(panel)
-            self.startObservingPreviewIndex(panel)
+            self.startPreviewKeyMonitoring(panel)
         }, show: {})
     }
 
@@ -1314,23 +1330,16 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
 
     private func synchronizePreviewPanel(_ panel: QLPreviewPanel) {
         guard panel.dataSource === self, !previewItems.isEmpty else { return }
-        // Transient index changes during our own reload must not be mistaken
-        // for panel-driven navigation.
-        isSynchronizingPreview = true
-        defer { isSynchronizingPreview = false }
         panel.reloadData()
-        panel.currentPreviewItemIndex = previewIndex
+        panel.currentPreviewItemIndex = 0
     }
 
     var preparedPreviewIndex: Int { previewIndex }
 
     private func closePreview(_ panel: QLPreviewPanel, restoreFocus: Bool = true) {
-        stopObservingPreviewIndex()
+        stopPreviewKeyMonitoring()
+        if panel.isInFullScreenMode { panel.exitFullScreenMode(options: nil) }
         panel.orderOut(self)
-        // Panel-native navigation (arrows, ‹ › buttons) never passes through
-        // previewPanel(_:handle:); fold the panel's final index back into the
-        // selection so closing lands on the photo that was actually viewed.
-        if restoreFocus { syncSelectionToPanelIndex(panel) }
         if panel.dataSource === self { panel.dataSource = nil }
         if panel.delegate === self { panel.delegate = nil }
         previewItems = []
@@ -1348,20 +1357,28 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
         panel.dataSource = self
         panel.delegate = self
         synchronizePreviewPanel(panel)
-        startObservingPreviewIndex(panel)
+        startPreviewKeyMonitoring(panel)
     }
 
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        stopObservingPreviewIndex()
+        stopPreviewKeyMonitoring()
         if panel.dataSource === self { panel.dataSource = nil }
         if panel.delegate === self { panel.delegate = nil }
     }
 
-    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { previewItems.count }
+    func windowWillClose(_ notification: Notification) {
+        guard let panel = notification.object as? QLPreviewPanel, panel.dataSource === self else { return }
+        closePreview(panel)
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        previewItems.indices.contains(previewIndex) ? 1 : 0
+    }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        guard previewItems.indices.contains(index) else { return nil }
-        return previewItems[index]
+        // A single native item omits Quick Look's previous/next controls.
+        guard index == 0, previewItems.indices.contains(previewIndex) else { return nil }
+        return previewItems[previewIndex]
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
@@ -1371,9 +1388,12 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow == nil, QLPreviewPanel.sharedPreviewPanelExists(),
-           let panel = QLPreviewPanel.shared(), panel.dataSource === self {
-            closePreview(panel, restoreFocus: false)
+        if newWindow == nil {
+            if QLPreviewPanel.sharedPreviewPanelExists(),
+               let panel = QLPreviewPanel.shared(), panel.dataSource === self {
+                closePreview(panel, restoreFocus: false)
+            }
+            stopPreviewKeyMonitoring()
         }
         super.viewWillMove(toWindow: newWindow)
     }
@@ -1406,59 +1426,65 @@ class ProjectMaterialDocumentView: NSView, NSDraggingSource, QLPreviewPanelDataS
             if !event.isARepeat { closePreview(panel) }
             return true
         }
-        guard [123, 124, 125, 126].contains(event.keyCode) else { return false }
-        navigatePreview(with: event.keyCode, panel: panel)
+        return handlePreviewArrowKey(event) { _ in synchronizePreviewPanel(panel) }
+    }
+
+    func handlePreviewArrowKey(_ event: NSEvent, setDisplayedIndex: (Int) -> Void) -> Bool {
+        guard isActive, event.type == .keyDown,
+              event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty,
+              [123, 124, 125, 126].contains(event.keyCode) else { return false }
+        navigatePreview(with: event.keyCode, setDisplayedIndex: setDisplayedIndex)
         return true
     }
 
-    private func navigatePreview(with key: UInt16, panel: QLPreviewPanel) {
-        navigatePreview(with: key) { panel.currentPreviewItemIndex = $0 }
-    }
-
     func navigatePreview(with key: UInt16, setDisplayedIndex: (Int) -> Void) {
-        guard !previewAssetIDs.isEmpty else { return }
-        guard [123, 124, 125, 126].contains(key) else { return }
-        let delta = (key == 123 || key == 126) ? -1 : 1
-        let next = min(max(0, previewIndex + delta), previewAssetIDs.count - 1)
-        guard next != previewIndex else { return }
-        previewIndex = next
-        setDisplayedIndex(next)
-        updateSelection([previewAssetIDs[next]])
-        revealAsset(previewAssetIDs[next])
-    }
-
-    /// Finder keeps the underlying selection on the item Quick Look is showing.
-    /// Since the panel consumes arrow keys and ‹ › clicks internally, observe
-    /// currentPreviewItemIndex instead of waiting for delegate events.
-    private func startObservingPreviewIndex(_ panel: QLPreviewPanel) {
-        guard observedPreviewPanel !== panel, panel.dataSource === self else { return }
-        stopObservingPreviewIndex()
-        panel.addObserver(self, forKeyPath: "currentPreviewItemIndex",
-                          options: [], context: &Self.previewIndexObservationContext)
-        observedPreviewPanel = panel
-    }
-
-    private func stopObservingPreviewIndex() {
-        guard let panel = observedPreviewPanel else { return }
-        observedPreviewPanel = nil
-        panel.removeObserver(self, forKeyPath: "currentPreviewItemIndex",
-                             context: &Self.previewIndexObservationContext)
-    }
-
-    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
-                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-        guard context == &Self.previewIndexObservationContext else {
-            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
-            return
+        guard previewAssetIDs.indices.contains(previewIndex),
+              let current = assetIndices[previewAssetIDs[previewIndex]] else { return }
+        let columns = max(1, gridLayout?.columns ?? 1)
+        let delta: Int
+        switch key {
+        case 123: delta = -1
+        case 124: delta = 1
+        case 126 where !isGroupRow: delta = -columns
+        case 125 where !isGroupRow: delta = columns
+        default: return
         }
-        guard !isSynchronizingPreview, let panel = observedPreviewPanel,
-              object as? QLPreviewPanel === panel else { return }
-        syncSelectionToPanelIndex(panel)
+        // Use the complete grid, including any items without a preview URL,
+        // so vertical movement stays in the same displayed column.
+        var target = current + delta
+        while assets.indices.contains(target) {
+            if let next = previewAssetIDs.firstIndex(of: assets[target].id) {
+                syncSelectionToPreviewIndex(next)
+                setDisplayedIndex(next)
+                return
+            }
+            target += delta
+        }
     }
 
-    private func syncSelectionToPanelIndex(_ panel: QLPreviewPanel) {
-        guard panel.dataSource === self else { return }
-        syncSelectionToPreviewIndex(panel.currentPreviewItemIndex)
+    private func startPreviewKeyMonitoring(_ panel: QLPreviewPanel) {
+        guard monitoredPreviewPanel !== panel, panel.dataSource === self else { return }
+        stopPreviewKeyMonitoring()
+        monitoredPreviewPanel = panel
+        // Quick Look consumes direction keys before its delegate sees them.
+        // Intercept only events belonging to our active preview or source grid.
+        previewKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self, weak panel] event in
+            guard let self, let panel, self.isActive, panel.dataSource === self,
+                  panel.isVisible || panel.isInFullScreenMode,
+                  panel.attachedSheet == nil, self.window?.attachedSheet == nil,
+                  event.window === panel
+                    || (event.window === self.window && self.window?.firstResponder === self) else { return event }
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            return self.handlePreviewKey(event, panel: panel, modifiers: modifiers) ? nil : event
+        }
+    }
+
+    private func stopPreviewKeyMonitoring() {
+        if let previewKeyMonitor {
+            NSEvent.removeMonitor(previewKeyMonitor)
+            self.previewKeyMonitor = nil
+        }
+        monitoredPreviewPanel = nil
     }
 
     /// The bounds check also rejects stale values such as NSNotFound.

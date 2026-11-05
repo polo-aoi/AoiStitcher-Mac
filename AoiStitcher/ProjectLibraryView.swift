@@ -20,6 +20,7 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var library = ProjectLibraryStore()
+    @StateObject private var materialNavigation = ProjectMaterialNavigation()
     @Environment(\.openSettings) private var openSettings
     @AppStorage("colorSchemeStyle") private var theme = AppPreferences.defaultTheme
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
@@ -37,10 +38,9 @@ struct ContentView: View {
                                      initialRequest: nil, onReturnHome: { library.closeProject() })
                     .id(project.id)
             } else if let session = directCollage {
-                ProjectWorkspaceView(library: library, projectID: nil,
+                DirectCollageWorkspaceView(persistentLibrary: library, request: session,
                                      mode: $mode, homeRequest: homeRequest,
-                                     navigationBusy: $workspaceBusy,
-                                     initialRequest: session, onReturnHome: {
+                                     navigationBusy: $workspaceBusy, onReturnHome: {
                                          directCollage = nil
                                          mode = "library"
                                          workspaceBusy = false
@@ -53,6 +53,7 @@ struct ContentView: View {
                 }
             }
         }
+        .environmentObject(materialNavigation)
         .frame(minWidth: 1020, minHeight: 740)
         .preferredColorScheme(theme == 2 ? .dark : .light)
         .background {
@@ -60,17 +61,25 @@ struct ContentView: View {
                 selectedWorkspace: library.currentProject != nil || directCollage != nil ? mode : nil,
                 workspaces: AppPreferences.workspaceOrder(from: storedWorkspaceOrder),
                 homeEnabled: !workspaceBusy && !library.isImporting,
-                showsProjectMaterials: directCollage == nil,
+                navigationEnabled: !workspaceBusy && !library.isImporting,
+                materialSelectionCount: mode == "library" ? materialNavigation.selectionCount : 0,
                 onHome: { if library.currentProject != nil || directCollage != nil { homeRequest += 1 } },
-                onSelectWorkspace: { mode = $0 },
+                onSelectWorkspace: { workspace in
+                    guard !workspaceBusy && !library.isImporting else { return }
+                    mode = materialNavigation.selectWorkspace(workspace, from: mode)
+                },
                 onSettings: { openSettings() }
             ).frame(width: 0, height: 0)
         }
         .onChange(of: library.currentProject?.id) { _, _ in
+            materialNavigation.reset()
             mode = "library"
             workspaceBusy = false
         }
-        .onAppear { ProjectLibraryLifecycle.library = library }
+        .onChange(of: directCollage?.id) { _, _ in materialNavigation.reset() }
+        .onAppear {
+            if directCollage == nil { ProjectLibraryLifecycle.library = library }
+        }
         .alert("项目素材库", isPresented: Binding(
             get: { library.message != nil },
             set: { if !$0 { library.message = nil } }
@@ -487,6 +496,40 @@ private struct ProjectCoverCard: View {
     }
 }
 
+private struct DirectCollageWorkspaceView: View {
+    let persistentLibrary: ProjectLibraryStore
+    let request: ProjectEditorRequest
+    @Binding var mode: String
+    let homeRequest: Int
+    @Binding var navigationBusy: Bool
+    let onReturnHome: () -> Void
+    @StateObject private var library = ProjectLibraryStore(temporarySession: true)
+
+    var body: some View {
+        ProjectWorkspaceView(library: library, projectID: library.currentProject?.id,
+                             mode: $mode, homeRequest: homeRequest,
+                             navigationBusy: $navigationBusy, initialRequest: request,
+                             onReturnHome: onReturnHome)
+        .onAppear { ProjectLibraryLifecycle.library = library }
+        .onDisappear {
+            if ProjectLibraryLifecycle.library === library {
+                ProjectLibraryLifecycle.library = persistentLibrary
+            }
+        }
+        .alert("项目素材", isPresented: Binding(
+            get: { library.message != nil },
+            set: { if !$0 { library.message = nil } }
+        )) {
+            Button("确定") { library.message = nil }
+        } message: { Text(library.message ?? "") }
+        .sheet(item: $library.duplicateImportRequest, onDismiss: {
+            library.cancelDuplicateImport()
+        }) { prompt in
+            ProjectDuplicateImportView(library: library, prompt: prompt)
+        }
+    }
+}
+
 private struct ProjectWorkspaceView: View {
     @ObservedObject var library: ProjectLibraryStore
     let projectID: UUID?
@@ -504,7 +547,8 @@ private struct ProjectWorkspaceView: View {
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
 
     private var isBusy: Bool {
-        library.isImporting || bridge.activeExportCount > 0 || bridge.request != nil
+        library.isImporting || library.duplicateImportRequest != nil
+            || bridge.activeExportCount > 0 || bridge.request != nil
             || bridge.statuses.values.contains(where: { $0.isBusy }) || isMaterialDispatchPresented
     }
 
@@ -553,15 +597,16 @@ private struct ProjectWorkspaceView: View {
             Button("继续编辑", role: .cancel) {}
             Button("返回首页", role: .destructive, action: returnHome)
         } message: {
-            Text(projectID == nil
-                 ? "当前有尚未导出的拼图，返回首页后将清空编辑器。请先导出需要保留的作品。"
+            Text(library.isTemporarySession
+                 ? "返回首页后将清空本次拼图和临时素材、照片组。原始照片会保留，请先导出需要保留的作品。"
                  : "当前有尚未导出的拼图，返回首页后将清空编辑器。项目素材、照片组和处理状态会自动保存。")
         }
     }
 
     private func requestHome() {
         guard !isBusy, library.currentProject?.id == projectID else { return }
-        if bridge.statuses.values.contains(where: { $0.hasUnexportedChanges }) {
+        if bridge.statuses.values.contains(where: { $0.hasUnexportedChanges })
+            || (library.isTemporarySession && library.currentProject?.activeAssets.isEmpty == false) {
             confirmsReturnHome = true
         } else {
             returnHome()
@@ -612,6 +657,7 @@ private struct ProjectDispatch: Identifiable {
     let id = UUID()
     let operation: ProjectOperation
     let assets: [ProjectAsset]
+    let offersGrouping: Bool
 }
 
 private struct ProjectLibraryView: View {
@@ -621,15 +667,16 @@ private struct ProjectLibraryView: View {
     @Binding var isDispatchPresented: Bool
     let onSend: (ProjectOperation, [URL], ProjectImportMode) -> Bool
     @EnvironmentObject private var bridge: ProjectEditorBridge
+    @EnvironmentObject private var materialNavigation: ProjectMaterialNavigation
     @AppStorage(AppPreferences.workspaceOrderKey) private var storedWorkspaceOrder = ""
-    @AppStorage("projectLibrary.didAddPhotos") private var didAddPhotos = false
+    @AppStorage(AppPreferences.skipGroupingPromptKey) private var skipGroupingPrompt = false
+    @AppStorage(AppPreferences.materialSelectionHintDismissedKey) private var didDismissMaterialSelectionHint = false
     @AppStorage("projectLibrary.groupSidebarWidth") private var groupSidebarWidth = 340.0
     @State private var selection: Set<UUID> = []
     @State private var selectedGroupID: UUID?
     @State private var selectedWholeGroupID: UUID?
     @State private var groupSelection: Set<UUID> = []
     @State private var catalog = ProjectMaterialCatalog()
-    @State private var arrangeRequest = 0
     @State private var dispatch: ProjectDispatch?
     @State private var draggedGroupID: UUID?
     @State private var groupDropInsertionIndex: Int?
@@ -669,7 +716,7 @@ private struct ProjectLibraryView: View {
                         ProjectMaterialBoard(
                             assets: materialAssets, selection: $selection,
                             thumbnailSize: CGFloat(library.currentProject?.thumbnailSize ?? 128),
-                            viewZoom: .constant(1), fitRequest: arrangeRequest,
+                            viewZoom: .constant(1), fitRequest: 0,
                             thumbnails: thumbnails, assetURLs: assetURLs, isActive: isActive && !showsModal,
                             badges: badges,
                             onMove: library.moveAssets,
@@ -710,7 +757,7 @@ private struct ProjectLibraryView: View {
             }
             Divider()
             HStack {
-                Text(library.currentProject?.name ?? "项目")
+                Text(library.isTemporarySession ? "本次拼图素材（仅本次保留）" : (library.currentProject?.name ?? "项目"))
                     .lineLimit(1).truncationMode(.middle).frame(maxWidth: 200, alignment: .leading)
                 Text("·")
                 Text("未分组 \(materialAssets.count) 张 · 项目共 \(assets.count) 张")
@@ -722,64 +769,82 @@ private struct ProjectLibraryView: View {
             guard library.currentProject?.id == projectID else { return }
             refreshCatalog()
             library.boardViewZoom = 1
+            publishSelectionCount()
+        }
+        .onChange(of: selectedCount) { _, _ in publishSelectionCount() }
+        .onChange(of: isActive) { _, _ in publishSelectionCount() }
+        .onDisappear { materialNavigation.reset() }
+        .onChange(of: materialNavigation.request?.id) { _, _ in
+            guard let request = materialNavigation.request else { return }
+            materialNavigation.consumeRequest(id: request.id)
+            didDismissMaterialSelectionHint = true
+            prepareDispatch(request.operation, ids: activeSelection)
         }
         .onChange(of: library.currentProject?.modifiedAt) { _, _ in refreshCatalog() }
         .onChange(of: showsModal) { _, value in isDispatchPresented = value }
         .onChange(of: materialAssets.map(\.id)) { _, ids in selection.formIntersection(Set(ids)) }
         .sheet(item: $dispatch) { request in
-            ProjectDispatchSheet(operation: request.operation, assets: request.assets) { orderedAssets, importMode in
+            ProjectDispatchSheet(operation: request.operation, assets: request.assets,
+                                 offersGrouping: request.offersGrouping) { orderedAssets, importMode, shouldGroup, suppressPrompt in
                 if onSend(request.operation, orderedAssets.map { library.assetURL($0) }, importMode) {
-                    didAddPhotos = true
+                    // Delay organization and preferences until all prompts are
+                    // accepted. Cancelling never moves photos or hides guidance.
+                    if shouldGroup { createGroup(Set(orderedAssets.map(\.id))) }
+                    if suppressPrompt { skipGroupingPrompt = true }
                     dispatch = nil
                 }
             }.environmentObject(bridge)
         }
     }
 
-    private var groupActionBar: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            actionSelectionLabel
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 6)],
-                      alignment: .leading, spacing: 6) {
-                ForEach(operations) { operation in operationTarget(operation) }
-            }
-            if !didAddPhotos {
-                Text("选中照片，拖到下方空白处或按回车建组；按住 Shift 多选。")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.horizontal, 8).padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
-
-    private var actionSelectionLabel: some View {
-        Text(selectedCount == 0 ? "选择照片后，添加至：" : "已选 \(selectedCount) 张，添加至：")
-            .font(.callout).foregroundStyle(selectedCount == 0 ? .secondary : .primary)
-            .fixedSize()
-    }
-
-    private func operationTarget(_ operation: ProjectOperation) -> some View {
-        ProjectOperationTarget(
-            operation: operation, selectionCount: selectedCount,
-            isBusy: bridge.status(for: operation).isBusy || showsModal || !isActive || bridge.request != nil,
-            onChoose: { prepareDispatch(operation, ids: activeSelection) },
-            onDropIDs: { prepareDispatch(operation, ids: Set($0)) }
-        )
+    private func publishSelectionCount() {
+        materialNavigation.selectionCount = isActive ? selectedCount : 0
     }
 
     private var libraryToolbar: some View {
         HStack(spacing: 10) {
             Button(action: library.importPanel) { Label("导入素材", systemImage: "plus") }
                 .buttonStyle(.borderedProminent).disabled(library.isImporting)
+            selectionSummary
             if library.isImporting { ProgressView().controlSize(.small) }
-            Button("整理对齐") { arrangeRequest += 1 }
-                .disabled(!assets.contains { $0.groupID == nil })
-                .help("素材已按当前顺序自动对齐，点击回到排列起点")
             Spacer(minLength: 0)
             thumbnailControls
         }.padding(.horizontal, 10).padding(.vertical, 8)
+    }
+
+    @ViewBuilder private var selectionSummary: some View {
+        if selectedCount > 0 {
+            HStack(spacing: 8) {
+                HStack(spacing: 5) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityHidden(true)
+                    Text("\(selectedCount) 张已选").monospacedDigit()
+                }
+                .font(.callout)
+
+                if !didDismissMaterialSelectionHint {
+                    Label("点顶部拼图方式继续", systemImage: "arrow.up")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize()
+                    Button {
+                        didDismissMaterialSelectionHint = true
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("关闭选图提示")
+                    .accessibilityLabel("关闭选图提示")
+                }
+            }
+            .accessibilityElement(children: .combine)
+        }
     }
 
     private var thumbnailControls: some View {
@@ -834,7 +899,6 @@ private struct ProjectLibraryView: View {
             }.padding(.horizontal, 8).padding(.vertical, 8)
                 .contentShape(Rectangle())
                 .onTapGesture { if isActive && !showsModal { clearSelection() } }
-            groupActionBar
             Divider()
             ScrollViewReader { proxy in
                 ScrollView {
@@ -992,7 +1056,9 @@ private struct ProjectLibraryView: View {
     }
 
     private func prepareDispatch(_ operation: ProjectOperation, ids: Set<UUID>) {
-        guard isActive, !showsModal, bridge.request == nil, ProjectOperation.allCases.contains(operation) else { return }
+        guard isActive, !showsModal, !library.isImporting,
+              library.currentProject?.id == projectID,
+              bridge.request == nil, ProjectOperation.allCases.contains(operation) else { return }
         let chosen = orderedForDispatch(ids)
         guard !chosen.isEmpty else { return }
         let status = bridge.status(for: operation)
@@ -1004,10 +1070,11 @@ private struct ProjectLibraryView: View {
             library.message = "标准拼图最多容纳 16 张照片，请减少选择后重试。"
             return
         }
-        if status.count == 0 {
-            if onSend(operation, chosen.map { library.assetURL($0) }, .append) { didAddPhotos = true }
+        let offersGrouping = !skipGroupingPrompt && chosen.allSatisfy { $0.groupID == nil }
+        if status.count == 0 && !offersGrouping {
+            _ = onSend(operation, chosen.map { library.assetURL($0) }, .append)
         } else {
-            dispatch = ProjectDispatch(operation: operation, assets: chosen)
+            dispatch = ProjectDispatch(operation: operation, assets: chosen, offersGrouping: offersGrouping)
         }
     }
 
@@ -1148,135 +1215,5 @@ struct ProjectThumbnailRefresh<Content: View>: View {
             image.representations.map { max($0.pixelsWide, $0.pixelsHigh) }.max() ?? 0
         }
         return pixels(first) > pixels(second) ? first : second
-    }
-}
-
-
-private struct ProjectOperationTarget: View {
-    let operation: ProjectOperation
-    let selectionCount: Int
-    let isBusy: Bool
-    let onChoose: () -> Void
-    let onDropIDs: ([UUID]) -> Void
-    @ObservedObject private var materialDrag = ProjectMaterialDragState.shared
-    @State private var isTargeted = false
-    @State private var isHovered = false
-
-    private var shortcut: String {
-        switch operation {
-        case .gridCollage: return "1"
-        case .freeCanvas: return "2"
-        case .longStitch: return "3"
-        case .compression: return ""
-        }
-    }
-
-    private var title: String {
-        if isTargeted && !isBusy { return "松开添加 \(materialDrag.assetIDs.count) 张" }
-        return operation.title
-    }
-
-    var body: some View {
-        Button(action: onChoose) {
-            HStack(spacing: 6) {
-                Image(systemName: operation.systemImage)
-                Text(title).lineLimit(1)
-                Text(shortcut)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 18, height: 18)
-                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
-            }
-            .font(.callout.weight(.medium))
-            .padding(.horizontal, 10).padding(.vertical, 8)
-            .frame(maxWidth: .infinity)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(ProjectOperationButtonStyle(highlighted: isTargeted || (isHovered && !isBusy),
-                                                available: selectionCount > 0 && !isBusy))
-        .onHover { isHovered = $0 }
-        .disabled(isBusy || selectionCount == 0)
-        .help(isBusy ? "当前工具正在处理" : "点击或按 \(shortcut)，将选中照片添加至\(operation.title)")
-        .onDrop(of: [ProjectMaterialBoard.assetPasteboardType.rawValue], isTargeted: $isTargeted) { providers in
-            guard !isBusy, let provider = providers.first else { return false }
-            provider.loadDataRepresentation(forTypeIdentifier: ProjectMaterialBoard.assetPasteboardType.rawValue) { data, _ in
-                guard let data, let strings = try? JSONDecoder().decode([String].self, from: data) else { return }
-                let ids = strings.compactMap(UUID.init(uuidString:))
-                DispatchQueue.main.async { onDropIDs(ids) }
-            }
-            return true
-        }
-    }
-}
-
-private struct ProjectOperationButtonStyle: ButtonStyle {
-    let highlighted: Bool
-    let available: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .background(Color.accentColor.opacity(configuration.isPressed ? 0.24 : highlighted ? 0.16 : available ? 0.07 : 0.02),
-                        in: RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9)
-                .strokeBorder(highlighted || available ? Color.accentColor.opacity(highlighted ? 1 : 0.45) : Color(nsColor: .separatorColor),
-                              lineWidth: highlighted ? 1.5 : 1))
-    }
-}
-
-private struct ProjectDispatchSheet: View {
-    let operation: ProjectOperation
-    @State var assets: [ProjectAsset]
-    let onSend: ([ProjectAsset], ProjectImportMode) -> Void
-    @EnvironmentObject private var bridge: ProjectEditorBridge
-    @Environment(\.dismiss) private var dismiss
-
-    private var status: ProjectEditorStatus { bridge.status(for: operation) }
-    private var isTooMany: Bool { operation == .gridCollage && assets.count > 16 }
-    private var appendExceedsLimit: Bool { operation == .gridCollage && status.count + assets.count > 16 }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("将 \(assets.count) 张照片添加到\(operation.title)").font(.title2.weight(.semibold))
-            if status.count > 0 {
-                Label(status.hasUnexportedChanges ? "当前已有 \(status.count) 项素材，存在尚未导出的内容。" : "当前已有 \(status.count) 项素材，现有内容已导出。",
-                      systemImage: status.hasUnexportedChanges ? "exclamationmark.circle" : "checkmark.circle")
-                    .font(.callout)
-                    .foregroundStyle(status.hasUnexportedChanges ? Color.orange : Color.secondary)
-                Text("继续添加会保留当前编辑结果；清空后导入将开始新的一组，项目中的素材、照片组和处理状态会保留。")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            Text("本次添加顺序：可拖动条目或用箭头调整，素材库中的排列位置会保留。")
-                .font(.caption).foregroundStyle(.secondary)
-            List {
-                ForEach(Array(assets.enumerated()), id: \.element.id) { index, asset in
-                    HStack(spacing: 10) {
-                        Text("\(index + 1)").monospacedDigit().foregroundStyle(.secondary).frame(width: 24)
-                        Text(asset.name).lineLimit(1)
-                        Spacer()
-                        Button { assets.swapAt(index, index - 1) } label: { Image(systemName: "chevron.up") }
-                            .disabled(index == 0).help("提前一位")
-                        Button { assets.swapAt(index, index + 1) } label: { Image(systemName: "chevron.down") }
-                            .disabled(index == assets.count - 1).help("推后一位")
-                    }.buttonStyle(.borderless).padding(.vertical, 4)
-                }.onMove { from, to in assets.move(fromOffsets: from, toOffset: to) }
-            }.frame(height: 250)
-            if status.isBusy {
-                Text("目标工具正在处理，请完成后再导入。").font(.caption).foregroundStyle(.secondary)
-            } else if isTooMany || appendExceedsLimit {
-                Text(isTooMany ? "标准拼图最多容纳 16 张照片，请减少选择。" : "继续添加后将超过 16 张，可选择清空后导入或取消。")
-                    .font(.caption).foregroundStyle(.orange)
-            }
-            HStack {
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Spacer()
-                if status.count > 0 {
-                    Button("清空后导入", role: .destructive) { onSend(assets, .replace) }
-                        .disabled(status.isBusy || isTooMany || assets.isEmpty)
-                }
-                Button(status.count > 0 ? "继续添加" : "导入照片") { onSend(assets, .append) }
-                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                    .disabled(status.isBusy || appendExceedsLimit || assets.isEmpty)
-            }
-        }.padding(24).frame(width: 550)
     }
 }
